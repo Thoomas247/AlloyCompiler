@@ -1,0 +1,28 @@
+/*
+	Built in functions:
+	- XX:to_YY()
+		~ convert from numeric type XX to numeric type YY, keeping the value the same
+		~ returns by value
+	- XX:as_YY()
+		~ reinterpret the bytes of type XX as type YY
+		~ type YY must be of size smaller or equal to size of XX
+		~ returns by reference
+*/
+
+fn main(): int
+{
+	const a: u32 = 23;
+	const b: i8 = 123;
+	const f = get_float();
+
+	const str: [u8] = [ 1, 2, 3, 4, 5, 6, 7 ];
+	const arr: [f32; 5] = [ 1, 2, 3, 4, 5 ];
+	const arr2 = [32.0:to_f32(); 10];	// implicit type, array of floats with size 10, all initialized with value 32.0
+
+	return 0;
+}
+
+fn get_float(): f32
+{
+	return 7.421;
+}
