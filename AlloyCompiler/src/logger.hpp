@@ -1,3 +1,5 @@
+#pragma once
+
 #include <string>
 #include <format>
 #include <print>
@@ -25,20 +27,20 @@ static void logInfo(const std::string& format, Args&&... args)
 class Logger
 {
 public:
-	Logger(const Source& source) : mSource(source), mHasError(false) {}
+	Logger(const Source& source) : m_Source(source), m_HasError(false) {}
 
 	template<typename... Args>
 	void logErrorInRange(TokenPosition startPos, TokenPosition endPos, const std::string& format, Args&&... args)
 	{
-		mHasError = true;
+		m_HasError = true;
 		logError("{}:{}:{}", startPos.line, startPos.col, std::vformat(format, std::make_format_args(args...)));
 	}
 
-	bool hasError() const { return mHasError; }
+	bool hasError() const { return m_HasError; }
 
 private:
-	const Source& mSource;
-	bool mHasError;
+	const Source& m_Source;
+	bool m_HasError;
 };
 
 #define ASSERT(x) do{ if (!(x)) __debugbreak(); } while(0)

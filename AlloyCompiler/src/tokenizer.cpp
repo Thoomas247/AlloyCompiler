@@ -9,51 +9,51 @@
 class SourceIterator
 {
 public:
-	SourceIterator(const Source& source) : mSource(source), mCurrentPosition(0, 1, 1) {}
+	SourceIterator(const Source& source) : m_Source(source), m_CurrentPosition(0, 1, 1) {}
 
 	bool hasNext(size_t offset = 0) const
 	{
-		return (mCurrentPosition.index + offset) < mSource.data.size();
+		return (m_CurrentPosition.index + offset) < m_Source.data.size();
 	}
 
 	char consume(char expected = 0)
 	{
 		ASSERT(hasNext());
-		ASSERT(expected != 0 ? mSource.data[mCurrentPosition.index] == expected : true);
+		ASSERT(expected != 0 ? m_Source.data[m_CurrentPosition.index] == expected : true);
 
-		if (mSource.data[mCurrentPosition.index] == '\n')
+		if (m_Source.data[m_CurrentPosition.index] == '\n')
 		{
-			mCurrentPosition.line++;
-			mCurrentPosition.col = 1;
+			m_CurrentPosition.line++;
+			m_CurrentPosition.col = 1;
 		}
 		else
 		{
-			mCurrentPosition.col++;
+			m_CurrentPosition.col++;
 		}
 
-		return mSource.data[mCurrentPosition.index++];
+		return m_Source.data[m_CurrentPosition.index++];
 	}
 
 	char peek(size_t offset = 0) const
 	{
 		ASSERT(hasNext(offset));
-		return mSource.data[mCurrentPosition.index + offset];
+		return m_Source.data[m_CurrentPosition.index + offset];
 	}
 
 	TokenPosition currentPosition() const
 	{
-		return mCurrentPosition;
+		return m_CurrentPosition;
 	}
 
 	std::string_view createView(TokenPosition startPos, TokenPosition endPos) const
 	{
-		ASSERT(endPos.index <= mSource.data.size());
-		return std::string_view(&mSource.data[startPos.index], endPos.index - startPos.index);
+		ASSERT(endPos.index <= m_Source.data.size());
+		return std::string_view(&m_Source.data[startPos.index], endPos.index - startPos.index);
 	}
 
 private:
-	const Source& mSource;
-	TokenPosition mCurrentPosition;
+	const Source& m_Source;
+	TokenPosition m_CurrentPosition;
 };
 
 struct TokenizerState
@@ -74,6 +74,7 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 {
 	{"import", Import},
 
+	{"extern", Extern},
 	{"type", Type},
 	{"enum", Enum},
 	{"struct", Struct},
@@ -104,6 +105,8 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 	{"~", BitwiseNot},	{"~=", BitwiseNotAssign},
 	{"^", Xor},			{"^=", XorAssign},
 
+	{"->", Arrow},
+
 	{".", Dot },		{"...", Ellipsis},
 	{":", Colon},		{"::", DoubleColon},
 	{",", Comma},
@@ -113,7 +116,7 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 static const std::unordered_map<char, std::array<std::string_view, 3>> s_OperatorCombinations =
 {
 	{'+', {"="}},				// +, +=
-	{'-', {"="}},				// -, -=
+	{'-', {"=", ">"}},			// -, -=, ->
 	{'*', {"="}},				// *, *=
 	{'/', {"="}},				// /, /=
 	{'%', {"="}},				// %, %=
@@ -151,12 +154,16 @@ static bool checkOperatorCombinations()
 	return true;
 }
 
-static void skipWhitespace(TokenizerState& state)
+static bool trySkipWhitespace(TokenizerState& state)
 {
+	bool skipped = false;
 	while (state.it.hasNext() && isspace(state.it.peek()))
 	{
 		state.it.consume();
+		skipped = true;
 	}
+
+	return skipped;
 }
 
 static bool tryGetComment(TokenizerState& state)
@@ -222,13 +229,15 @@ static bool tryGetOperator(TokenizerState& state)
 	}
 
 	const auto startPos = state.it.currentPosition();
-	state.it.consume();
+	state.it.consume(opIt->first);
 
 	// keep going while we have a matching sequence
 	size_t suffixCharIndex = 0;
 	bool hasMatch = false;
 	do
 	{
+		hasMatch = false;
+
 		// check every possible sequence for the next character
 		for (const auto& suffix : opIt->second)
 		{
@@ -436,8 +445,7 @@ Result<std::vector<Token>> tokenize(const Source& source)
 
 	while (state.it.hasNext())
 	{
-		skipWhitespace(state);
-
+		if (trySkipWhitespace(state)) continue;
 		if (tryGetComment(state)) continue;
 		if (tryGetOperator(state)) continue;
 		if (tryGetDelimiter(state)) continue;
@@ -452,5 +460,5 @@ Result<std::vector<Token>> tokenize(const Source& source)
 	}
 
 	state.tokens.emplace_back(EndOfFile, state.it.currentPosition(), state.it.currentPosition());
-	return { state.logger.hasError(), std::move(state.tokens) };
+	return { !state.logger.hasError(), std::move(state.tokens) };
 }

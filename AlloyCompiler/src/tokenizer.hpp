@@ -26,6 +26,7 @@ enum class TokenKind
 
 	Import,
 
+	Extern,
 	Type,
 	Enum,
 	Struct,
@@ -55,6 +56,8 @@ enum class TokenKind
 	Or, LogicalOr, OrAssign,
 	BitwiseNot, BitwiseNotAssign,
 	Xor, XorAssign,
+
+	Arrow,
 
 	Dot, Ellipsis,
 	Colon, DoubleColon,
