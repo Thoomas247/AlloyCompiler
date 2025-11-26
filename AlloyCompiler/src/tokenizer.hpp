@@ -37,6 +37,8 @@ enum class TokenKind
 	Else,
 	While,
 	For,
+
+	Break,
 	Return,
 
 	LParen, RParen,

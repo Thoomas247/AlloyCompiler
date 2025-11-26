@@ -85,6 +85,8 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 	{"else", Else},
 	{"while", While},
 	{"for", For},
+
+	{"break", Break},
 	{"return", Return},
 
 	{"(", LParen},		{")", RParen},

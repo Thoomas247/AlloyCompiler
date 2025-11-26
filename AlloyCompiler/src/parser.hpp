@@ -62,7 +62,22 @@ namespace AST
 
 #pragma region Type Nodes
 
-	using Type = std::variant<NamedType, StructType, EnumType, ArrayType>;
+	using BaseType = std::variant<NamedType, StructType, EnumType, ArrayType, FunctionType>;
+
+	struct Type
+	{
+		enum class Modifier
+		{
+			None,
+			Pointer,
+			Reference,
+			PointerToMutable,
+			ReferenceToMutable
+		};
+
+		Modifier modifier;
+		std::variant<BaseType, Type> baseType;
+	};
 
 	struct NamedType
 	{
@@ -78,7 +93,7 @@ namespace AST
 			Type type;
 		};
 
-		ListNode<Member> members;
+		ListNode<Member>& members;
 	};
 
 	struct EnumType
@@ -86,10 +101,10 @@ namespace AST
 		struct Member
 		{
 			std::string_view name;
-			Optional<Type> payloadType = nullptr;
+			Optional<Type> payloadType;
 		};
 
-		ListNode<Member> members;
+		ListNode<Member>& members;
 	};
 
 	struct ArrayType
@@ -98,47 +113,123 @@ namespace AST
 		size_t size;
 	};
 
+	struct FunctionType
+	{
+		ListNode<Type>& parameterTypes;
+		Optional<Type> returnType;
+	};
+
 #pragma endregion
+
+	struct Expression
+	{
+		// TODO
+	};
+
+	struct Capture
+	{
+		Type::Modifier modifier;
+		std::string_view variableName;
+	};
+
+	struct IfExpression
+	{
+		using Branch = std::variant<Expression, StatementBlock>;
+
+		Expression& condition;
+		Optional<Capture> capture;
+		Branch thenBranch;
+		Optional<Branch> elseBranch;
+	};
+
+	struct ForExpression
+	{
+		ListNode<Expression>& iterables;
+		ListNode<Capture>& iterators;
+		StatementBlock& body;
+		Optional<Statement> elseBody;
+	};
+
+	struct WhileExpression
+	{
+		Expression& condition;
+		StatementBlock& body;
+		Optional<Statement> elseBody;
+	};
+
+	struct FunctionCallExpression
+	{
+		Expression& function;
+		ListNode<Expression>& arguments;
+	};
+
+	struct LambdaExpression
+	{
+		Optional<ListNode<Capture>> captures;
+		Function& function;
+	};
+
+#pragma region Statement Nodes
 
 	struct Statement
 	{
 		// TODO
 	};
 
+	struct VariableDefinitionStatement
+	{
+		std::string_view name;
+		Optional<Type> type;
+		Expression& value;
+		bool isMutable;
+	};
+
+	struct AssignmentStatement
+	{
+		Expression& target;
+		Expression& value;
+	};
+
 	struct StatementBlock
 	{
-		ListNode<Statement> statements;
+		ListNode<Statement>& statements;
 	};
+
+#pragma endregion
+
+#pragma region Function Nodes
 
 	struct FunctionParameter
 	{
 		std::string_view name;
-		Type type;
+		Type& type;
 	};
 
 	struct Function
 	{
-		ListNode<FunctionParameter> parameters;
+		ListNode<FunctionParameter>& parameters;
 		Optional<Type> returnType;
-		StatementBlock body;
+		StatementBlock& body;
 	};
 
 	struct FunctionDefinition
 	{
 		std::string_view name;
-		Function function;
+		Function& function;
 	};
 
 	struct ExternDefinition
 	{
 		std::string_view name;
-		ListNode<FunctionParameter> parameters;
+		ListNode<FunctionParameter>& parameters;
 		bool isVariadic;
 	};
 
+#pragma endregion
+
 	struct Program
 	{
-		ListNode<std::string_view> imports;
+		ListNode<std::string_view>& imports;
 	};
 }
 
