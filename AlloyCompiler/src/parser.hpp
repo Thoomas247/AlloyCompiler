@@ -6,42 +6,60 @@
 
 #include "source.hpp"
 
+template <typename T>
+class Optional
+{
+public:
+	Optional()
+		: m_pValue(nullptr)
+	{
+	}
+	Optional(T* pValue)
+		: m_pValue(pValue)
+	{
+	}
+
+	bool hasValue() const
+	{
+		return m_pValue != nullptr;
+	}
+
+	const T& value() const
+	{
+		ASSERT(m_pValue != nullptr);
+		return *m_pValue;
+	}
+
+	const T* ptr() const
+	{
+		return m_pValue;
+	}
+
+private:
+	T* m_pValue;
+};
+
+template <typename T>
+class Required
+{
+public:
+	Required(T* pValue)
+		: m_pValue(pValue)
+	{
+	}
+
+	const T& value() const
+	{
+		ASSERT(m_pValue != nullptr);
+		return m_pValue;
+	}
+
+private:
+	T* m_pValue;
+};
+
 namespace AST
 {
-
-	template <typename T>
-	class Optional
-	{
-	public:
-		Optional()
-			: m_pValue(nullptr)
-		{
-		}
-		Optional(T* pValue)
-			: m_pValue(pValue)
-		{
-		}
-
-		bool hasValue() const
-		{
-			return m_Ptr != nullptr;
-		}
-
-		const T& value() const
-		{
-			ASSERT(m_pValue != nullptr);
-			return *m_pValue;
-		}
-
-		const T* ptr() const
-		{
-			return m_pValue;
-		}
-
-	private:
-		T* m_pValue;
-	};
-
 	template <typename T>
 	struct ListNode
 	{
@@ -60,9 +78,26 @@ namespace AST
 		}
 	};
 
+	using TokenRef = const Token&;
+
+	struct NamedType;
+	struct StructType;
+	struct EnumType;
+	struct ArrayType;
+	struct FunctionType;
+	struct StatementBlock;
+	struct Statement;
+	struct Function;
+
 #pragma region Type Nodes
 
-	using BaseType = std::variant<NamedType, StructType, EnumType, ArrayType, FunctionType>;
+	using BaseType = std::variant<
+		Required<NamedType>,
+		Required<StructType>,
+		Required<EnumType>,
+		Required<ArrayType>,
+		Required<FunctionType>
+	>;
 
 	struct Type
 	{
@@ -76,12 +111,12 @@ namespace AST
 		};
 
 		Modifier modifier;
-		std::variant<BaseType, Type> baseType;
+		std::variant<Required<BaseType>, Required<Type>> baseType;
 	};
 
 	struct NamedType
 	{
-		const Token& typeName;
+		TokenRef typeName;
 		BaseType underlyingType;
 	};
 
@@ -89,33 +124,33 @@ namespace AST
 	{
 		struct Member
 		{
-			const Token& name;
+			TokenRef name;
 			Type type;
 		};
 
-		ListNode<Member>& members;
+		Optional<ListNode<Member>> members;
 	};
 
 	struct EnumType
 	{
 		struct Member
 		{
-			const Token& name;
+			TokenRef name;
 			Optional<Type> payloadType;
 		};
 
-		ListNode<Member>& members;
+		Optional<ListNode<Member>> members;
 	};
 
 	struct ArrayType
 	{
-		Type elementType;
+		Required<Type> elementType;
 		size_t size;
 	};
 
 	struct FunctionType
 	{
-		ListNode<Type>& parameterTypes;
+		Optional<ListNode<Type>> parameterTypes;
 		Optional<Type> returnType;
 	};
 
@@ -129,14 +164,14 @@ namespace AST
 	struct Capture
 	{
 		Type::Modifier modifier;
-		const Token& variableName;
+		TokenRef variableName;
 	};
 
 	struct IfExpression
 	{
-		using Branch = std::variant<Expression, StatementBlock>;
+		using Branch = std::variant<Required<Expression>, Required<StatementBlock>>;
 
-		Expression& condition;
+		Required<Expression> condition;
 		Optional<Capture> capture;
 		Branch thenBranch;
 		Optional<Branch> elseBranch;
@@ -144,29 +179,29 @@ namespace AST
 
 	struct ForExpression
 	{
-		ListNode<Expression>& iterables;
-		ListNode<Capture>& iterators;
-		StatementBlock& body;
+		Required<ListNode<Expression>> iterables;
+		Required<ListNode<Capture>> iterators;
+		Required<StatementBlock> body;
 		Optional<Statement> elseBody;
 	};
 
 	struct WhileExpression
 	{
-		Expression& condition;
-		StatementBlock& body;
+		Required<Expression> condition;
+		Required<StatementBlock> body;
 		Optional<Statement> elseBody;
 	};
 
 	struct FunctionCallExpression
 	{
-		Expression& function;
-		ListNode<Expression>& arguments;
+		Required<Expression> function;
+		Required<ListNode<Expression>> arguments;
 	};
 
 	struct LambdaExpression
 	{
 		Optional<ListNode<Capture>> captures;
-		Function& function;
+		Required<Function> function;
 	};
 
 #pragma region Statement Nodes
@@ -178,21 +213,21 @@ namespace AST
 
 	struct VariableDefinitionStatement
 	{
-		const Token& name;
+		TokenRef name;
 		Optional<Type> type;
-		Expression& value;
+		Required<Expression> value;
 		bool isMutable;
 	};
 
 	struct AssignmentStatement
 	{
-		Expression& target;
-		Expression& value;
+		Required<Expression> target;
+		Required<Expression> value;
 	};
 
 	struct StatementBlock
 	{
-		ListNode<Statement>& statements;
+		Required<ListNode<Statement>> statements;
 	};
 
 #pragma endregion
@@ -201,15 +236,15 @@ namespace AST
 
 	struct FunctionParameter
 	{
-		const Token& name;
-		Type& type;
+		TokenRef name;
+		Required<Type> type;
 	};
 
 	struct Function
 	{
-		ListNode<FunctionParameter>& parameters;
+		Required<ListNode<FunctionParameter>> parameters;
 		Optional<Type> returnType;
-		StatementBlock& body;
+		Required<StatementBlock> body;
 	};
 
 #pragma endregion
@@ -218,27 +253,25 @@ namespace AST
 
 	struct TypeDefinition
 	{
-		const Token& name;
-		BaseType baseType;
+		TokenRef name;
+		Required<BaseType> baseType;
 	};
 
 	struct FunctionDefinition
 	{
-		const Token& name;
-		Function& function;
+		TokenRef name;
+		Required<Function> function;
 	};
 
 	struct ExternDefinition
 	{
-		const Token& name;
-		ListNode<FunctionParameter>& parameters;
+		TokenRef name;
+		Required<ListNode<FunctionParameter>> parameters;
 		bool isVariadic;
 	};
 
 	struct Definition
 	{
-		using BaseDefinition = std::variant<TypeDefinition, FunctionDefinition, ExternDefinition>;
-
 		enum class Visibility
 		{
 			Private,
@@ -247,14 +280,14 @@ namespace AST
 		};
 
 		Visibility visiblity;
-		BaseDefinition definition;
+		std::variant<TypeDefinition, FunctionDefinition, ExternDefinition> definition;
 	};
 
 #pragma endregion
 
 	struct Program
 	{
-		ListNode<Definition>& definitions;
+		Required<ListNode<Definition>> definitions;
 	};
 }
 
