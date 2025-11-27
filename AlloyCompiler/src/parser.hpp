@@ -81,15 +81,15 @@ namespace AST
 
 	struct NamedType
 	{
-		std::string_view typeName;
-		Type underlyingType;
+		const Token& typeName;
+		BaseType underlyingType;
 	};
 
 	struct StructType
 	{
 		struct Member
 		{
-			std::string_view name;
+			const Token& name;
 			Type type;
 		};
 
@@ -100,7 +100,7 @@ namespace AST
 	{
 		struct Member
 		{
-			std::string_view name;
+			const Token& name;
 			Optional<Type> payloadType;
 		};
 
@@ -129,7 +129,7 @@ namespace AST
 	struct Capture
 	{
 		Type::Modifier modifier;
-		std::string_view variableName;
+		const Token& variableName;
 	};
 
 	struct IfExpression
@@ -178,7 +178,7 @@ namespace AST
 
 	struct VariableDefinitionStatement
 	{
-		std::string_view name;
+		const Token& name;
 		Optional<Type> type;
 		Expression& value;
 		bool isMutable;
@@ -201,7 +201,7 @@ namespace AST
 
 	struct FunctionParameter
 	{
-		std::string_view name;
+		const Token& name;
 		Type& type;
 	};
 
@@ -212,24 +212,49 @@ namespace AST
 		StatementBlock& body;
 	};
 
+#pragma endregion
+
+#pragma region Definition Nodes
+
+	struct TypeDefinition
+	{
+		const Token& name;
+		BaseType baseType;
+	};
+
 	struct FunctionDefinition
 	{
-		std::string_view name;
+		const Token& name;
 		Function& function;
 	};
 
 	struct ExternDefinition
 	{
-		std::string_view name;
+		const Token& name;
 		ListNode<FunctionParameter>& parameters;
 		bool isVariadic;
+	};
+
+	struct Definition
+	{
+		using BaseDefinition = std::variant<TypeDefinition, FunctionDefinition, ExternDefinition>;
+
+		enum class Visibility
+		{
+			Private,
+			Public,
+			Export
+		};
+
+		Visibility visiblity;
+		BaseDefinition definition;
 	};
 
 #pragma endregion
 
 	struct Program
 	{
-		ListNode<std::string_view>& imports;
+		ListNode<Definition>& definitions;
 	};
 }
 

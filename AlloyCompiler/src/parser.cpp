@@ -3,6 +3,7 @@
 #include "logger.hpp"
 #include "allocator.hpp"
 #include "tokenizer.hpp"
+#include "parser.hpp"
 
 class TokenIterator
 {
@@ -43,5 +44,21 @@ struct ParserState
 	Logger logger;
 	TokenIterator it;
 	Allocator allocator;
+
+	ParserState(const Source& source, const std::vector<Token>& tokens)
+		: logger(source), it(tokens)
+	{
+	}
 };
 
+static AST::Program& parseProgram(ParserState& state)
+{
+
+}
+
+Result<bool> parse(const Source& source, const std::vector<Token>& tokens)
+{
+	ParserState state(source, tokens);
+
+	return Result<bool>();
+}
