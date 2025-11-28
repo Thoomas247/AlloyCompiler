@@ -47,7 +47,10 @@ public:
 
 	std::string_view createView(TokenPosition startPos, TokenPosition endPos) const
 	{
+		ASSERT(startPos.index <= m_Source.data.size());
 		ASSERT(endPos.index <= m_Source.data.size());
+		ASSERT(endPos.index >= startPos.index);
+
 		return std::string_view(&m_Source.data[startPos.index], endPos.index - startPos.index);
 	}
 
@@ -462,5 +465,5 @@ Result<std::vector<Token>> tokenize(const Source& source)
 	}
 
 	state.tokens.emplace_back(EndOfFile, state.it.currentPosition(), state.it.currentPosition());
-	return { !state.logger.hasError(), std::move(state.tokens) };
+	return { state.logger.hasError() ? Status::Error : Status::Ok , std::move(state.tokens) };
 }

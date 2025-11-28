@@ -9,6 +9,8 @@
 		~ returns by reference
 */
 
+import a::b::c;
+
 extern printf(...);
 
 type CharArray = [u8];	// aliases cannot hide pointers or references

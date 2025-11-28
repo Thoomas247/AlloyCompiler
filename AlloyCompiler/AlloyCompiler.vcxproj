@@ -92,6 +92,7 @@
       </SubType>
     </ClInclude>
     <ClInclude Include="src\allocator.hpp" />
+    <ClInclude Include="src\AST.hpp" />
     <ClInclude Include="src\parser.hpp" />
     <ClInclude Include="src\result.hpp" />
     <ClInclude Include="src\source.hpp" />
