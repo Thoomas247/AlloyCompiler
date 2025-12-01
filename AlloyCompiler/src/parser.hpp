@@ -7,4 +7,4 @@
 #include "AST.hpp"
 #include "source.hpp"
 
-Result<Required<AST::Program>> parse(const Source& source, const std::vector<std::string>& tokens);
+Result<Required<AST::Module>> parse(const Source& source, const std::vector<std::string>& tokens);

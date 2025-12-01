@@ -12,6 +12,7 @@ public:
 		: m_pValue(nullptr)
 	{
 	}
+
 	Optional(T* pValue)
 		: m_pValue(pValue)
 	{
@@ -66,7 +67,12 @@ namespace AST
 	template <typename T>
 	struct ListNode
 	{
-		T item;
+		ListNode(Required<T> item, Optional<ListNode<T>> next)
+			: item(item), next(next)
+		{
+		}
+
+		Required<T> item;
 		Optional<ListNode<T>> next;
 
 		template <typename Function>
@@ -117,7 +123,7 @@ namespace AST
 
 	struct NamedType
 	{
-		TokenRef typeName;
+		Required<Token> typeName;
 		BaseType underlyingType;
 	};
 
@@ -125,7 +131,7 @@ namespace AST
 	{
 		struct Member
 		{
-			TokenRef name;
+			Required<Token> name;
 			Type type;
 		};
 
@@ -136,7 +142,7 @@ namespace AST
 	{
 		struct Member
 		{
-			TokenRef name;
+			Required<Token> name;
 			Optional<Type> payloadType;
 		};
 
@@ -165,7 +171,7 @@ namespace AST
 	struct Capture
 	{
 		Type::Modifier modifier;
-		TokenRef variableName;
+		Required<Token> variableName;
 	};
 
 	struct IfExpression
@@ -214,7 +220,7 @@ namespace AST
 
 	struct VariableDefinitionStatement
 	{
-		TokenRef name;
+		Required<Token> name;
 		Optional<Type> type;
 		Required<Expression> value;
 		bool isMutable;
@@ -237,7 +243,7 @@ namespace AST
 
 	struct FunctionParameter
 	{
-		TokenRef name;
+		Required<Token> name;
 		Required<Type> type;
 	};
 
@@ -254,20 +260,20 @@ namespace AST
 
 	struct TypeDefinition
 	{
-		TokenRef name;
+		Required<Token> name;
 		Required<BaseType> baseType;
 	};
 
 	struct FunctionDefinition
 	{
-		TokenRef name;
+		Required<Token> name;
 		Required<Function> function;
 	};
 
 	struct ExternDefinition
 	{
-		TokenRef name;
-		Required<ListNode<FunctionParameter>> parameters;
+		Required<Token> name;
+		Optional<ListNode<FunctionParameter>> parameters;
 		bool isVariadic;
 	};
 
@@ -286,7 +292,7 @@ namespace AST
 
 #pragma endregion
 
-	struct Program
+	struct Module
 	{
 		Optional<ListNode<std::string_view>> imports;
 		Optional<ListNode<Definition>> definitions;

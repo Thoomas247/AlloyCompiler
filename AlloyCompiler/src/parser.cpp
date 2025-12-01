@@ -1,4 +1,5 @@
 #include <vector>
+#include <functional>
 
 #include "logger.hpp"
 #include "allocator.hpp"
@@ -23,11 +24,17 @@ public:
 		return m_CurrentIndex >= m_Tokens.size();
 	}
 
+	/**
+	* Consumes the current token.
+	*/
 	const Token& consume()
 	{
 		return m_Tokens[m_CurrentIndex++];
 	}
 
+	/**
+	* Asserts that the current token is one of the expected kinds, then consumes it.
+	*/
 	template<TokenKind... Expected>
 	const Token& consume()
 	{
@@ -35,23 +42,17 @@ public:
 		return m_Tokens[m_CurrentIndex++];
 	}
 
+	/**
+	* Checks if the current token is one of the expected kinds.
+	* Displays an error message and does not consume the token if it is not.
+	*/
 	template<TokenKind... Expected>
-	std::pair<bool, TokenRef> consume(const std::string& expectedMessage)
+	std::pair<bool, const Token&> consume(const std::string& expectedMessage)
 	{
-		if (!hasNext())
-		{
-			m_Logger.logErrorInRange(
-				m_Tokens.back(),
-				m_Tokens.back(),
-				"Expected {}, but found end of file.",
-				expectedMessage
-			);
-			return { false, m_Tokens.back() };
-		}
-
 		const auto& token = peek();
 		if ((token.kind == Expected || ...))
 		{
+			m_CurrentIndex++;
 			return { true, token };
 		}
 		else
@@ -67,30 +68,40 @@ public:
 		}
 	}
 
+	/**
+	* Returns true if the current token is one of the expected kinds.
+	* Prints the given error message if it is not.
+	*/
 	template<TokenKind... Expected>
 	bool expect(const std::string& expectedMessage)
 	{
-		auto [success, token] = consume<Expected...>(expectedMessage);
-		if (success)
-		{
-			m_CurrentIndex++;
-		}
+		auto [success, _] = consume<Expected...>(expectedMessage);
 		return success;
 	}
 
+	/**
+	* Returns the current token without consuming it.
+	*/
 	const Token& peek(size_t offset = 0) const
 	{
 		ASSERT(m_CurrentIndex + offset < m_Tokens.size());
 		return m_Tokens[m_CurrentIndex + offset];
 	}
 
+	/**
+	* Returns the previously consumed token.
+	*/
 	const Token& previous() const
 	{
 		ASSERT(m_CurrentIndex > 0);
 		return m_Tokens[m_CurrentIndex - 1];
 	}
 
-	std::string_view createView(TokenRef startToken, TokenRef endToken) const
+	/**
+	* Creates a view into the source code in the given range.
+	* Start token is inclusive, end token is exclusive.
+	*/
+	std::string_view createView(const Token& startToken, const Token& endToken) const
 	{
 		const auto startIndex = startToken.start.index;
 		const auto endIndex = endToken.end.index;
@@ -121,6 +132,8 @@ struct ParserState
 	}
 };
 
+#pragma region Util
+
 using enum Status;
 using enum TokenKind;
 
@@ -130,9 +143,17 @@ using enum TokenKind;
 			return { Error }; \
 	} while(0)
 
+#define ERROR_IF_ERROR(status) \
+	do { \
+		if (status == Error) \
+			return { Error }; \
+	} while(0)
+
+#pragma endregion
+
 static Result<std::string_view> parseImport(ParserState& state)
 {
-	TokenRef errorToken = state.it.consume<Import>();
+	state.it.consume<Import>();
 
 	auto [success, startToken] = state.it.consume<Identifier>("module name after 'import' keyword");
 	ERROR_IF_FALSE(success);
@@ -148,44 +169,133 @@ static Result<std::string_view> parseImport(ParserState& state)
 		}
 	}
 
-	TokenRef endToken = state.it.previous();
+	const Token& endToken = state.it.previous();
 
-	state.it.consume<Semicolon>();
+	ERROR_IF_FALSE(state.it.expect<Semicolon>("';' after import statement"));
 
 	return { Ok, state.it.createView(startToken, endToken) };
 }
 
-static Result<Required<AST::Program>> parseProgram(ParserState& state)
+static Result<Required<AST::Type>> parseType(ParserState& state)
 {
-	auto program = state.allocator.allocate<AST::Program>();
 
-	Status status = Ok;
+}
+
+static Result<Required<AST::FunctionParameter>> parseFunctionParameter(ParserState& state)
+{
+	auto [success, nameToken] = state.it.consume<Identifier>("parameter name");
+	ERROR_IF_FALSE(success);
+
+	ERROR_IF_FALSE(state.it.expect<Colon>("':' after parameter name"));
+
+	auto [typeStatus, type] = parseType(state);
+	ERROR_IF_ERROR(typeStatus);
+
+	auto functionParameter = state.allocator.allocate<AST::FunctionParameter>(Required(&nameToken), type);
+
+	return { Ok, functionParameter };
+}
+
+static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState& state)
+{
+	state.it.consume<Extern>();
+
+	auto [success, functionNameToken] = state.it.consume<Identifier>("C function name after 'extern' keyword");
+	ERROR_IF_FALSE(success);
+
+	ERROR_IF_FALSE(state.it.expect<LParen>("'(' after extern function name"));
+
+	bool isVariadic = false;
+	Optional<AST::ListNode<AST::FunctionParameter>> functionParameters;
+	while (state.it.peek().kind != RParen)
+	{
+		auto [paramStatus, functionParameter] = parseFunctionParameter(state);
+		ERROR_IF_ERROR(paramStatus);
+
+		functionParameters = state.allocator.allocate<AST::ListNode<AST::FunctionParameter>>(
+			functionParameter,
+			functionParameters
+		);
+
+		if (state.it.peek().kind == Comma)
+		{
+			state.it.consume();
+			ERROR_IF_FALSE((state.it.expect<Identifier, Ellipsis>("function parameter declaration after ','")));
+		}
+		else if (state.it.peek().kind == Ellipsis)
+		{
+			state.it.consume();
+			isVariadic = true;
+			break;
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	if (!state.it.expect<RParen>("')' after extern function parameters"))
+	{
+		if (isVariadic)
+		{
+			state.logger.logInfo("'...' should always be the at the end of the parameter list.");
+		}
+
+		return { Error };
+	}
+
+	ERROR_IF_FALSE(state.it.expect<Semicolon>("';' after extern function declaration"));
+
+	return { Ok, state.allocator.allocate<AST::ExternDefinition>(Required(&functionNameToken), functionParameters, isVariadic) };
+}
+
+static Result<Required<AST::Module>> parseModule(ParserState& state)
+{
+	auto module = state.allocator.allocate<AST::Module>();
+
+	Optional<AST::ListNode<std::string_view>> imports;
+	Optional<AST::ListNode<AST::Definition>> definitions;
+
+	Status moduleStatus = Ok;
+
+	auto [importsResult, imports] = noneOrMore(state, Import, parseImport);
+
 	while (state.it.hasNext())
 	{
 		const auto& token = state.it.peek();
 		switch (token.kind)
 		{
-		case Import:
+		case Extern:
+		{
 
-			break;
+		}
 
 		case EndOfFile:
+		{
 			state.it.consume();
 			break;
-
-		default:
-			state.logger.logErrorInRange(token.start, token.end, "Unexpected token '{}'.", token);
-			status = Error;
+		}
+		case Import:
+		{
+			state.logger.logErrorInRange(token, token, "Import statements must appear before any definitions.");
+			moduleStatus = Error;
 			break;
+		}
+		default:
+		{
+			state.logger.logErrorInRange(token, token, "Unexpected token '{}'.", token);
+			moduleStatus = Error;
+			break;
+		}
 		}
 	}
 
-	return { status, Required(program) };
+	return { moduleStatus, module };
 }
 
-Result<Required<AST::Program>> parse(const Source& source, const std::vector<Token>& tokens)
+Result<Required<AST::Module>> parse(const Source& source, const std::vector<Token>& tokens)
 {
 	ParserState state(source, tokens);
 
-	return parseProgram(state);
+	return parseModule(state);
 }

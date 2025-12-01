@@ -7,19 +7,19 @@
 #include "tokenizer.hpp"
 
 template<typename... Args>
-static void logFatal(const std::string& format, Args&&... args)
+static void _logFatal(const std::string& format, Args&&... args)
 {
 	std::println("FATAL:{}", std::vformat(format, std::make_format_args(args...)));
 }
 
 template<typename... Args>
-static void logError(const std::string& format, Args&&... args)
+static void _logError(const std::string& format, Args&&... args)
 {
 	std::println("ERROR:{}", std::vformat(format, std::make_format_args(args...)));
 }
 
 template<typename... Args>
-static void logInfo(const std::string& format, Args&&... args)
+static void _logInfo(const std::string& format, Args&&... args)
 {
 	std::println("INFO:{}", std::vformat(format, std::make_format_args(args...)));
 }
@@ -41,7 +41,21 @@ public:
 	void logErrorInRange(TokenPosition startPos, TokenPosition, const std::string& format, Args&&... args)
 	{
 		m_HasError = true;
+		_logError("{}:{}:{}:", startPos.line, startPos.col, makeFormatted(format, args...));
+	}
 
+	template<typename... Args>
+	void logInfo(const std::string& format, Args&&... args)
+	{
+		_logInfo("{}:", makeFormatted(format, args...));
+	}
+
+	bool hasError() const { return m_HasError; }
+
+private:
+	template<typename... Args>
+	auto makeFormatted(const std::string& format, Args&&... args) const
+	{
 		// template magic to make type Token printable
 		// overload makePrintable to add more printable types
 		auto transformed = std::tuple{
@@ -58,12 +72,9 @@ public:
 			)
 		);
 
-		logError("{}:{}:{}", startPos.line, startPos.col, formatted);
+		return formatted;
 	}
 
-	bool hasError() const { return m_HasError; }
-
-private:
 	template<typename T>
 	auto makePrintable(const T& value) const
 	{

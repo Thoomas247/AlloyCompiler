@@ -76,6 +76,4 @@ struct Token
 	TokenPosition end;
 };
 
-using TokenRef = const Token&;
-
 Result<std::vector<Token>> tokenize(const Source& source);
