@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "source.hpp"
-#include "result.hpp"
+#include "../source/source.hpp"
+#include "../util/result.hpp"
 
 struct TokenPosition
 {

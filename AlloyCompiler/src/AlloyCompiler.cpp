@@ -1,16 +1,16 @@
 #include <filesystem>
 
-#include "logger.hpp"
-#include "source.hpp"
-#include "tokenizer.hpp"
-#include "parser.hpp"
+#include "source/source.hpp"
+#include "tokenizer/tokenizer.hpp"
+#include "parser/parser.hpp"
 
 namespace fs = std::filesystem;
 
 static void compileModule(const Source& source)
 {
-	const auto tokenizeResult = tokenize(source);
-	//const auto parseResult = parse(tokenizeResult.value);
+	auto [tokenizeStatus, tokens] = tokenize(source);
+	auto [parseStatus, parseResult] = parse(source, tokens);
+	auto& [moduleNode, allocator] = parseResult;
 	__debugbreak();
 }
 

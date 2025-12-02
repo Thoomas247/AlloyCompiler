@@ -2,7 +2,7 @@
 
 #include <variant>
 
-#include "tokenizer.hpp"
+#include "../tokenizer/tokenizer.hpp"
 
 template <typename T>
 class Optional
@@ -13,7 +13,7 @@ public:
 	{
 	}
 
-	Optional(T* pValue)
+	Optional(const T* pValue)
 		: m_pValue(pValue)
 	{
 	}
@@ -35,7 +35,7 @@ public:
 	}
 
 private:
-	T* m_pValue;
+	const T* m_pValue;
 };
 
 template <typename T>
@@ -47,7 +47,7 @@ public:
 	{
 	}
 
-	Required(T* pValue)
+	Required(const T* pValue)
 		: m_pValue(pValue)
 	{
 	}
@@ -58,8 +58,14 @@ public:
 		return m_pValue;
 	}
 
+	const T* ptr() const
+	{
+		ASSERT(m_pValue != nullptr);
+		return m_pValue;
+	}
+
 private:
-	T* m_pValue;
+	const T* m_pValue;
 };
 
 namespace AST
@@ -118,13 +124,12 @@ namespace AST
 		};
 
 		Modifier modifier;
-		std::variant<Required<BaseType>, Required<Type>> baseType;
+		std::variant<Required<BaseType>, Required<Type>> innerType;
 	};
 
 	struct NamedType
 	{
 		Required<Token> typeName;
-		BaseType underlyingType;
 	};
 
 	struct StructType
@@ -132,7 +137,7 @@ namespace AST
 		struct Member
 		{
 			Required<Token> name;
-			Type type;
+			Required<Type> type;
 		};
 
 		Optional<ListNode<Member>> members;
@@ -162,6 +167,8 @@ namespace AST
 	};
 
 #pragma endregion
+
+#pragma region Expression Nodes
 
 	struct Expression
 	{
@@ -210,6 +217,8 @@ namespace AST
 		Optional<ListNode<Capture>> captures;
 		Required<Function> function;
 	};
+
+#pragma endregion
 
 #pragma region Statement Nodes
 
@@ -287,7 +296,7 @@ namespace AST
 		};
 
 		Visibility visiblity;
-		std::variant<TypeDefinition, FunctionDefinition, ExternDefinition> definition;
+		std::variant<Required<TypeDefinition>, Required<FunctionDefinition>, Required<ExternDefinition>> definition;
 	};
 
 #pragma endregion

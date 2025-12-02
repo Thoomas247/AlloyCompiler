@@ -81,22 +81,22 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\AlloyCompiler.cpp" />
-    <ClCompile Include="src\logger.hpp" />
-    <ClCompile Include="src\parser.cpp" />
-    <ClCompile Include="src\source.cpp" />
-    <ClCompile Include="src\tokenizer.cpp" />
+    <ClCompile Include="src\util\logger.hpp" />
+    <ClCompile Include="src\parser\parser.cpp" />
+    <ClCompile Include="src\source\source.cpp" />
+    <ClCompile Include="src\tokenizer\tokenizer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="examples\main.alloy">
       <SubType>
       </SubType>
     </ClInclude>
-    <ClInclude Include="src\allocator.hpp" />
-    <ClInclude Include="src\AST.hpp" />
-    <ClInclude Include="src\parser.hpp" />
-    <ClInclude Include="src\result.hpp" />
-    <ClInclude Include="src\source.hpp" />
-    <ClInclude Include="src\tokenizer.hpp" />
+    <ClInclude Include="src\util\allocator.hpp" />
+    <ClInclude Include="src\parser\AST.hpp" />
+    <ClInclude Include="src\parser\parser.hpp" />
+    <ClInclude Include="src\util\result.hpp" />
+    <ClInclude Include="src\source\source.hpp" />
+    <ClInclude Include="src\tokenizer\tokenizer.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

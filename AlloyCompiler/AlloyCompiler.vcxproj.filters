@@ -18,16 +18,16 @@
     <ClCompile Include="src\AlloyCompiler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\tokenizer.cpp">
+    <ClCompile Include="src\tokenizer\tokenizer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\source.cpp">
+    <ClCompile Include="src\source\source.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\logger.hpp">
+    <ClCompile Include="src\util\logger.hpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\parser.cpp">
+    <ClCompile Include="src\parser\parser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -35,22 +35,22 @@
     <ClInclude Include="examples\main.alloy">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\tokenizer.hpp">
+    <ClInclude Include="src\tokenizer\tokenizer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\source.hpp">
+    <ClInclude Include="src\source\source.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\result.hpp">
+    <ClInclude Include="src\util\result.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\parser.hpp">
+    <ClInclude Include="src\parser\parser.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\allocator.hpp">
+    <ClInclude Include="src\util\allocator.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\AST.hpp">
+    <ClInclude Include="src\parser\AST.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

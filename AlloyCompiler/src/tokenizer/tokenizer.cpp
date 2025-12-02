@@ -3,8 +3,8 @@
 #include <unordered_map>
 #include <array>
 
-#include "logger.hpp"
-#include "source.hpp"
+#include "../util/logger.hpp"
+#include "../source/source.hpp"
 
 class SourceIterator
 {
@@ -150,7 +150,7 @@ static bool checkOperatorCombinations()
 			currentOp += suffix;
 			if (s_KnownSymbols.find(currentOp) == s_KnownSymbols.end())
 			{
-				logFatal("Operator combination '{}' is not defined in known symbols.", currentOp);
+				Log::fatal("Operator combination '{}' is not defined in known symbols.", currentOp);
 				return false;
 			}
 		}

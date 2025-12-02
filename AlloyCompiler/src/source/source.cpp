@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <fstream>
 
-#include "logger.hpp"
+#include "../util/logger.hpp"
 
 namespace fs = std::filesystem;
 
@@ -53,7 +53,7 @@ std::vector<Source> getSources(const fs::path& rootDir)
 
 		if (!fileStream.is_open())
 		{
-			logError("Could not read source file '{}'.", filePath.generic_string(), 12);
+			Log::error("Could not read source file '{}'.", filePath.generic_string(), 12);
 		}
 
 		std::stringstream stringStream;

@@ -4,24 +4,27 @@
 #include <format>
 #include <print>
 
-#include "tokenizer.hpp"
+#include "../tokenizer/tokenizer.hpp"
 
-template<typename... Args>
-static void _logFatal(const std::string& format, Args&&... args)
+namespace Log
 {
-	std::println("FATAL:{}", std::vformat(format, std::make_format_args(args...)));
-}
+	template<typename... Args>
+	static void fatal(const std::string& format, Args&&... args)
+	{
+		std::println("FATAL:{}", std::vformat(format, std::make_format_args(args...)));
+	}
 
-template<typename... Args>
-static void _logError(const std::string& format, Args&&... args)
-{
-	std::println("ERROR:{}", std::vformat(format, std::make_format_args(args...)));
-}
+	template<typename... Args>
+	static void error(const std::string& format, Args&&... args)
+	{
+		std::println("ERROR:{}", std::vformat(format, std::make_format_args(args...)));
+	}
 
-template<typename... Args>
-static void _logInfo(const std::string& format, Args&&... args)
-{
-	std::println("INFO:{}", std::vformat(format, std::make_format_args(args...)));
+	template<typename... Args>
+	static void info(const std::string& format, Args&&... args)
+	{
+		std::println("INFO:{}", std::vformat(format, std::make_format_args(args...)));
+	}
 }
 
 struct Token;
@@ -41,13 +44,13 @@ public:
 	void logErrorInRange(TokenPosition startPos, TokenPosition, const std::string& format, Args&&... args)
 	{
 		m_HasError = true;
-		_logError("{}:{}:{}:", startPos.line, startPos.col, makeFormatted(format, args...));
+		Log::error("{}:{}:{}", startPos.line, startPos.col, makeFormatted(format, args...));
 	}
 
 	template<typename... Args>
 	void logInfo(const std::string& format, Args&&... args)
 	{
-		_logInfo("{}:", makeFormatted(format, args...));
+		Log::info("{}", makeFormatted(format, args...));
 	}
 
 	bool hasError() const { return m_HasError; }
