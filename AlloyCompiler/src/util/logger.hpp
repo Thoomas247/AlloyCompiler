@@ -29,6 +29,11 @@ namespace Log
 
 struct Token;
 
+static constexpr auto expectedError(const std::string_view& expected, const std::string_view& found)
+{
+	return std::vformat("Expected {}, but found '{}'.", std::make_format_args(expected, found));
+}
+
 class Logger
 {
 public:

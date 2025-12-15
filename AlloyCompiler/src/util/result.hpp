@@ -1,6 +1,6 @@
 #pragma once
 
-enum class Status : uint8_t
+enum class Status
 {
 	Error = 0,
 	Ok
@@ -19,4 +19,9 @@ struct Result
 {
 	Status status;
 	T value;
+
+	explicit operator bool() const
+	{
+		return status == Status::Ok;
+	}
 };

@@ -50,6 +50,7 @@ public:
 	Required(const T* pValue)
 		: m_pValue(pValue)
 	{
+		ASSERT(m_pValue != nullptr);
 	}
 
 	const T& value() const
@@ -98,9 +99,15 @@ namespace AST
 	struct EnumType;
 	struct ArrayType;
 	struct FunctionType;
+
+	struct IfExpression;
+	struct ForExpression;
+	struct WhileExpression;
+	struct FunctionCallExpression;
+	struct LambdaExpression;
+
 	struct StatementBlock;
 	struct Statement;
-	struct Function;
 
 #pragma region Type Nodes
 
@@ -168,12 +175,32 @@ namespace AST
 
 #pragma endregion
 
+#pragma region Function Nodes
+
+	struct FunctionParameter
+	{
+		Required<Token> name;
+		Required<Type> type;
+	};
+
+	struct Function
+	{
+		Required<ListNode<FunctionParameter>> parameters;
+		Optional<Type> returnType;
+		Required<StatementBlock> body;
+	};
+
+#pragma endregion
+
 #pragma region Expression Nodes
 
-	struct Expression
-	{
-		// TODO
-	};
+	using Expression = std::variant<
+		Required<IfExpression>,
+		Required<ForExpression>,
+		Required<WhileExpression>,
+		Required<FunctionCallExpression>,
+		Required<LambdaExpression>
+	>;
 
 	struct Capture
 	{
@@ -183,26 +210,24 @@ namespace AST
 
 	struct IfExpression
 	{
-		using Branch = std::variant<Required<Expression>, Required<StatementBlock>>;
-
 		Required<Expression> condition;
 		Optional<Capture> capture;
-		Branch thenBranch;
-		Optional<Branch> elseBranch;
+		Required<Statement> thenBranch;
+		Optional<Statement> elseBranch;
 	};
 
 	struct ForExpression
 	{
 		Required<ListNode<Expression>> iterables;
-		Required<ListNode<Capture>> iterators;
-		Required<StatementBlock> body;
+		Optional<ListNode<Capture>> iterators;
+		Required<Statement> body;
 		Optional<Statement> elseBody;
 	};
 
 	struct WhileExpression
 	{
 		Required<Expression> condition;
-		Required<StatementBlock> body;
+		Required<Statement> body;
 		Optional<Statement> elseBody;
 	};
 
@@ -244,23 +269,6 @@ namespace AST
 	struct StatementBlock
 	{
 		Required<ListNode<Statement>> statements;
-	};
-
-#pragma endregion
-
-#pragma region Function Nodes
-
-	struct FunctionParameter
-	{
-		Required<Token> name;
-		Required<Type> type;
-	};
-
-	struct Function
-	{
-		Required<ListNode<FunctionParameter>> parameters;
-		Optional<Type> returnType;
-		Required<StatementBlock> body;
 	};
 
 #pragma endregion

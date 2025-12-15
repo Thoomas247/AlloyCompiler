@@ -81,6 +81,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\AlloyCompiler.cpp" />
+    <ClCompile Include="src\parser\token_iterator.cpp" />
     <ClCompile Include="src\util\logger.hpp" />
     <ClCompile Include="src\parser\parser.cpp" />
     <ClCompile Include="src\source\source.cpp" />
@@ -91,6 +92,7 @@
       <SubType>
       </SubType>
     </ClInclude>
+    <ClInclude Include="src\parser\token_iterator.hpp" />
     <ClInclude Include="src\util\allocator.hpp" />
     <ClInclude Include="src\parser\AST.hpp" />
     <ClInclude Include="src\parser\parser.hpp" />

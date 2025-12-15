@@ -54,8 +54,8 @@ enum class TokenKind
 	Not, NotEqual,
 	Less, ShiftLeft, ShiftLeftAssign, LessEqual,
 	Greater, ShiftRight, ShiftRightAssign, GreaterEqual,
-	And, LogicalAnd, AndAssign,
-	Or, LogicalOr, OrAssign,
+	BitwiseAnd, LogicalAnd, AndAssign,
+	BitwiseOr, LogicalOr, OrAssign,
 	BitwiseNot, BitwiseNotAssign,
 	Xor, XorAssign,
 

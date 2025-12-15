@@ -1,124 +1,13 @@
 #include <vector>
-#include <functional>
 
 #include "../util/logger.hpp"
 #include "../util/allocator.hpp"
 #include "../tokenizer/tokenizer.hpp"
 #include "../parser/parser.hpp"
+#include "token_iterator.hpp"
 
-class TokenIterator
-{
-public:
-	TokenIterator(Logger& logger, const Source& source, const std::vector<Token>& tokens)
-		: m_Logger(logger), m_Source(source), m_Tokens(tokens), m_CurrentIndex(0)
-	{
-	}
-
-	bool hasNext(size_t offset = 0) const
-	{
-		return (m_CurrentIndex + offset) < m_Tokens.size();
-	}
-
-	bool done() const
-	{
-		return m_CurrentIndex >= m_Tokens.size();
-	}
-
-	/**
-	* Consumes the current token.
-	*/
-	const Token& consume()
-	{
-		return m_Tokens[m_CurrentIndex++];
-	}
-
-	/**
-	* Asserts that the current token is one of the expected kinds, then consumes it.
-	*/
-	template<TokenKind... Expected>
-	const Token& consume()
-	{
-		ASSERT(((m_Tokens[m_CurrentIndex].kind == Expected) || ...));
-		return m_Tokens[m_CurrentIndex++];
-	}
-
-	/**
-	* Checks if the current token is one of the expected kinds.
-	* Displays an error message and does not consume the token if it is not.
-	*/
-	template<TokenKind... Expected>
-	std::pair<bool, const Token&> consume(const std::string& expectedMessage)
-	{
-		const auto& token = peek();
-		if (((token.kind == Expected) || ...))
-		{
-			m_CurrentIndex++;
-			return { true, token };
-		}
-		else
-		{
-			m_Logger.logErrorInRange(
-				token,
-				token,
-				"Expected {}, but found '{}'.",
-				expectedMessage,
-				token
-			);
-			return { false, token };
-		}
-	}
-
-	/**
-	* Returns true if the current token is one of the expected kinds.
-	* Prints the given error message if it is not.
-	*/
-	template<TokenKind... Expected>
-	bool expect(const std::string& expectedMessage)
-	{
-		auto [success, _] = consume<Expected...>(expectedMessage);
-		return success;
-	}
-
-	/**
-	* Returns the current token without consuming it.
-	*/
-	const Token& peek(size_t offset = 0) const
-	{
-		ASSERT(m_CurrentIndex + offset < m_Tokens.size());
-		return m_Tokens[m_CurrentIndex + offset];
-	}
-
-	/**
-	* Returns the previously consumed token.
-	*/
-	const Token& previous() const
-	{
-		ASSERT(m_CurrentIndex > 0);
-		return m_Tokens[m_CurrentIndex - 1];
-	}
-
-	/**
-	* Creates a view into the source code in the given range.
-	* Start token is inclusive, end token is exclusive.
-	*/
-	std::string_view createView(const Token& startToken, const Token& endToken) const
-	{
-		const auto startIndex = startToken.start.index;
-		const auto endIndex = endToken.end.index;
-
-		ASSERT(startIndex <= m_Source.data.size());
-		ASSERT(endIndex <= m_Source.data.size());
-		ASSERT(endIndex >= startIndex);
-
-		return std::string_view(&m_Source.data[startIndex], endIndex - startIndex);
-	}
-
-private:
-	Logger& m_Logger;
-	const Source& m_Source;
-	const std::vector<Token>& m_Tokens;
-	size_t m_CurrentIndex;
-};
+using enum Status;
+using enum TokenKind;
 
 struct ParserState
 {
@@ -134,20 +23,57 @@ struct ParserState
 
 #pragma region Util
 
-using enum Status;
-using enum TokenKind;
-
-#define ERROR_IF_FALSE(expr) \
-	do { \
-		if (!expr) \
-			return { Error }; \
+#define ERROR_IF_FALSE(expr)	\
+	do {						\
+		if (!expr)				\
+			return { Error };	\
 	} while(0)
 
-#define ERROR_IF_ERROR(status) \
-	do { \
-		if (status == Error) \
-			return { Error }; \
+#define ERROR_IF_ERROR(status)	\
+	do {						\
+		if (status == Error)	\
+			return { Error };	\
 	} while(0)
+
+
+#define ERROR()				\
+	do {					\
+		return { Error };	\
+	} while(0)
+
+static AST::Type::Modifier getTypeModifier(ParserState& state)
+{
+	auto modifier = AST::Type::Modifier::None;
+
+	if (state.it.peek().kind == Multiply)
+	{
+		state.it.consume<Multiply>();
+		if (state.it.peek().kind == Var)
+		{
+			modifier = AST::Type::Modifier::PointerToMutable;
+			state.it.consume<Var>();
+		}
+		else
+		{
+			modifier = AST::Type::Modifier::Pointer;
+		}
+	}
+	else if (state.it.peek().kind == BitwiseAnd)
+	{
+		state.it.consume<BitwiseAnd>();
+		if (state.it.peek().kind == Var)
+		{
+			modifier = AST::Type::Modifier::ReferenceToMutable;
+			state.it.consume<Var>();
+		}
+		else
+		{
+			modifier = AST::Type::Modifier::Reference;
+		}
+	}
+
+	return modifier;
+}
 
 #pragma endregion
 
@@ -157,30 +83,30 @@ static Result<Required<AST::Type>> parseType(ParserState& state);
 
 static Result<Required<AST::NamedType>> parseNamedType(ParserState& state)
 {
-	auto [success, typeNameToken] = state.it.consume<Identifier>("type name");
-	ERROR_IF_FALSE(success);
+	auto [status, typeNameToken] = state.it.consume<Identifier>("type name");
+	ERROR_IF_ERROR(status);
 
 	return { Ok, state.allocator.allocate<AST::NamedType>(Required(&typeNameToken)) };
 }
 
 static Result<Required<AST::StructType>> parseStructType(ParserState& state)
 {
-	state.it.consume<Struct>();
+	ASSERT(state.it.consume<Struct>());
 
-	ERROR_IF_FALSE(state.it.expect<LBrace>("'{' after 'struct' keyword"));
+	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after 'struct' keyword"));
 
 	Optional<AST::ListNode<AST::StructType::Member>> members;
 	while (state.it.peek().kind != RBrace)
 	{
-		auto [success, memberNameToken] = state.it.consume<Identifier>("member name");
-		ERROR_IF_FALSE(success);
+		auto [status, memberNameToken] = state.it.consume<Identifier>("member name");
+		ERROR_IF_ERROR(status);
 
-		ERROR_IF_FALSE(state.it.expect<Colon>("':' after member name"));
+		ERROR_IF_FALSE(state.it.consume<Colon>("':' after member name"));
 
 		auto [typeStatus, memberType] = parseType(state);
 		ERROR_IF_ERROR(typeStatus);
 
-		ERROR_IF_FALSE(state.it.expect<Semicolon>("';' after stuct member definition"));
+		ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after stuct member definition"));
 
 		auto member = state.allocator.allocate<AST::StructType::Member>(
 			Required(&memberNameToken),
@@ -193,22 +119,22 @@ static Result<Required<AST::StructType>> parseStructType(ParserState& state)
 		);
 	}
 
-	ERROR_IF_FALSE(state.it.expect<RBrace>("'}' after struct members"));
+	ERROR_IF_FALSE(state.it.consume<RBrace>("'}' after struct members"));
 
 	return { Ok, state.allocator.allocate<AST::StructType>(members) };
 }
 
 static Result<Required<AST::EnumType>> parseEnumType(ParserState& state)
 {
-	state.it.consume<Enum>();
+	ASSERT(state.it.consume<Enum>());
 
-	ERROR_IF_FALSE(state.it.expect<LBrace>("'{' after 'enum' keyword"));
+	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after 'enum' keyword"));
 
 	Optional<AST::ListNode<AST::EnumType::Member>> members;
 	while (state.it.peek().kind != RBrace)
 	{
-		auto [success, memberNameToken] = state.it.consume<Identifier>("member name");
-		ERROR_IF_FALSE(success);
+		auto [status, memberNameToken] = state.it.consume<Identifier>("member name");
+		ERROR_IF_ERROR(status);
 
 		Optional<AST::Type> payloadType;
 		if (state.it.peek().kind == Colon)
@@ -219,7 +145,7 @@ static Result<Required<AST::EnumType>> parseEnumType(ParserState& state)
 			payloadType = Optional(memberType.ptr());
 		}
 
-		ERROR_IF_FALSE(state.it.expect<Semicolon>("';' after enum member definition"));
+		ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after enum member definition"));
 
 		auto member = state.allocator.allocate<AST::EnumType::Member>(
 			Required(&memberNameToken),
@@ -232,14 +158,14 @@ static Result<Required<AST::EnumType>> parseEnumType(ParserState& state)
 		);
 	}
 
-	ERROR_IF_FALSE(state.it.expect<RBrace>("'}' after struct members"));
+	ERROR_IF_FALSE(state.it.consume<RBrace>("'}' after struct members"));
 
 	return { Ok, state.allocator.allocate<AST::EnumType>(members) };
 }
 
 static Result<Required<AST::ArrayType>> parseArrayType(ParserState& state)
 {
-	state.it.consume<LBracket>();
+	ASSERT(state.it.consume<LBracket>());
 
 	auto [typeStatus, elementType] = parseType(state);
 	ERROR_IF_ERROR(typeStatus);
@@ -249,20 +175,20 @@ static Result<Required<AST::ArrayType>> parseArrayType(ParserState& state)
 	{
 		state.it.consume<Semicolon>();
 
-		auto [success, sizeToken] = state.it.consume<IntegerLiteral>("integral array size after ';'");
-		ERROR_IF_FALSE(success);
+		auto [status, sizeToken] = state.it.consume<IntegerLiteral>("integral array size after ';'");
+		ERROR_IF_ERROR(status);
 
 		size = std::stoull(std::string(state.it.createView(sizeToken, sizeToken)));
 	}
 
-	ERROR_IF_FALSE(state.it.expect<RBracket>("']' after array type"));
+	ERROR_IF_FALSE(state.it.consume<RBracket>("']' after array type"));
 
 	return { Ok, state.allocator.allocate<AST::ArrayType>(elementType, size) };
 }
 
 static Result<Required<AST::FunctionType>> parseFunctionType(ParserState& state)
 {
-	state.it.consume<LParen>();
+	ASSERT(state.it.consume<LParen>());
 
 	Optional<AST::ListNode<AST::Type>> parameterTypes;
 
@@ -286,7 +212,7 @@ static Result<Required<AST::FunctionType>> parseFunctionType(ParserState& state)
 		}
 	}
 
-	ERROR_IF_FALSE(state.it.expect<RParen>("')' after function parameter types"));
+	ERROR_IF_FALSE(state.it.consume<RParen>("')' after function parameter types"));
 
 	Optional<AST::Type> returnType;
 
@@ -358,38 +284,11 @@ static Result<Required<AST::BaseType>> parseBaseType(ParserState& state)
 
 static Result<Required<AST::Type>> parseType(ParserState& state)
 {
-	AST::Type::Modifier modifier = AST::Type::Modifier::None;
-
-	if (state.it.peek().kind == Multiply)
-	{
-		state.it.consume<Multiply>();
-		if (state.it.peek().kind == Var)
-		{
-			modifier = AST::Type::Modifier::PointerToMutable;
-			state.it.consume<Var>();
-		}
-		else
-		{
-			modifier = AST::Type::Modifier::Pointer;
-		}
-	}
-	else if (state.it.peek().kind == And)
-	{
-		state.it.consume<And>();
-		if (state.it.peek().kind == Var)
-		{
-			modifier = AST::Type::Modifier::ReferenceToMutable;
-			state.it.consume<Var>();
-		}
-		else
-		{
-			modifier = AST::Type::Modifier::Reference;
-		}
-	}
+	auto modifier = getTypeModifier(state);
 
 	std::variant<Required<AST::BaseType>, Required<AST::Type>> innerType;
 
-	if (state.it.peek().kind == Multiply || state.it.peek().kind == And)
+	if (state.it.peek().kind == Multiply || state.it.peek().kind == BitwiseAnd)
 	{
 		auto [status, type] = parseType(state);
 		ERROR_IF_ERROR(status);
@@ -407,8 +306,162 @@ static Result<Required<AST::Type>> parseType(ParserState& state)
 
 #pragma endregion
 
-
 #pragma region Expression Nodes
+
+static Result<Required<AST::Expression>> parseExpression(ParserState& state);
+static Result<Required<AST::StatementBlock>> parseStatementBlock(ParserState& state);
+static Result<Required<AST::Statement>> parseStatement(ParserState& state);
+
+static Result<Required<AST::Capture>> parseCapture(ParserState& state)
+{
+	ASSERT(state.it.consume<BitwiseOr>());
+
+	auto modifier = getTypeModifier(state);
+	auto [success, captureNameToken] = state.it.consume<Identifier>("capture name");
+
+	return { Ok, state.allocator.allocate<AST::Capture>(modifier, Required(&captureNameToken)) };
+}
+
+static Result<Required<AST::IfExpression>> parseIfExpression(ParserState& state)
+{
+	ASSERT(state.it.consume<If>());
+
+	ERROR_IF_FALSE(state.it.consume<LParen>("'(' after 'if' keyword"));
+
+	auto [status, condition] = parseExpression(state);
+	ERROR_IF_ERROR(status);
+
+	ERROR_IF_FALSE(state.it.consume<RParen>("')' after condition"));
+
+	Optional<AST::Capture> ifCapture;
+	if (state.it.peek().kind == BitwiseOr)
+	{
+		state.it.consume();
+
+		auto [status, capture] = parseCapture(state);
+		ERROR_IF_ERROR(status);
+
+		ERROR_IF_FALSE(state.it.consume<BitwiseOr>("'|' after capture name"));
+
+		ifCapture = capture.ptr();
+	}
+
+	auto [status, thenBranch] = parseStatement(state);
+	ERROR_IF_ERROR(status);
+
+	Optional<AST::Statement> elseBranch;
+	if (state.it.peek().kind == Else)
+	{
+		state.it.consume();
+
+		auto [status, branch] = parseStatement(state);
+		ERROR_IF_ERROR(status);
+
+		elseBranch = branch.ptr();
+	}
+
+	return { Ok, state.allocator.allocate<AST::IfExpression>(condition, ifCapture, thenBranch, elseBranch) };
+}
+
+template <TokenKind EndTokenKind, typename T, typename F>
+static Optional<AST::ListNode<T>> zeroOrMore(ParserState& state, F&& parse)
+{
+	Optional<AST::ListNode<T>> listHead;
+	while (state.it.peek().kind != EndTokenKind)
+	{
+		auto [status, node] = parse(state);
+		ERROR_IF_ERROR(status);
+
+		listHead = state.allocator.allocate<AST::ListNode<T>>(
+			node,
+			listHead
+		);
+
+		if (state.it.peek().kind == Comma)
+		{
+			state.it.consume();
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	ASSERT(state.it.consume<EndTokenKind>());
+
+	return listHead;
+}
+
+static Result<Required<AST::ForExpression>> parseForExpression(ParserState& state)
+{
+	ASSERT(state.it.consume<For>());
+
+	ERROR_IF_FALSE(state.it.consume<LParen>("'(' after 'for' keyword"));
+
+	auto iterables = zeroOrMore<RParen, AST::Expression>(state, parseExpression);
+	if (!iterables.hasValue())
+	{
+		state.logger.logErrorInRange(state.it.previous(), state.it.previous(), expectedError("an iterable expression", ")"));
+		ERROR();
+	}
+
+	Optional<AST::ListNode<AST::Capture>> iterators;
+	if (state.it.peek().kind == BitwiseOr)
+	{
+		state.it.consume();
+
+		iterators = zeroOrMore<BitwiseOr, AST::Capture>(state, parseCapture);
+		if (!iterators.hasValue())
+		{
+			state.logger.logErrorInRange(state.it.previous(), state.it.previous(), expectedError("a capture name", "|"));
+			ERROR();
+		}
+	}
+
+	auto [status, body] = parseStatement(state);
+	ERROR_IF_ERROR(status);
+
+	Optional<AST::Statement> elseBody;
+	if (state.it.peek().kind == Else)
+	{
+		state.it.consume();
+
+		auto [status, statement] = parseStatement(state);
+		ERROR_IF_ERROR(status);
+
+		elseBody = statement.ptr();
+	}
+
+	return { Ok, state.allocator.allocate<AST::ForExpression>(Required(iterables.ptr()), iterators, body, elseBody) };
+}
+
+static Result<Required<AST::WhileExpression>> parseWhileExpression(ParserState& state)
+{
+	ASSERT(state.it.consume<While>());
+
+	ERROR_IF_FALSE(state.it.consume<LParen>("'(' after 'while' keyword"));
+
+	auto [status, condition] = parseExpression(state);
+	ERROR_IF_ERROR(status);
+
+	ERROR_IF_FALSE(state.it.consume<RParen>("')' after condition"));
+
+	auto [status, body] = parseStatement(state);
+	ERROR_IF_ERROR(status);
+
+	Optional<AST::Statement> elseBody;
+	if (state.it.peek().kind == Else)
+	{
+		state.it.consume();
+
+		auto [status, statement] = parseStatement(state);
+		ERROR_IF_ERROR(status);
+
+		elseBody = statement.ptr();
+	}
+
+	return { Ok, state.allocator.allocate<AST::WhileExpression>(condition, body, elseBody) };
+}
 
 #pragma endregion
 
@@ -421,10 +474,10 @@ static Result<Required<AST::Type>> parseType(ParserState& state)
 
 static Result<Required<AST::FunctionParameter>> parseFunctionParameter(ParserState& state)
 {
-	auto [success, nameToken] = state.it.consume<Identifier>("parameter name");
-	ERROR_IF_FALSE(success);
+	auto [status, nameToken] = state.it.consume<Identifier>("parameter name");
+	ERROR_IF_ERROR(status);
 
-	ERROR_IF_FALSE(state.it.expect<Colon>("':' after parameter name"));
+	ERROR_IF_FALSE(state.it.consume<Colon>("':' after parameter name"));
 
 	auto [typeStatus, type] = parseType(state);
 	ERROR_IF_ERROR(typeStatus);
@@ -442,10 +495,10 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 {
 	state.it.consume<Extern>();
 
-	auto [success, functionNameToken] = state.it.consume<Identifier>("C function name after 'extern' keyword");
-	ERROR_IF_FALSE(success);
+	auto [status, functionNameToken] = state.it.consume<Identifier>("C function name after 'extern' keyword");
+	ERROR_IF_ERROR(status);
 
-	ERROR_IF_FALSE(state.it.expect<LParen>("'(' after extern function name"));
+	ERROR_IF_FALSE(state.it.consume<LParen>("'(' after extern function name"));
 
 	bool isVariadic = false;
 	Optional<AST::ListNode<AST::FunctionParameter>> functionParameters;
@@ -462,7 +515,6 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 		if (state.it.peek().kind == Comma)
 		{
 			state.it.consume();
-			ERROR_IF_FALSE((state.it.expect<Identifier, Ellipsis>("function parameter declaration after ','")));
 		}
 		else if (state.it.peek().kind == Ellipsis)
 		{
@@ -476,7 +528,7 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 		}
 	}
 
-	if (!state.it.expect<RParen>("')' after extern function parameters"))
+	if (!state.it.consume<RParen>("')' after extern function parameters"))
 	{
 		if (isVariadic)
 		{
@@ -486,7 +538,7 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 		return { Error };
 	}
 
-	ERROR_IF_FALSE(state.it.expect<Semicolon>("';' after extern function declaration"));
+	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after extern function declaration"));
 
 	return { Ok, state.allocator.allocate<AST::ExternDefinition>(Required(&functionNameToken), functionParameters, isVariadic) };
 }
@@ -497,13 +549,13 @@ static Result<std::string_view> parseImport(ParserState& state)
 {
 	state.it.consume<Import>();
 
-	auto [success, startToken] = state.it.consume<Identifier>("module name after 'import' keyword");
-	ERROR_IF_FALSE(success);
+	auto [status, startToken] = state.it.consume<Identifier>("module name after 'import' keyword");
+	ERROR_IF_ERROR(status);
 
 	while (true)
 	{
-		ERROR_IF_FALSE(state.it.expect<DoubleColon>("'::' or ';' after module name"));
-		ERROR_IF_FALSE(state.it.expect<Identifier>("module name after '::'"));
+		ERROR_IF_FALSE(state.it.consume<DoubleColon>("'::' or ';' after module name"));
+		ERROR_IF_FALSE(state.it.consume<Identifier>("module name after '::'"));
 
 		if (state.it.peek().kind == Semicolon)
 		{
@@ -513,7 +565,7 @@ static Result<std::string_view> parseImport(ParserState& state)
 
 	const Token& endToken = state.it.previous();
 
-	ERROR_IF_FALSE(state.it.expect<Semicolon>("';' after import statement"));
+	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after import statement"));
 
 	return { Ok, state.it.createView(startToken, endToken) };
 }
