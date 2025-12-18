@@ -79,11 +79,7 @@ inline Result<const Token&> TokenIterator::consume(const std::string& expectedMe
 	}
 	else
 	{
-		m_Logger.logErrorInRange(
-			token,
-			token,
-			expectedError(expectedMessage, token)
-		);
+		m_Logger.logErrorUnexpected(token, token, expectedMessage, token);
 		return { Error, token };
 	}
 }

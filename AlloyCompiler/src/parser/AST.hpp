@@ -13,7 +13,7 @@ public:
 	{
 	}
 
-	Optional(const T* pValue)
+	Optional(T* pValue)
 		: m_pValue(pValue)
 	{
 	}
@@ -34,8 +34,13 @@ public:
 		return m_pValue;
 	}
 
+	T* ptr()
+	{
+		return m_pValue;
+	}
+
 private:
-	const T* m_pValue;
+	T* m_pValue;
 };
 
 template <typename T>
@@ -47,7 +52,7 @@ public:
 	{
 	}
 
-	Required(const T* pValue)
+	Required(T* pValue)
 		: m_pValue(pValue)
 	{
 		ASSERT(m_pValue != nullptr);
@@ -56,7 +61,13 @@ public:
 	const T& value() const
 	{
 		ASSERT(m_pValue != nullptr);
-		return m_pValue;
+		return *m_pValue;
+	}
+
+	T& value()
+	{
+		ASSERT(m_pValue != nullptr);
+		return *m_pValue;
 	}
 
 	const T* ptr() const
@@ -65,8 +76,14 @@ public:
 		return m_pValue;
 	}
 
+	T* ptr()
+	{
+		ASSERT(m_pValue != nullptr);
+		return m_pValue;
+	}
+
 private:
-	const T* m_pValue;
+	T* m_pValue;
 };
 
 namespace AST
@@ -105,6 +122,8 @@ namespace AST
 	struct WhileExpression;
 	struct FunctionCallExpression;
 	struct LambdaExpression;
+	struct BinaryExpression;
+	struct UnaryExpression;
 
 	struct StatementBlock;
 	struct Statement;
@@ -136,14 +155,14 @@ namespace AST
 
 	struct NamedType
 	{
-		Required<Token> typeName;
+		const Token& typeName;
 	};
 
 	struct StructType
 	{
 		struct Member
 		{
-			Required<Token> name;
+			const Token& name;
 			Required<Type> type;
 		};
 
@@ -154,7 +173,7 @@ namespace AST
 	{
 		struct Member
 		{
-			Required<Token> name;
+			const Token& name;
 			Optional<Type> payloadType;
 		};
 
@@ -179,13 +198,13 @@ namespace AST
 
 	struct FunctionParameter
 	{
-		Required<Token> name;
+		const Token& name;
 		Required<Type> type;
 	};
 
 	struct Function
 	{
-		Required<ListNode<FunctionParameter>> parameters;
+		Optional<ListNode<FunctionParameter>> parameters;
 		Optional<Type> returnType;
 		Required<StatementBlock> body;
 	};
@@ -199,13 +218,15 @@ namespace AST
 		Required<ForExpression>,
 		Required<WhileExpression>,
 		Required<FunctionCallExpression>,
-		Required<LambdaExpression>
+		Required<LambdaExpression>,
+		Required<BinaryExpression>,
+		Required<UnaryExpression>
 	>;
 
 	struct Capture
 	{
 		Type::Modifier modifier;
-		Required<Token> variableName;
+		const Token& variableName;
 	};
 
 	struct IfExpression
@@ -234,13 +255,26 @@ namespace AST
 	struct FunctionCallExpression
 	{
 		Required<Expression> function;
-		Required<ListNode<Expression>> arguments;
+		Optional<ListNode<Expression>> arguments;
 	};
 
 	struct LambdaExpression
 	{
 		Optional<ListNode<Capture>> captures;
 		Required<Function> function;
+	};
+
+	struct UnaryExpression
+	{
+		TokenKind op;
+		Required<Expression> expression;
+	};
+
+	struct BinaryExpression
+	{
+		TokenKind op;
+		Required<Expression> left;
+		Required<Expression> right;
 	};
 
 #pragma endregion
@@ -289,7 +323,7 @@ namespace AST
 
 	struct ExternDefinition
 	{
-		Required<Token> name;
+		const Token& name;
 		Optional<ListNode<FunctionParameter>> parameters;
 		bool isVariadic;
 	};

@@ -107,7 +107,7 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 	{">", Greater},		{">>", ShiftRight},			{">>=", ShiftRightAssign},	{">=", GreaterEqual},
 	{"&", BitwiseAnd},			{"&&", LogicalAnd},			{"&=", AndAssign},
 	{"|", BitwiseOr},			{"||", LogicalOr},			{"|=", OrAssign},
-	{"~", BitwiseNot},	{"~=", BitwiseNotAssign},
+	{"~", BitwiseNot},
 	{"^", Xor},			{"^=", XorAssign},
 
 	{"->", Arrow},
@@ -133,7 +133,7 @@ static const std::unordered_map<char, std::array<std::string_view, 3>> s_Operato
 
 	{'&', {"&", "="}},			// &, &&, &=
 	{'|', {"|", "="}},			// |, ||, |=
-	{'~', {"="}},				// ~, ~=
+	{'~', {}},					// ~
 	{'^', {"="}},				// ^, ^=
 
 	{'.', {".."}},				// ., ...

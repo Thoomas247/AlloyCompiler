@@ -29,15 +29,17 @@ namespace Log
 
 struct Token;
 
-static constexpr auto expectedError(const std::string_view& expected, const std::string_view& found)
-{
-	return std::vformat("Expected {}, but found '{}'.", std::make_format_args(expected, found));
-}
-
 class Logger
 {
 public:
 	Logger(const Source& source) : m_Source(source), m_HasError(false) {}
+
+	template<typename... Args>
+	void logErrorInRange(TokenPosition startPos, TokenPosition, const std::string& format, Args&&... args)
+	{
+		m_HasError = true;
+		Log::error("{}:{}:{}", startPos.line, startPos.col, makeFormatted(format, args...));
+	}
 
 	template<typename... Args>
 	void logErrorInRange(Token startToken, Token endToken, const std::string& format, Args&&... args)
@@ -45,11 +47,10 @@ public:
 		logErrorInRange(startToken.start, endToken.end, format, std::forward<Args>(args)...);
 	}
 
-	template<typename... Args>
-	void logErrorInRange(TokenPosition startPos, TokenPosition, const std::string& format, Args&&... args)
+	template<typename E, typename F>
+	void logErrorUnexpected(Token startToken, Token endToken, E&& expected, F&& found)
 	{
-		m_HasError = true;
-		Log::error("{}:{}:{}", startPos.line, startPos.col, makeFormatted(format, args...));
+		logErrorInRange(startToken, endToken, "Expected {}, but found '{}'.", expected, found);
 	}
 
 	template<typename... Args>
