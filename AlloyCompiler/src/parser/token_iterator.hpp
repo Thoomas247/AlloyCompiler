@@ -11,7 +11,7 @@ public:
 	/**
 	* Consumes the current token.
 	*/
-	const Token& consume();
+	Result<const Token&> consume();
 
 	/**
 	* Consumes if current token is one of the expected kinds.

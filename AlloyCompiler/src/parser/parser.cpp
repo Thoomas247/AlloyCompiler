@@ -82,6 +82,26 @@ static Result<Optional<AST::ListNode<T>>> zeroOrMore(ParserState& state, F&& par
 			node,
 			listHead
 		);
+	}
+
+	ASSERT(state.it.consume<EndTokenKind>());
+
+	return { Ok, listHead };
+}
+
+template <TokenKind EndTokenKind, typename T, typename F>
+static Result<Optional<AST::ListNode<T>>> commaSeparatedList(ParserState& state, F&& parse)
+{
+	Optional<AST::ListNode<T>> listHead;
+	while (state.it.peek().kind != EndTokenKind)
+	{
+		auto [status, node] = parse(state);
+		ERROR_IF_ERROR(status);
+
+		listHead = state.allocator.allocate<AST::ListNode<T>>(
+			node,
+			listHead
+		);
 
 		if (state.it.peek().kind == Comma)
 		{
@@ -144,8 +164,6 @@ static int getBinaryOperatorPrecedence(TokenKind kind)
 	default:
 		return -1;
 	}
-
-
 }
 
 static bool isUnaryOperator(TokenKind kind)
@@ -171,8 +189,9 @@ static bool isAssignmentOperator(TokenKind kind)
 		kind == TokenKind::XorAssign;
 }
 
-static Result<size_t> getOffsetToNext(const ParserState& state, TokenKind kind)
+static Result<size_t> getOffsetToClosing(const ParserState& state, TokenKind opening, TokenKind closing)
 {
+	size_t depth = 1;
 	size_t offset = 0;
 	while (true)
 	{
@@ -183,9 +202,18 @@ static Result<size_t> getOffsetToNext(const ParserState& state, TokenKind kind)
 			return { Error };
 		}
 
-		if (token.kind == kind)
+		if (token.kind == opening)
 		{
-			return { Ok, offset };
+			++depth;
+		}
+		else if (token.kind == closing)
+		{
+			--depth;
+
+			if (depth == 0)
+			{
+				return { Ok, offset };
+			}
 		}
 
 		++offset;
@@ -212,31 +240,28 @@ static Result<Required<AST::StructType>> parseStructType(ParserState& state)
 
 	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after 'struct' keyword"));
 
-	Optional<AST::ListNode<AST::StructType::Member>> members;
-	while (state.it.peek().kind != RBrace)
-	{
-		auto [status, memberNameToken] = state.it.consume<Identifier>("member name");
-		ERROR_IF_ERROR(status);
+	auto [status, members] = zeroOrMore<RBrace, AST::StructType::Member>(
+		state,
+		[](ParserState& state) -> Result<Required<AST::StructType::Member>>
+		{
+			auto [status, memberNameToken] = state.it.consume<Identifier>("member name");
+			ERROR_IF_ERROR(status);
 
-		ERROR_IF_FALSE(state.it.consume<Colon>("':' after member name"));
+			ERROR_IF_FALSE(state.it.consume<Colon>("':' after member name"));
 
-		auto [typeStatus, memberType] = parseType(state);
-		ERROR_IF_ERROR(typeStatus);
+			auto [typeStatus, memberType] = parseType(state);
+			ERROR_IF_ERROR(typeStatus);
 
-		ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after stuct member definition"));
+			ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after stuct member definition"));
 
-		auto member = state.allocator.allocate<AST::StructType::Member>(
-			memberNameToken,
-			memberType
-		);
+			return { Ok,  state.allocator.allocate<AST::StructType::Member>(
+				memberNameToken,
+				memberType
+			) };
+		}
+	);
 
-		members = state.allocator.allocate<AST::ListNode<AST::StructType::Member>>(
-			member,
-			members
-		);
-	}
-
-	ERROR_IF_FALSE(state.it.consume<RBrace>("'}' after struct members"));
+	ERROR_IF_ERROR(status);
 
 	return { Ok, state.allocator.allocate<AST::StructType>(members) };
 }
@@ -247,35 +272,33 @@ static Result<Required<AST::EnumType>> parseEnumType(ParserState& state)
 
 	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after 'enum' keyword"));
 
-	Optional<AST::ListNode<AST::EnumType::Member>> members;
-	while (state.it.peek().kind != RBrace)
-	{
-		auto [status, memberNameToken] = state.it.consume<Identifier>("member name");
-		ERROR_IF_ERROR(status);
-
-		Optional<AST::Type> payloadType;
-		if (state.it.peek().kind == Colon)
+	auto [status, members] = zeroOrMore<RBrace, AST::EnumType::Member>(
+		state,
+		[](ParserState& state) -> Result<Required<AST::EnumType::Member>>
 		{
-			auto [typeStatus, memberType] = parseType(state);
-			ERROR_IF_ERROR(typeStatus);
+			auto [status, memberNameToken] = state.it.consume<Identifier>("member name");
+			ERROR_IF_ERROR(status);
 
-			payloadType = Optional(memberType.ptr());
-		}
+			Optional<AST::Type> payloadType;
+			if (state.it.peek().kind == Colon)
+			{
+				state.it.consume();
 
-		ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after enum member definition"));
+				auto [typeStatus, memberType] = parseType(state);
+				ERROR_IF_ERROR(typeStatus);
 
-		auto member = state.allocator.allocate<AST::EnumType::Member>(
-			memberNameToken,
-			payloadType
-		);
+				payloadType = Optional(memberType.ptr());
+			}
 
-		members = state.allocator.allocate<AST::ListNode<AST::EnumType::Member>>(
-			member,
-			members
-		);
-	}
+			ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after enum member definition"));
 
-	ERROR_IF_FALSE(state.it.consume<RBrace>("'}' after struct members"));
+			return { Ok, state.allocator.allocate<AST::EnumType::Member>(
+				memberNameToken,
+				payloadType
+			) };
+		});
+
+	ERROR_IF_ERROR(status);
 
 	return { Ok, state.allocator.allocate<AST::EnumType>(members) };
 }
@@ -425,7 +448,7 @@ static Result<Required<AST::Type>> parseType(ParserState& state)
 
 #pragma region Function Nodes
 
-static Result<Required<AST::StatementBlock>> parseStatementBlock(ParserState& state) { return { Error }; }
+static Result<Required<AST::StatementBlock>> parseStatementBlock(ParserState& state);
 
 static Result<Required<AST::FunctionParameter>> parseFunctionParameter(ParserState& state)
 {
@@ -446,12 +469,14 @@ static Result<Required<AST::Function>> parseFunction(ParserState& state)
 {
 	ASSERT(state.it.consume<LParen>());
 
-	auto parametersResult = zeroOrMore<RParen, AST::FunctionParameter>(state, parseFunctionParameter);
+	auto parametersResult = commaSeparatedList<RParen, AST::FunctionParameter>(state, parseFunctionParameter);
 	ERROR_IF_FALSE(parametersResult);
 
 	Optional<AST::Type> returnType;
 	if (state.it.peek().kind == Arrow)
 	{
+		state.it.consume();
+
 		auto [status, type] = parseType(state);
 		ERROR_IF_ERROR(status);
 
@@ -469,7 +494,23 @@ static Result<Required<AST::Function>> parseFunction(ParserState& state)
 #pragma region Expression Nodes
 
 static Result<Required<AST::Expression>> parseExpression(ParserState& state, int minPrecedence = 0);
-static Result<Required<AST::Statement>> parseStatement(ParserState& state) { return { Error }; }
+static Result<Required<AST::Statement>> parseStatement(ParserState& state);
+
+static Result<Required<AST::LiteralExpression>> parseLiteralExpression(ParserState& state)
+{
+	auto [status, literalToken] = state.it.consume<CharLiteral, StringLiteral, IntegerLiteral, FloatLiteral>("a literal");
+	ERROR_IF_ERROR(status);
+
+	return { Ok, state.allocator.allocate<AST::LiteralExpression>(literalToken) };
+}
+
+static Result<Required<AST::VariableExpression>> parseVariableExpression(ParserState& state)
+{
+	auto [status, name] = state.it.consume<Identifier>();
+	ERROR_IF_ERROR(status);
+
+	return { Ok, state.allocator.allocate<AST::VariableExpression>(name) };
+}
 
 static Result<Required<AST::Capture>> parseCapture(ParserState& state)
 {
@@ -528,7 +569,7 @@ static Result<Required<AST::ForExpression>> parseForExpression(ParserState& stat
 
 	ERROR_IF_FALSE(state.it.consume<LParen>("'(' after 'for' keyword"));
 
-	auto iterablesResult = zeroOrMore<RParen, AST::Expression>(state, [](ParserState& state) { return parseExpression(state, 0); });
+	auto iterablesResult = commaSeparatedList<RParen, AST::Expression>(state, [](ParserState& state) { return parseExpression(state, 0); });
 	ERROR_IF_FALSE(iterablesResult);
 	if (!iterablesResult.value.hasValue())
 	{
@@ -541,7 +582,7 @@ static Result<Required<AST::ForExpression>> parseForExpression(ParserState& stat
 	{
 		state.it.consume();
 
-		auto [status, captures] = zeroOrMore<BitwiseOr, AST::Capture>(state, parseCapture);
+		auto [status, captures] = commaSeparatedList<BitwiseOr, AST::Capture>(state, parseCapture);
 		ERROR_IF_ERROR(status);
 
 		iterators = captures;
@@ -596,10 +637,32 @@ static Result<Required<AST::FunctionCallExpression>> parseFunctionCallExpression
 {
 	ASSERT(state.it.consume<LParen>());
 
-	auto [status, arguments] = zeroOrMore<RParen, AST::Expression>(state, [](ParserState& state) { return parseExpression(state, 0); });
+	auto [status, arguments] = commaSeparatedList<RParen, AST::Expression>(state, [](ParserState& state) { return parseExpression(state, 0); });
 	ERROR_IF_ERROR(status);
 
 	return { Ok, state.allocator.allocate<AST::FunctionCallExpression>(left, arguments) };
+}
+
+static Result<Required<AST::MemberAccessExpression>> parseMemberAccessExpression(ParserState& state, Required<AST::Expression> left)
+{
+	ASSERT(state.it.consume<Dot>());
+
+	auto [status, memberName] = state.it.consume<Identifier>("an identifier");
+	ERROR_IF_ERROR(status);
+
+	return { Ok, state.allocator.allocate<AST::MemberAccessExpression>(left, memberName) };
+}
+
+static Result<Required<AST::ArrayAccessExpression>> parseArrayAccessExpression(ParserState& state, Required<AST::Expression> left)
+{
+	ASSERT(state.it.consume<LBracket>());
+
+	auto [status, index] = parseExpression(state);
+	ERROR_IF_ERROR(status);
+
+	ERROR_IF_FALSE(state.it.consume<RBracket>("a ']' after the expression"));
+
+	return { Ok, state.allocator.allocate<AST::ArrayAccessExpression>(left, index) };
 }
 
 static Result<Required<AST::LambdaExpression>> parseLambdaExpression(ParserState& state)
@@ -609,7 +672,7 @@ static Result<Required<AST::LambdaExpression>> parseLambdaExpression(ParserState
 	{
 		state.it.consume();
 
-		auto [status, captureNames] = zeroOrMore<BitwiseOr, AST::Capture>(state, parseCapture);
+		auto [status, captureNames] = commaSeparatedList<BitwiseOr, AST::Capture>(state, parseCapture);
 		ERROR_IF_ERROR(status);
 
 		captures = captureNames;
@@ -656,7 +719,7 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 
 	case LParen:
 	{
-		auto seekResult = getOffsetToNext(state, RParen);
+		auto seekResult = getOffsetToClosing(state, LParen, RParen);
 		ERROR_IF_FALSE(seekResult);
 
 		if (state.it.peek(seekResult.value + 1).kind == Arrow)
@@ -677,9 +740,63 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 
 	case Identifier:
 	{
+		auto [status, expression] = parseVariableExpression(state);
+		ERROR_IF_ERROR(status);
+		return { Ok,  state.allocator.allocate<AST::Expression>(expression) };
+	}
 
+	case CharLiteral:
+	case StringLiteral:
+	case IntegerLiteral:
+	case FloatLiteral:
+	{
+		auto [status, expression] = parseLiteralExpression(state);
+		ERROR_IF_ERROR(status);
+		return { Ok,  state.allocator.allocate<AST::Expression>(expression) };
 	}
+
+	default:
+		state.logger.logErrorUnexpected(state.it.peek(), state.it.peek(), "an expression", state.it.peek());
+		return { Error };
 	}
+}
+
+static Result<Required<AST::Expression>> parsePostfixExpression(ParserState& state)
+{
+	auto [status, primary] = parsePrimaryExpression(state);
+	ERROR_IF_ERROR(status);
+
+	while (true)
+	{
+		if (state.it.peek().kind == LParen)
+		{
+			auto functionCallResult = parseFunctionCallExpression(state, primary);
+			ERROR_IF_FALSE(functionCallResult);
+
+			return { Ok, state.allocator.allocate<AST::Expression>(functionCallResult.value) };
+		}
+
+		if (state.it.peek().kind == Dot)
+		{
+			auto memberAccessResult = parseMemberAccessExpression(state, primary);
+			ERROR_IF_FALSE(memberAccessResult);
+
+			return { Ok, state.allocator.allocate<AST::Expression>(memberAccessResult.value) };
+		}
+
+
+		if (state.it.peek().kind == LBracket)
+		{
+			auto arrayAccessResult = parseArrayAccessExpression(state, primary);
+			ERROR_IF_FALSE(arrayAccessResult);
+
+			return { Ok, state.allocator.allocate<AST::Expression>(arrayAccessResult.value) };
+		}
+
+		break;
+	}
+
+	return { Ok, primary };
 }
 
 static Result<Required<AST::Expression>> parseUnaryExpression(ParserState& state)
@@ -700,7 +817,7 @@ static Result<Required<AST::Expression>> parseUnaryExpression(ParserState& state
 		) };
 	}
 
-	return parsePrimaryExpression(state);
+	return parsePostfixExpression(state);
 }
 
 static Result<Required<AST::Expression>> parseExpression(ParserState& state, int minPrecedence)
@@ -733,11 +850,198 @@ static Result<Required<AST::Expression>> parseExpression(ParserState& state, int
 
 #pragma region Statement Nodes
 
+static Result<Required<AST::VariableDefinitionStatement>> parseVariableDefinitionStatement(ParserState& state)
+{
+	auto keywordResult = state.it.consume<Var, Const>();
+	ASSERT(keywordResult);
 
+	bool isMutable = keywordResult.value.kind == Var;
+
+	auto nameResult = state.it.consume<Identifier>("a variable name");
+	ERROR_IF_FALSE(nameResult);
+
+	Optional<AST::Type> type;
+	if (state.it.peek().kind == Colon)
+	{
+		state.it.consume();
+
+		auto [status, variableType] = parseType(state);
+		ERROR_IF_ERROR(status);
+
+		type = variableType.ptr();
+	}
+
+	ERROR_IF_FALSE(state.it.consume<Assign>("an initializer"));
+
+	auto valueResult = parseExpression(state);
+	ERROR_IF_FALSE(valueResult);
+
+	ERROR_IF_FALSE(state.it.consume<Semicolon>());
+
+	return { Ok, state.allocator.allocate<AST::VariableDefinitionStatement>(nameResult.value, type, valueResult.value, isMutable) };
+}
+
+static Result<Required<AST::AssignmentStatement>> parseAssignmentStatement(ParserState& state)
+{
+	auto targetResult = parseExpression(state);
+	ERROR_IF_FALSE(targetResult);
+
+	auto [status, opToken] = state.it.consume();
+	ERROR_IF_ERROR(status);
+
+	if (!isAssignmentOperator(opToken.kind))
+	{
+		state.logger.logErrorUnexpected(opToken, opToken, "an assignment operator", opToken);
+	}
+
+	auto valueResult = parseExpression(state);
+	ERROR_IF_FALSE(valueResult);
+
+	return { Ok, state.allocator.allocate<AST::AssignmentStatement>(opToken.kind, targetResult.value, valueResult.value) };
+}
+
+static Result<Required<AST::StatementBlock>> parseStatementBlock(ParserState& state)
+{
+	ASSERT(state.it.consume<LBrace>());
+
+	auto [status, statements] = zeroOrMore<RBrace, AST::Statement>(state, parseStatement);
+	ERROR_IF_ERROR(status);
+
+	return { Ok, state.allocator.allocate<AST::StatementBlock>(statements) };
+}
+
+static Result<Required<AST::BreakStatement>> parseBreakStatement(ParserState& state)
+{
+	ASSERT(state.it.consume<Break>());
+
+	Optional<AST::Expression> breakValue;
+	if (state.it.peek().kind != Semicolon)
+	{
+		auto [status, value] = parseExpression(state);
+		ERROR_IF_ERROR(status);
+
+		breakValue = value.ptr();;
+	}
+
+	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after break statement"));
+
+	return { Ok, state.allocator.allocate<AST::BreakStatement>(breakValue) };
+}
+
+static Result<Required<AST::ReturnStatement>> parseReturnStatement(ParserState& state)
+{
+	ASSERT(state.it.consume<Return>());
+
+	Optional<AST::Expression> returnValue;
+	if (state.it.peek().kind != Semicolon)
+	{
+		auto [status, value] = parseExpression(state);
+		ERROR_IF_ERROR(status);
+
+		returnValue = value.ptr();
+	}
+
+	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after return statement"));
+
+	return { Ok, state.allocator.allocate<AST::ReturnStatement>(returnValue) };
+}
+
+static Result<Required<AST::Statement>> parseStatement(ParserState& state)
+{
+	switch (state.it.peek().kind)
+	{
+	case Var:
+	case Const:
+	{
+		auto [status, statement] = parseVariableDefinitionStatement(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	case LBrace:
+	{
+		auto [status, statement] = parseStatementBlock(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	case If:
+	{
+		auto [status, statement] = parseIfExpression(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	case For:
+	{
+		auto [status, statement] = parseForExpression(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	case While:
+	{
+		auto [status, statement] = parseWhileExpression(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	case Break:
+	{
+		auto [status, statement] = parseBreakStatement(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	case Return:
+	{
+		auto [status, statement] = parseReturnStatement(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+
+	default:
+	{
+		auto [status, statement] = parseAssignmentStatement(state);
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Statement>(statement) };
+	}
+	}
+}
 
 #pragma endregion
 
 #pragma region Definition Nodes
+
+static Result<Required<AST::TypeDefinition>> parseTypeDefinition(ParserState& state)
+{
+	ASSERT(state.it.consume<Type>());
+
+	auto [status, typeNameToken] = state.it.consume<Identifier>("type name after 'type' keyword");
+	ERROR_IF_ERROR(status);
+
+	ERROR_IF_FALSE(state.it.consume<Assign>("'=' after type name"));
+
+	auto baseTypeResult = parseBaseType(state);
+	ERROR_IF_FALSE(baseTypeResult);
+
+	ERROR_IF_FALSE(state.it.consume<Semicolon>("a semicolon after type definition"));
+
+	return { Ok, state.allocator.allocate<AST::TypeDefinition>(typeNameToken, baseTypeResult.value) };
+}
+
+static Result<Required<AST::FunctionDefinition>> parseFunctionDefinition(ParserState& state)
+{
+	ASSERT(state.it.consume<Fn>());
+
+	auto [status, functionNameToken] = state.it.consume<Identifier>("function name after 'fn' keyword");
+	ERROR_IF_ERROR(status);
+
+	auto functionResult = parseFunction(state);
+	ERROR_IF_FALSE(functionResult);
+
+	return { Ok, state.allocator.allocate<AST::FunctionDefinition>(functionNameToken, functionResult.value) };
+}
 
 static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState& state)
 {
@@ -752,6 +1056,13 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 	Optional<AST::ListNode<AST::FunctionParameter>> functionParameters;
 	while (state.it.peek().kind != RParen)
 	{
+		if (state.it.peek().kind == Ellipsis)
+		{
+			state.it.consume();
+			isVariadic = true;
+			break;
+		}
+
 		auto [paramStatus, functionParameter] = parseFunctionParameter(state);
 		ERROR_IF_ERROR(paramStatus);
 
@@ -763,12 +1074,6 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 		if (state.it.peek().kind == Comma)
 		{
 			state.it.consume();
-		}
-		else if (state.it.peek().kind == Ellipsis)
-		{
-			state.it.consume();
-			isVariadic = true;
-			break;
 		}
 		else
 		{
@@ -789,6 +1094,49 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after extern function declaration"));
 
 	return { Ok, state.allocator.allocate<AST::ExternDefinition>(functionNameToken, functionParameters, isVariadic) };
+}
+
+static Result<Required<AST::Definition>> parseDefinition(ParserState& state)
+{
+	const auto& token = state.it.peek();
+	switch (token.kind)
+	{
+	case Type:
+	{
+		auto [status, definition] = parseTypeDefinition(state);
+		ERROR_IF_ERROR(status);
+		return { Ok,  state.allocator.allocate<AST::Definition>(
+			AST::Definition::Visibility::Public,
+			definition
+		) };
+	}
+
+	case Fn:
+	{
+		auto [status, definition] = parseFunctionDefinition(state);
+		ERROR_IF_ERROR(status);
+		return { Ok,  state.allocator.allocate<AST::Definition>(
+			AST::Definition::Visibility::Public,
+			definition
+		) };
+	}
+
+	case Extern:
+	{
+		auto [status, definition] = parseExternDefinition(state);
+		ERROR_IF_ERROR(status);
+		return { Ok,  state.allocator.allocate<AST::Definition>(
+			AST::Definition::Visibility::Public,
+			definition
+		) };
+	}
+
+	default:
+	{
+		state.logger.logErrorUnexpected(token, token, "a definition", token);
+		return { Error };
+	}
+	}
 }
 
 #pragma endregion
@@ -828,37 +1176,13 @@ static Result<Required<AST::Module>> parseModule(ParserState& state)
 	while (state.it.hasNext())
 	{
 		const auto& token = state.it.peek();
-		switch (token.kind)
+		if (token.kind == Comment || token.kind == EndOfFile)
 		{
-		case Extern:
-		{
-			auto [status, externDefinition] = parseExternDefinition(state);
+			state.it.consume();
+			continue;
+		}
 
-			if (status == Ok)
-			{
-				const auto definition = state.allocator.allocate<AST::Definition>(
-					AST::Definition::Visibility::Public,
-					externDefinition
-				);
-				definitions = state.allocator.allocate<AST::ListNode<AST::Definition>>(
-					definition,
-					definitions
-				);
-			}
-			break;
-		}
-		case Comment:
-		{
-			// skip comments
-			state.it.consume();
-			break;
-		}
-		case EndOfFile:
-		{
-			state.it.consume();
-			break;
-		}
-		case Import:
+		if (token.kind == Import)
 		{
 			auto [status, importString] = parseImport(state);
 			if (status == Ok)
@@ -866,16 +1190,20 @@ static Result<Required<AST::Module>> parseModule(ParserState& state)
 				auto import = state.allocator.allocate<std::string_view>(importString);
 				imports = state.allocator.allocate<AST::ListNode<std::string_view>>(import, imports);
 			}
-			break;
+			continue;
 		}
-		default:
+
+		auto [status, definition] = parseDefinition(state);
+		if (status == Ok)
 		{
-			state.logger.logErrorInRange(token, token, "Unexpected token '{}'.", token);
-			moduleStatus = Error;
-			state.it.consume();
-			break;
+			definitions = state.allocator.allocate<AST::ListNode<AST::Definition>>(
+				definition,
+				definitions
+			);
+			continue;
 		}
-		}
+
+		state.it.consume();
 	}
 
 	return { moduleStatus, state.allocator.allocate<AST::Module>(imports, definitions) };

@@ -1,5 +1,7 @@
 #include "token_iterator.hpp"
 
+using enum Status;
+
 TokenIterator::TokenIterator(Logger& logger, const Source& source, const std::vector<Token>& tokens)
 	: m_Logger(logger), m_Source(source), m_Tokens(tokens), m_CurrentIndex(0)
 {
@@ -10,9 +12,14 @@ bool TokenIterator::hasNext(size_t offset) const
 	return (m_CurrentIndex + offset) < m_Tokens.size();
 }
 
-const Token& TokenIterator::consume()
+Result<const Token&> TokenIterator::consume()
 {
-	return m_Tokens[m_CurrentIndex++];
+	if (!hasNext())
+	{
+		return { Error, m_Tokens[m_CurrentIndex] };
+	}
+
+	return { Ok, m_Tokens[m_CurrentIndex++] };
 }
 
 const Token& TokenIterator::peek(size_t offset) const

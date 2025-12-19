@@ -42,6 +42,11 @@ type Vec3 = struct {
 	z: f32;
 };
 
+fn get_float() -> f32 {
+	return 7.421;
+}
+
+/*
 fn main() -> int {
 	const a: u32 = 23;
 	const b: i8 = 123;
@@ -86,10 +91,6 @@ fn main() -> int {
 	return 0;
 }
 
-fn get_float() -> f32 {
-	return 7.421;
-}
-
 fn call(func: () -> u64, func2: (u32)) {
 	func();
 	func2(123);
@@ -104,3 +105,4 @@ fn do_something2(param1: &var &Vec3)
 {
 	
 }
+*/
