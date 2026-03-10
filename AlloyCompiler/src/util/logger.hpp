@@ -39,6 +39,7 @@ public:
 	{
 		m_HasError = true;
 		Log::error("{}:{}:{}", startPos.line, startPos.col, makeFormatted(format, args...));
+		__debugbreak();
 	}
 
 	template<typename... Args>

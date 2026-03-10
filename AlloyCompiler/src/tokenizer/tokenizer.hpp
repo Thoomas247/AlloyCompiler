@@ -37,9 +37,13 @@ enum class TokenKind
 	Else,
 	While,
 	For,
+	Match,
 
 	Break,
 	Return,
+
+	New,
+	Move,
 
 	LParen, RParen,
 	LBrace, RBrace,

@@ -38,9 +38,12 @@ public:
 
 	/**
 	* Creates a view into the source code in the given range.
-	* Start token is inclusive, end token is exclusive.
+	* Both start and end token are inclusive.
 	*/
 	std::string_view createView(const Token& startToken, const Token& endToken) const;
+
+private:
+	void skipComments();
 
 private:
 	Logger& m_Logger;
@@ -53,11 +56,11 @@ template<TokenKind ...Expected>
 inline Result<const Token&> TokenIterator::consume()
 {
 	using enum Status;
-
 	const auto& token = peek();
 	if (((token.kind == Expected) || ...))
 	{
 		m_CurrentIndex++;
+		skipComments();
 		return { Ok, token };
 	}
 	else
@@ -70,11 +73,11 @@ template<TokenKind ...Expected>
 inline Result<const Token&> TokenIterator::consume(const std::string& expectedMessage)
 {
 	using enum Status;
-
 	const auto& token = peek();
 	if (((token.kind == Expected) || ...))
 	{
 		m_CurrentIndex++;
+		skipComments();
 		return { Ok, token };
 	}
 	else

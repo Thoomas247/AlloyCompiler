@@ -117,33 +117,43 @@ namespace AST
 	struct ArrayType;
 	struct FunctionType;
 
+	struct IdentifierExpression;
 	struct LiteralExpression;
-	struct VariableExpression;
 	struct IfExpression;
 	struct ForExpression;
 	struct WhileExpression;
+	struct MatchArm;
+	struct MatchExpression;
 	struct FunctionCallExpression;
 	struct MemberAccessExpression;
 	struct ArrayAccessExpression;
+	struct ArrayLiteralExpression;
+	struct ArrayFillExpression;
+	struct EnumVariantExpression;
 	struct LambdaExpression;
 	struct BinaryExpression;
 	struct UnaryExpression;
 
 	struct VariableDefinitionStatement;
 	struct AssignmentStatement;
+	struct ExpressionStatement;
 	struct StatementBlock;
 	struct BreakStatement;
 	struct ReturnStatement;
 
 	using Expression = std::variant<
+		Required<IdentifierExpression>,
 		Required<LiteralExpression>,
-		Required<VariableExpression>,
 		Required<IfExpression>,
 		Required<ForExpression>,
 		Required<WhileExpression>,
+		Required<MatchExpression>,
 		Required<FunctionCallExpression>,
 		Required<MemberAccessExpression>,
 		Required<ArrayAccessExpression>,
+		Required<ArrayLiteralExpression>,
+		Required<ArrayFillExpression>,
+		Required<EnumVariantExpression>,
 		Required<LambdaExpression>,
 		Required<BinaryExpression>,
 		Required<UnaryExpression>
@@ -152,10 +162,12 @@ namespace AST
 	using Statement = std::variant<
 		Required<VariableDefinitionStatement>,
 		Required<AssignmentStatement>,
+		Required<ExpressionStatement>,
 		Required<StatementBlock>,
 		Required<IfExpression>,
 		Required<ForExpression>,
 		Required<WhileExpression>,
+		Required<MatchExpression>,
 		Required<BreakStatement>,
 		Required<ReturnStatement>
 	>;
@@ -187,7 +199,7 @@ namespace AST
 
 	struct NamedType
 	{
-		const Token& typeName;
+		Required<IdentifierExpression> name;
 	};
 
 	struct StructType
@@ -245,14 +257,14 @@ namespace AST
 
 #pragma region Expression Nodes
 
+	struct IdentifierExpression
+	{
+		Required<ListNode<const Token*>> path;
+	};
+
 	struct LiteralExpression
 	{
 		const Token& value;
-	};
-
-	struct VariableExpression
-	{
-		const Token& name;
 	};
 
 	struct Capture
@@ -284,6 +296,20 @@ namespace AST
 		Optional<Statement> elseBody;
 	};
 
+	struct MatchArm
+	{
+		Required<IdentifierExpression> variant;
+		Optional<Capture> capture;
+		Required<Statement> body;
+	};
+
+	struct MatchExpression
+	{
+		Required<Expression> subject;
+		Optional<ListNode<MatchArm>> arms;
+		Optional<Statement> elseArm;
+	};
+
 	struct FunctionCallExpression
 	{
 		Required<Expression> function;
@@ -300,6 +326,23 @@ namespace AST
 	{
 		Required<Expression> object;
 		Required<Expression> index;
+	};
+
+	struct ArrayLiteralExpression
+	{
+		Optional<ListNode<Expression>> elements;
+	};
+
+	struct ArrayFillExpression
+	{
+		Required<Expression> value;
+		const Token& size;
+	};
+
+	struct EnumVariantExpression
+	{
+		const Token& typeName;
+		const Token& variantName;
 	};
 
 	struct LambdaExpression
@@ -338,6 +381,11 @@ namespace AST
 		TokenKind op;
 		Required<Expression> target;
 		Required<Expression> value;
+	};
+
+	struct ExpressionStatement
+	{
+		Required<Expression> expression;
 	};
 
 	struct StatementBlock
