@@ -1,9 +1,9 @@
 /*
 	Built in functions:
-	- XX.to_YY()
+	- XX.to<YY>()
 		~ convert from numeric type XX to numeric type YY, keeping the value the same
 		~ returns by value
-	- XX.as_YY()
+	- XX.as<YY>()
 		~ reinterpret the bytes of type XX as type YY
 		~ type YY must be of size smaller or equal to size of XX
 		~ returns by reference
@@ -46,24 +46,33 @@ fn get_float() -> f32 {
 	return 7.421;
 }
 
-fn main() -> int {
+fn main() -> u32 {
 	const a: u32 = 23;
 	const b: i8 = 123;
+
 	const f = get_float();
+
 	const str: [u8] = [ 1, 2, 3, 4, 5, 6, 7 ];
 	const heapStr: *[u8] = new [ 10, 20, 30, 40, 50 ];
 	const refStr: &[u8] = &heapStr;
+
 	const arr: [f32; 5] = [ 1, 2, 3, 4, 5 ];
-	const arr2 = [32.0.to_f32(); 10];
+	const arr2 = [32.0; 10];
+
+	const vec = Vec3 { .x = 1.0, .y = 2.0, .z = 3.0 };
+
 	var ref = &arr[2];
 	ref += &arr[3];
 	printf("ref value: %f\n", ref);
+
 	ref = arr2[1];
 	printf("ref value: %f\n", ref);
+
 	call(
 		| &arr | () { return arr[4]; },
 		(x: u32) { return; }
 	);
+
 	const value = for (arr, arr2) | &var val1, &var val2 | {
 		printf("val1: %f, val2: %f\n", val1, val2);
 		if (val1 > 3.0)
@@ -71,6 +80,7 @@ fn main() -> int {
 			break val2;
 		}
 	} else break 0.0;
+
 	var index = 0;
 	while (index < arr.length()) {
 		printf("arr[%d]: %f\n", index, arr[index]);

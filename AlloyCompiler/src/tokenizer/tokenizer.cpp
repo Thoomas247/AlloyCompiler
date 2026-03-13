@@ -76,6 +76,7 @@ using enum TokenKind;
 static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 {
 	{"import", Import},
+	{"as", As},
 
 	{"extern", Extern},
 	{"type", Type},

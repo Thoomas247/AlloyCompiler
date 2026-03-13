@@ -1,18 +1,11 @@
 #include <filesystem>
+#include <vector>
 
 #include "source/source.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "parser/parser.hpp"
 
 namespace fs = std::filesystem;
-
-static void compileModule(const Source& source)
-{
-	auto [tokenizeStatus, tokens] = tokenize(source);
-	auto [parseStatus, parseResult] = parse(source, tokens);
-	auto& [moduleNode, allocator] = parseResult;
-	__debugbreak();
-}
 
 int main()
 {
@@ -21,8 +14,10 @@ int main()
 
 	for (const auto& source : sources)
 	{
-		compileModule(source);
+		auto [tokenStatus, tokens] = tokenize(source);
+		auto [parseStatus, parseResult] = parse(source, tokens);
+		auto& [moduleNode, allocator] = parseResult;
 	}
-
+	
 	__debugbreak();
 }

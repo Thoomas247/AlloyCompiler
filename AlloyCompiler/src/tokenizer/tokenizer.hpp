@@ -25,6 +25,7 @@ enum class TokenKind
 	CharLiteral,
 
 	Import,
+	As,
 
 	Extern,
 	Type,

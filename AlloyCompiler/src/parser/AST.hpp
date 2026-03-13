@@ -3,88 +3,8 @@
 #include <variant>
 
 #include "../tokenizer/tokenizer.hpp"
-
-template <typename T>
-class Optional
-{
-public:
-	Optional()
-		: m_pValue(nullptr)
-	{
-	}
-
-	Optional(T* pValue)
-		: m_pValue(pValue)
-	{
-	}
-
-	bool hasValue() const
-	{
-		return m_pValue != nullptr;
-	}
-
-	const T& value() const
-	{
-		ASSERT(m_pValue != nullptr);
-		return *m_pValue;
-	}
-
-	const T* ptr() const
-	{
-		return m_pValue;
-	}
-
-	T* ptr()
-	{
-		return m_pValue;
-	}
-
-private:
-	T* m_pValue;
-};
-
-template <typename T>
-class Required
-{
-public:
-	Required()
-		: m_pValue(nullptr)
-	{
-	}
-
-	Required(T* pValue)
-		: m_pValue(pValue)
-	{
-		ASSERT(m_pValue != nullptr);
-	}
-
-	const T& value() const
-	{
-		ASSERT(m_pValue != nullptr);
-		return *m_pValue;
-	}
-
-	T& value()
-	{
-		ASSERT(m_pValue != nullptr);
-		return *m_pValue;
-	}
-
-	const T* ptr() const
-	{
-		ASSERT(m_pValue != nullptr);
-		return m_pValue;
-	}
-
-	T* ptr()
-	{
-		ASSERT(m_pValue != nullptr);
-		return m_pValue;
-	}
-
-private:
-	T* m_pValue;
-};
+#include "../util/pointers.hpp"
+#include "../util/allocator.hpp"
 
 namespace AST
 {
@@ -111,6 +31,25 @@ namespace AST
 		}
 	};
 
+	template <typename T>
+	struct ListBuilder
+	{
+		Optional<ListNode<T>> head;
+
+		void append(Required<T> item, Allocator& allocator)
+		{
+			auto* pNew = allocator.allocate<ListNode<T>>(item, Optional<ListNode<T>>());
+			if (!m_pTail)
+				head = pNew;
+			else
+				m_pTail->next = pNew;
+			m_pTail = pNew;
+		}
+
+	private:
+		ListNode<T>* m_pTail = nullptr;
+	};
+
 	struct NamedType;
 	struct StructType;
 	struct EnumType;
@@ -130,6 +69,7 @@ namespace AST
 	struct ArrayLiteralExpression;
 	struct ArrayFillExpression;
 	struct EnumVariantExpression;
+	struct StructInitializerExpression;
 	struct LambdaExpression;
 	struct BinaryExpression;
 	struct UnaryExpression;
@@ -154,6 +94,7 @@ namespace AST
 		Required<ArrayLiteralExpression>,
 		Required<ArrayFillExpression>,
 		Required<EnumVariantExpression>,
+		Required<StructInitializerExpression>,
 		Required<LambdaExpression>,
 		Required<BinaryExpression>,
 		Required<UnaryExpression>
@@ -345,6 +286,18 @@ namespace AST
 		const Token& variantName;
 	};
 
+	struct StructInitializerExpression
+	{
+		struct MemberInitializer
+		{
+			const Token& name;
+			Required<Expression> value;
+		};
+
+		Required<NamedType> type;
+		Optional<ListNode<MemberInitializer>> initializers;
+	};
+
 	struct LambdaExpression
 	{
 		Optional<ListNode<Capture>> captures;
@@ -441,9 +394,15 @@ namespace AST
 
 #pragma endregion
 
+	struct Import
+	{
+		std::string_view path;   // full module path, e.g. "a::b::c"
+		std::string_view alias;  // user-given alias; same as path if no alias
+	};
+
 	struct Module
 	{
-		Optional<ListNode<std::string_view>> imports;
+		Optional<ListNode<Import>> imports;
 		Optional<ListNode<Definition>> definitions;
 	};
 }

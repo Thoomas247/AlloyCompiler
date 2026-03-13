@@ -72,36 +72,32 @@ static AST::Type::Modifier getTypeModifier(ParserState& state)
 template <TokenKind EndTokenKind, typename T, typename F>
 static Result<Optional<AST::ListNode<T>>> zeroOrMore(ParserState& state, F&& parse)
 {
-	Optional<AST::ListNode<T>> listHead;
+	AST::ListBuilder<T> list;
+
 	while (state.it.peek().kind != EndTokenKind)
 	{
 		auto [status, node] = parse(state);
 		ERROR_IF_ERROR(status);
 
-		listHead = state.allocator.allocate<AST::ListNode<T>>(
-			node,
-			listHead
-		);
+		list.append(node, state.allocator);
 	}
 
 	ASSERT(state.it.consume<EndTokenKind>());
 
-	return { Ok, listHead };
+	return { Ok, list.head };
 }
 
 template <TokenKind EndTokenKind, typename T, typename F>
 static Result<Optional<AST::ListNode<T>>> commaSeparatedList(ParserState& state, F&& parse)
 {
-	Optional<AST::ListNode<T>> listHead;
+	AST::ListBuilder<T> list;
+
 	while (state.it.peek().kind != EndTokenKind)
 	{
 		auto [status, node] = parse(state);
 		ERROR_IF_ERROR(status);
 
-		listHead = state.allocator.allocate<AST::ListNode<T>>(
-			node,
-			listHead
-		);
+		list.append(node, state.allocator);
 
 		if (state.it.peek().kind == Comma)
 		{
@@ -115,7 +111,7 @@ static Result<Optional<AST::ListNode<T>>> commaSeparatedList(ParserState& state,
 
 	ASSERT(state.it.consume<EndTokenKind>());
 
-	return { Ok, listHead };
+	return { Ok, list.head };
 }
 
 static int getBinaryOperatorPrecedence(TokenKind kind)
@@ -334,17 +330,14 @@ static Result<Required<AST::FunctionType>> parseFunctionType(ParserState& state)
 {
 	ASSERT(state.it.consume<LParen>());
 
-	Optional<AST::ListNode<AST::Type>> parameterTypes;
+	AST::ListBuilder<AST::Type> parameterTypes;
 
 	while (state.it.peek().kind != RParen)
 	{
 		auto [typeStatus, parameterType] = parseType(state);
 		ERROR_IF_ERROR(typeStatus);
 
-		parameterTypes = state.allocator.allocate<AST::ListNode<AST::Type>>(
-			parameterType,
-			parameterTypes
-		);
+		parameterTypes.append(parameterType, state.allocator);
 
 		if (state.it.peek().kind == Comma)
 		{
@@ -370,7 +363,7 @@ static Result<Required<AST::FunctionType>> parseFunctionType(ParserState& state)
 		returnType = Optional(retType.ptr());
 	}
 
-	return { Ok, state.allocator.allocate<AST::FunctionType>(parameterTypes, returnType) };
+	return { Ok, state.allocator.allocate<AST::FunctionType>(parameterTypes.head, returnType) };
 }
 
 static Result<Required<AST::BaseType>> parseBaseType(ParserState& state)
@@ -503,15 +496,22 @@ static Result<Required<AST::Statement>> parseStatement(ParserState& state);
 static Result<Required<AST::IdentifierExpression>> parseIdentifierExpression(ParserState& state)
 {
 	Optional<AST::ListNode<const Token*>> path;
+	AST::ListNode<const Token*>* pPathTail = nullptr;
+
 	while (true)
 	{
 		auto [status, segment] = state.it.consume<Identifier>("identifier");
 		ERROR_IF_ERROR(status);
 
-		path = state.allocator.allocate<AST::ListNode<const Token*>>(
+		auto* pNew = state.allocator.allocate<AST::ListNode<const Token*>>(
 			state.allocator.allocate<const Token*>(&segment),
-			path
+			Optional<AST::ListNode<const Token*>>()
 		);
+		if (!pPathTail)
+			path = pNew;
+		else
+			pPathTail->next = pNew;
+		pPathTail = pNew;
 
 		if (state.it.peek().kind == DoubleColon)
 		{
@@ -667,6 +667,7 @@ static Result<Required<AST::MatchExpression>> parseMatchExpression(ParserState& 
 	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after match subject"));
 
 	Optional<AST::ListNode<AST::MatchArm>> arms;
+	AST::ListNode<AST::MatchArm>* pArmsTail = nullptr;
 	Optional<AST::Statement> elseArm;
 
 	while (state.it.peek().kind != RBrace)
@@ -701,10 +702,15 @@ static Result<Required<AST::MatchExpression>> parseMatchExpression(ParserState& 
 		auto [bodyStatus, body] = parseStatement(state);
 		ERROR_IF_ERROR(bodyStatus);
 
-		arms = state.allocator.allocate<AST::ListNode<AST::MatchArm>>(
+		auto* pNew = state.allocator.allocate<AST::ListNode<AST::MatchArm>>(
 			Required(state.allocator.allocate<AST::MatchArm>(variant, capture, body)),
-			arms
+			Optional<AST::ListNode<AST::MatchArm>>()
 		);
+		if (!pArmsTail)
+			arms = pNew;
+		else
+			pArmsTail->next = pNew;
+		pArmsTail = pNew;
 	}
 
 	ERROR_IF_FALSE(state.it.consume<RBrace>("'}' after match arms"));
@@ -761,6 +767,31 @@ static Result<Required<AST::LambdaExpression>> parseLambdaExpression(ParserState
 	ERROR_IF_ERROR(status);
 
 	return { Ok, state.allocator.allocate<AST::LambdaExpression>(captures, function) };
+}
+
+static Result<Required<AST::StructInitializerExpression>> parseStructInitializerExpression(ParserState& state)
+{
+	auto [typeStatus, type] = parseNamedType(state);
+	ERROR_IF_ERROR(typeStatus);
+
+	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after struct type name"));
+
+	auto [status, initializers] = commaSeparatedList<RBrace, AST::StructInitializerExpression::MemberInitializer>(
+		state,
+		[](ParserState& state) -> Result<Required<AST::StructInitializerExpression::MemberInitializer>>
+		{
+			ERROR_IF_FALSE(state.it.consume<Dot>("'.' before member name"));
+			auto [nameStatus, name] = state.it.consume<Identifier>("member name");
+			ERROR_IF_ERROR(nameStatus);
+			ERROR_IF_FALSE(state.it.consume<Assign>("'='"));
+			auto [valueStatus, value] = parseExpression(state);
+			ERROR_IF_ERROR(valueStatus);
+			return { Ok, state.allocator.allocate<AST::StructInitializerExpression::MemberInitializer>(name, value) };
+		}
+	);
+	ERROR_IF_ERROR(status);
+
+	return { Ok, state.allocator.allocate<AST::StructInitializerExpression>(type, initializers) };
 }
 
 static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& state)
@@ -848,7 +879,9 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 		}
 
 		// [a, b, c]
-		Optional<AST::ListNode<AST::Expression>> elements = state.allocator.allocate<AST::ListNode<AST::Expression>>(firstExpr, Optional<AST::ListNode<AST::Expression>>());
+		auto* pElemsTail = state.allocator.allocate<AST::ListNode<AST::Expression>>(firstExpr, Optional<AST::ListNode<AST::Expression>>());
+		Optional<AST::ListNode<AST::Expression>> elements = pElemsTail;
+
 		while (state.it.peek().kind == Comma)
 		{
 			state.it.consume<Comma>();
@@ -856,7 +889,9 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 			auto [elemStatus, elem] = parseExpression(state);
 			ERROR_IF_ERROR(elemStatus);
 
-			elements = state.allocator.allocate<AST::ListNode<AST::Expression>>(elem, elements);
+			auto* pNew = state.allocator.allocate<AST::ListNode<AST::Expression>>(elem, Optional<AST::ListNode<AST::Expression>>());
+			pElemsTail->next = pNew;
+			pElemsTail = pNew;
 		}
 
 		ERROR_IF_FALSE(state.it.consume<RBracket>("']' after array literal"));
@@ -868,6 +903,13 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 
 	case Identifier:
 	{
+		if (state.it.peek(1).kind == LBrace)
+		{
+			auto [status, expression] = parseStructInitializerExpression(state);
+			ERROR_IF_ERROR(status);
+			return { Ok, state.allocator.allocate<AST::Expression>(expression) };
+		}
+
 		auto [status, identifier] = parseIdentifierExpression(state);
 		ERROR_IF_ERROR(status);
 		return { Ok, state.allocator.allocate<AST::Expression>(identifier) };
@@ -971,7 +1013,8 @@ static Result<Required<AST::Expression>> parseExpression(ParserState& state, int
 		auto rightResult = parseExpression(state, precedence + 1);
 		ERROR_IF_FALSE(rightResult);
 
-		left.value() = state.allocator.allocate<AST::BinaryExpression>(op, left, rightResult.value);
+		auto* pBin = state.allocator.allocate<AST::BinaryExpression>(op, left, rightResult.value);
+		left = state.allocator.allocate<AST::Expression>(Required<AST::BinaryExpression>(pBin));
 	}
 
 	return { Ok, left };
@@ -1198,6 +1241,8 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 
 	bool isVariadic = false;
 	Optional<AST::ListNode<AST::FunctionParameter>> functionParameters;
+	AST::ListNode<AST::FunctionParameter>* pParamsTail = nullptr;
+
 	while (state.it.peek().kind != RParen)
 	{
 		if (state.it.peek().kind == Ellipsis)
@@ -1210,10 +1255,12 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 		auto [paramStatus, functionParameter] = parseFunctionParameter(state);
 		ERROR_IF_ERROR(paramStatus);
 
-		functionParameters = state.allocator.allocate<AST::ListNode<AST::FunctionParameter>>(
-			functionParameter,
-			functionParameters
-		);
+		auto* pNew = state.allocator.allocate<AST::ListNode<AST::FunctionParameter>>(functionParameter, Optional<AST::ListNode<AST::FunctionParameter>>());
+		if (!pParamsTail)
+			functionParameters = pNew;
+		else
+			pParamsTail->next = pNew;
+		pParamsTail = pNew;
 
 		if (state.it.peek().kind == Comma)
 		{
@@ -1285,30 +1332,42 @@ static Result<Required<AST::Definition>> parseDefinition(ParserState& state)
 
 #pragma endregion
 
-static Result<std::string_view> parseImport(ParserState& state)
+static Result<AST::Import> parseImport(ParserState& state)
 {
 	ASSERT(state.it.consume<Import>());
 
 	auto [status, startToken] = state.it.consume<Identifier>("module name after 'import' keyword");
 	ERROR_IF_ERROR(status);
 
-	while (state.it.peek().kind != Semicolon)
+	while (state.it.peek().kind != Semicolon && state.it.peek().kind != As)
 	{
-		ERROR_IF_FALSE(state.it.consume<DoubleColon>("'::' or ';' after module name"));
+		ERROR_IF_FALSE(state.it.consume<DoubleColon>("'::' or ';' or 'as' after module name"));
 		ERROR_IF_FALSE(state.it.consume<Identifier>("module name after '::'"));
 	}
 
 	const Token& endToken = state.it.previous();
+	std::string_view path = state.it.createView(startToken, endToken);
+
+	std::string_view alias = path;
+	if (state.it.peek().kind == As)
+	{
+		state.it.consume<As>();
+		auto [aliasStatus, aliasToken] = state.it.consume<Identifier>("alias name after 'as'");
+		ERROR_IF_ERROR(aliasStatus);
+		alias = state.it.createView(aliasToken, aliasToken);
+	}
 
 	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after import statement"));
 
-	return { Ok, state.it.createView(startToken, endToken) };
+	return { Ok, AST::Import{ path, alias } };
 }
 
 static Result<Required<AST::Module>> parseModule(ParserState& state)
 {
-	Optional<AST::ListNode<std::string_view>> imports;
+	Optional<AST::ListNode<AST::Import>> imports;
+	AST::ListNode<AST::Import>* pImportsTail = nullptr;
 	Optional<AST::ListNode<AST::Definition>> definitions;
+	AST::ListNode<AST::Definition>* pDefinitionsTail = nullptr;
 
 	while (state.it.hasNext())
 	{
@@ -1321,11 +1380,18 @@ static Result<Required<AST::Module>> parseModule(ParserState& state)
 
 		if (token.kind == Import)
 		{
-			auto [status, importString] = parseImport(state);
+			auto [status, importNode] = parseImport(state);
 			if (status == Ok)
 			{
-				auto import = state.allocator.allocate<std::string_view>(importString);
-				imports = state.allocator.allocate<AST::ListNode<std::string_view>>(import, imports);
+				auto* pNew = state.allocator.allocate<AST::ListNode<AST::Import>>(
+					state.allocator.allocate<AST::Import>(importNode),
+					Optional<AST::ListNode<AST::Import>>()
+				);
+				if (!pImportsTail)
+					imports = pNew;
+				else
+					pImportsTail->next = pNew;
+				pImportsTail = pNew;
 			}
 			continue;
 		}
@@ -1333,10 +1399,12 @@ static Result<Required<AST::Module>> parseModule(ParserState& state)
 		auto [status, definition] = parseDefinition(state);
 		if (status == Ok)
 		{
-			definitions = state.allocator.allocate<AST::ListNode<AST::Definition>>(
-				definition,
-				definitions
-			);
+			auto* pNew = state.allocator.allocate<AST::ListNode<AST::Definition>>(definition, Optional<AST::ListNode<AST::Definition>>());
+			if (!pDefinitionsTail)
+				definitions = pNew;
+			else
+				pDefinitionsTail->next = pNew;
+			pDefinitionsTail = pNew;
 			continue;
 		}
 
