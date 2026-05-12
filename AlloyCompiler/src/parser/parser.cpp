@@ -449,6 +449,12 @@ static Result<Required<AST::StatementBlock>> parseStatementBlock(ParserState& st
 
 static Result<Required<AST::FunctionParameter>> parseFunctionParameter(ParserState& state)
 {
+	bool isSelf = state.it.peek().kind == Self;
+	if (isSelf)
+	{
+		state.it.consume<Self>();
+	}
+
 	auto [status, nameToken] = state.it.consume<Identifier>("parameter name");
 	ERROR_IF_ERROR(status);
 
@@ -457,9 +463,7 @@ static Result<Required<AST::FunctionParameter>> parseFunctionParameter(ParserSta
 	auto [typeStatus, type] = parseType(state);
 	ERROR_IF_ERROR(typeStatus);
 
-	auto functionParameter = state.allocator.allocate<AST::FunctionParameter>(nameToken, type);
-
-	return { Ok, functionParameter };
+	return { Ok, state.allocator.allocate<AST::FunctionParameter>(nameToken, type, isSelf) };
 }
 
 static Result<Required<AST::Function>> parseFunction(ParserState& state)
@@ -468,6 +472,15 @@ static Result<Required<AST::Function>> parseFunction(ParserState& state)
 
 	auto parametersResult = commaSeparatedList<RParen, AST::FunctionParameter>(state, parseFunctionParameter);
 	ERROR_IF_FALSE(parametersResult);
+
+	bool isFirstParam = true;
+	parametersResult.value.forEach([&](const Required<AST::FunctionParameter>& param)
+		{
+			if (!isFirstParam && param.value().isSelf)
+				state.logger.logErrorInRange(param.value().name, param.value().name,
+					"'self' is only allowed on the first parameter.");
+			isFirstParam = false;
+		});
 
 	Optional<AST::Type> returnType;
 	if (state.it.peek().kind == Arrow)

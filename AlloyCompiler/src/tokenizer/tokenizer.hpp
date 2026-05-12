@@ -45,6 +45,7 @@ enum class TokenKind
 
 	New,
 	Move,
+	Self,
 
 	LParen, RParen,
 	LBrace, RBrace,

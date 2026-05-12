@@ -96,6 +96,7 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 
 	{"new", New},
 	{"move", Move},
+	{"self", Self},
 
 	{"(", LParen},		{")", RParen},
 	{"{", LBrace},		{"}", RBrace},

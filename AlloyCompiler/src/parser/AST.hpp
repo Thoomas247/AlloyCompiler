@@ -183,6 +183,7 @@ namespace AST
 	{
 		const Token& name;
 		Required<Type> type;
+		bool isSelf;   // true iff declared with 'self' keyword
 	};
 
 	struct Function
