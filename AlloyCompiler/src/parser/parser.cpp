@@ -731,14 +731,64 @@ static Result<Required<AST::MatchExpression>> parseMatchExpression(ParserState& 
 	return { Ok, state.allocator.allocate<AST::MatchExpression>(subject, arms, elseArm) };
 }
 
-static Result<Required<AST::FunctionCallExpression>> parseFunctionCallExpression(ParserState& state, Required<AST::Expression> left)
+static Result<Required<AST::FunctionCallExpression>> parseFunctionCallExpression(
+	ParserState& state,
+	Required<AST::Expression> left,
+	Optional<AST::ListNode<AST::Type>> typeArgs = Optional<AST::ListNode<AST::Type>>())
 {
 	ASSERT(state.it.consume<LParen>());
 
 	auto [status, arguments] = commaSeparatedList<RParen, AST::Expression>(state, [](ParserState& state) { return parseExpression(state, 0); });
 	ERROR_IF_ERROR(status);
 
-	return { Ok, state.allocator.allocate<AST::FunctionCallExpression>(left, arguments) };
+	return { Ok, state.allocator.allocate<AST::FunctionCallExpression>(left, typeArgs, arguments) };
+}
+
+// Returns true if the current '<' token is the start of a generic type argument list
+// (i.e. '<Types...>' followed by '('), rather than a less-than comparison operator.
+static bool isGenericCallAhead(const ParserState& state)
+{
+	int depth = 1;
+	size_t offset = 1;  // start scanning after the '<'
+
+	while (true)
+	{
+		auto kind = state.it.peek(offset).kind;
+
+		if (kind == EndOfFile)
+			return false;
+
+		if (kind == Less)
+		{
+			++depth;
+		}
+		else if (kind == Greater)
+		{
+			--depth;
+			if (depth == 0)
+				return state.it.peek(offset + 1).kind == LParen;
+		}
+		else if (
+			kind == Identifier ||
+			kind == DoubleColon ||
+			kind == Multiply ||
+			kind == BitwiseAnd ||
+			kind == Var ||
+			kind == LBracket ||
+			kind == RBracket ||
+			kind == Comma ||
+			kind == Semicolon ||
+			kind == IntegerLiteral)
+		{
+			// valid tokens inside a type expression — continue
+		}
+		else
+		{
+			return false;  // value-expression operator or non-integer literal → comparison
+		}
+
+		++offset;
+	}
 }
 
 static Result<Required<AST::MemberAccessExpression>> parseMemberAccessExpression(ParserState& state, Required<AST::Expression> left)
@@ -963,6 +1013,20 @@ static Result<Required<AST::Expression>> parsePostfixExpression(ParserState& sta
 			ERROR_IF_FALSE(functionCallResult);
 
 			primary = state.allocator.allocate<AST::Expression>(functionCallResult.value);
+			continue;
+		}
+
+		if (state.it.peek().kind == Less && isGenericCallAhead(state))
+		{
+			state.it.consume<Less>();
+			auto [taStatus, typeArgs] = commaSeparatedList<Greater, AST::Type>(state,
+				[](ParserState& state) -> Result<Required<AST::Type>> { return parseType(state); });
+			ERROR_IF_ERROR(taStatus);
+
+			auto callResult = parseFunctionCallExpression(state, primary, typeArgs);
+			ERROR_IF_FALSE(callResult);
+
+			primary = state.allocator.allocate<AST::Expression>(callResult.value);
 			continue;
 		}
 
@@ -1243,10 +1307,37 @@ static Result<Required<AST::FunctionDefinition>> parseFunctionDefinition(ParserS
 	auto [status, functionNameToken] = state.it.consume<Identifier>("function name after 'fn' keyword");
 	ERROR_IF_ERROR(status);
 
+	// optional type parameter list: fn name<T: Interface, U>(...)
+	Optional<AST::ListNode<AST::TypeParameter>> typeParams;
+	if (state.it.peek().kind == Less)
+	{
+		state.it.consume<Less>();
+		auto [tpStatus, tpList] = commaSeparatedList<Greater, AST::TypeParameter>(
+			state,
+			[](ParserState& state) -> Result<Required<AST::TypeParameter>>
+			{
+				auto [nameStatus, nameToken] = state.it.consume<Identifier>("type parameter name");
+				ERROR_IF_ERROR(nameStatus);
+
+				Optional<Token> interface;
+				if (state.it.peek().kind == Colon)
+				{
+					state.it.consume<Colon>();
+					auto [ifStatus, ifToken] = state.it.consume<Identifier>("interface name after ':'");
+					ERROR_IF_ERROR(ifStatus);
+					interface = Optional(state.allocator.allocate<Token>(ifToken));
+				}
+
+				return { Ok, state.allocator.allocate<AST::TypeParameter>(nameToken, interface) };
+			});
+		ERROR_IF_ERROR(tpStatus);
+		typeParams = tpList;
+	}
+
 	auto functionResult = parseFunction(state);
 	ERROR_IF_FALSE(functionResult);
 
-	return { Ok, state.allocator.allocate<AST::FunctionDefinition>(functionNameToken, functionResult.value) };
+	return { Ok, state.allocator.allocate<AST::FunctionDefinition>(functionNameToken, typeParams, functionResult.value) };
 }
 
 static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState& state)

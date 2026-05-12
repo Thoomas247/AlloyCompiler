@@ -111,14 +111,23 @@ struct ResolveState : ResolverState
 		: ResolverState(source), moduleScope(moduleScope) {
 	}
 
-	const ResolvedDeclaration* lookup(std::string_view name, const ScopedSymbolTable* scope) const
+	// returns all candidates for name. Local scope (variables/params) always produces at most one
+	std::vector<const ResolvedDeclaration*> lookup(std::string_view name, const ScopedSymbolTable* scope) const
 	{
 		if (scope)
 		{
 			if (auto* decl = scope->lookupLocal(name))
-				return decl;
+				return { decl };
 		}
-		return moduleScope.get(name);
+		return moduleScope.get(name);  // may return multiple for overloaded functions
+	}
+
+	// convenience for contexts where only a single declaration is valid (captures, type names)
+	// returns nullptr if not found or if multiple candidates exist
+	const ResolvedDeclaration* lookupSingle(std::string_view name, const ScopedSymbolTable* scope) const
+	{
+		auto candidates = lookup(name, scope);
+		return candidates.size() == 1 ? candidates[0] : (candidates.empty() ? nullptr : candidates[0]);
 	}
 
 	const SymbolTable* findImport(std::string_view alias) const
@@ -128,8 +137,8 @@ struct ResolveState : ResolverState
 	}
 };
 
-// Wraps arena-allocated node (const ref) in a non-const Required<T>.
-// Safe because arena allocations are non-const by origin.
+// wraps arena-allocated node (const ref) in a non-const Required<T>
+// safe because arena allocations are non-const by origin
 template<typename T>
 static Required<T> asRequired(const T& ref)
 {
@@ -159,25 +168,24 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 	{
 		auto name = state.getStringView(*firstToken);
 
-
 		// check if built-in type
 		if (s_BuiltinTypeNames.contains(name))
 		{
 			return;
 		}
 
-		auto* decl = state.lookup(name, scope);
-		if (!decl)
+		auto candidates = state.lookup(name, scope);
+		if (candidates.empty())
 		{
 			state.logger.logErrorInRange(*firstToken, *firstToken, "Undefined name '{}'.", name);
 		}
-		state.result.names[&ident] = decl;
+		state.result.names[&ident] = std::move(candidates);
 	}
 	else
 	{
-		// Qualified path: A::B[::C...].
-		// Track A — module-qualified: first segment is an import alias.
-		// Track B — type-scoped: first segment is a TypeDefinition; remaining segments resolved by type-checker.
+		// qualified path: A::B[::C...]
+		// track A — module-qualified: first segment is an import alias
+		// track B — type-scoped: first segment is a TypeDefinition; remaining segments resolved by type-checker
 		auto firstName = state.getStringView(*firstToken);
 
 		if (auto* importTable = state.findImport(firstName))
@@ -189,22 +197,22 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 
 			const Token* lastToken = node->item.value();
 			auto lastName = state.getStringView(*lastToken);
-			auto* decl = importTable->get(lastName);
-			if (!decl)
+			auto candidates = importTable->get(lastName);
+			if (candidates.empty())
 				state.logger.logErrorInRange(*lastToken, *lastToken,
 					"Undefined name '{}' in module '{}'.", lastName, firstName);
-			state.result.names[&ident] = decl;
+			state.result.names[&ident] = std::move(candidates);
 		}
 		else
 		{
 			// Track B: first segment must be a TypeDefinition.
 			// Remaining segments (variant/member names) are resolved by the type-checker.
-			auto* decl = state.lookup(firstName, scope);
+			auto* decl = state.lookupSingle(firstName, scope);
 			if (!decl)
 			{
 				state.logger.logErrorInRange(*firstToken, *firstToken,
 					"Undefined name '{}'.", firstName);
-				state.result.names[&ident] = nullptr;
+				state.result.names[&ident] = {};
 				return;
 			}
 
@@ -212,12 +220,12 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 			{
 				state.logger.logErrorInRange(*firstToken, *firstToken,
 					"'{}' is not a type; '::' requires a type or module.", firstName);
-				state.result.names[&ident] = nullptr;
+				state.result.names[&ident] = {};
 				return;
 			}
 
 			// Store the TypeDefinition. Type-checker validates remaining path segments.
-			state.result.names[&ident] = decl;
+			state.result.names[&ident] = { decl };
 		}
 	}
 }
@@ -346,7 +354,7 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 				lambda.value().captures.forEach([&](const Required<AST::Capture>& capture)
 					{
 						auto name = state.getStringView(capture.value().variableName);
-						auto* outerDecl = state.lookup(name, scope);
+						auto* outerDecl = state.lookupSingle(name, scope);
 						if (!outerDecl)
 						{
 							state.logger.logErrorInRange(capture.value().variableName, capture.value().variableName, "Undefined name '{}' in capture.", name);
@@ -549,15 +557,49 @@ Result<ResolvedModule> resolve(
 					},
 					[&](const Required<AST::FunctionDefinition>& fnDef)
 					{
-						resolveFunction(state, fnDef.value().function.value(), nullptr);
-					},
-					[&](const Required<AST::ExternDefinition>& externDef)
-					{
-						externDef.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+					// Validate and resolve type parameter interface constraints.
+					fnDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
+						{
+							if (!tp.value().interface.hasValue())
+								return;
+
+							const Token* ifToken = tp.value().interface.ptr();
+							auto ifName = state.getStringView(*ifToken);
+
+							// Step 1: check built-in interfaces.
+							auto builtinIt = s_BuiltinInterfaces.find(ifName);
+							if (builtinIt != s_BuiltinInterfaces.end())
 							{
-								resolveType(state, param.value().type.value(), nullptr);
-							});
-					},
+								state.result.resolvedInterfaces[ifToken] = builtinIt->second;
+								return;
+							}
+
+							// Step 2 (future): check user-defined interface declarations in moduleScope.
+							// auto candidates = state.moduleScope.get(ifName);
+							// if (!candidates.empty() && holds_alternative<InterfaceDefinition>)
+							// { state.result.resolvedInterfaces[ifToken] = candidates[0]; return; }
+
+							state.logger.logErrorInRange(*ifToken, *ifToken,
+								"'{}' is not a known interface.", ifName);
+						});
+
+					// Inject type parameters into a scope so resolveType can find 'T', 'U', etc.
+					ScopedSymbolTable typeParamScope(nullptr);
+					fnDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
+						{
+							auto name = state.getStringView(tp.value().name);
+							typeParamScope.declare(name, { AST::Definition::Visibility::Private, tp });
+						});
+
+					resolveFunction(state, fnDef.value().function.value(), &typeParamScope);
+				},
+				[&](const Required<AST::ExternDefinition>& externDef)
+				{
+					externDef.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+						{
+							resolveType(state, param.value().type.value(), nullptr);
+						});
+				},
 				}, def.value().definition);
 		});
 

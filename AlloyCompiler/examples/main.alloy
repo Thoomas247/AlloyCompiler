@@ -1,9 +1,9 @@
 /*
 	Built in functions:
-	- XX.to<YY>()
+	- XX.convert<YY>()
 		~ convert from numeric type XX to numeric type YY, keeping the value the same
 		~ returns by value
-	- XX.as<YY>()
+	- XX.reinterpret<YY>()
 		~ reinterpret the bytes of type XX as type YY
 		~ type YY must be of size smaller or equal to size of XX
 		~ returns by reference
@@ -44,6 +44,17 @@ fn add(self v: &Vec3, other: &Vec3) -> Vec3 {
 	return Vec3 { .x = v.x + other.x, .y = v.y + other.y, .z = v.z + other.z };
 }
 
+// T parameter just means that a, b and ret type have the same type
+// 'Number' is a built-in interface signifying that type T must be one of the number types available in the language
+fn add<T: Number>(a: &T, b: &T) -> T {
+	return a + b;
+}
+
+// function overloading is essential and works across extensions, generics and normal functions
+fn add(a: &Vec3, b: &Vec3) -> Vec3 {
+	return a.add(b);
+}
+
 fn get_float() -> f32 {
 	return 7.421;
 }
@@ -51,6 +62,19 @@ fn get_float() -> f32 {
 fn main() -> u32 {
 	const a: u32 = 23;
 	const b: i8 = 123;
+
+	const c = add(10, 20);	// T implicitly resolved as an integer type (i32 by default)
+	const d = add<u64>(10, 20); // T is explicitly a u64, 10 and 20 are treated as such
+
+	// built-in functions also exist
+	// in this case reinterpret<T>(self s: &T) is implicitly defined for all types (even user-made ones)
+	// "reinterpret" reinterprets the bytes of d as a u16 and returns them by reference
+	// however since there is no & operator before the call, the referenced value gets copied into a new u16
+	const e = d.reinterpret<u16>();
+
+	// "convert" is similar to "reinterpret" but it converts to the new type and returns by value
+	// this one is only defined on Number types and certain array types implicitly (think [u8; 4] -> u32 conversion)
+	const g = d.convert<i16>();
 
 	const f = get_float();
 

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "../parser/AST.hpp"
+#include "../builtins/builtins.hpp"
 
 using Declaration = std::variant<
 	Required<AST::TypeDefinition>,
@@ -12,7 +13,8 @@ using Declaration = std::variant<
 	Required<AST::ExternDefinition>,
 	Required<AST::FunctionParameter>,
 	Required<AST::VariableDefinitionStatement>,
-	Required<AST::Capture>
+	Required<AST::Capture>,
+	Required<AST::TypeParameter>
 >;
 
 struct ResolvedDeclaration
@@ -21,45 +23,82 @@ struct ResolvedDeclaration
 	Declaration definition;
 };
 
+// A resolved interface constraint — either a built-in interface or (future) a user-defined
+// interface declaration from the SymbolTable.
+using ResolvedInterface = std::variant<BuiltinInterface, const ResolvedDeclaration*>;
+
 class SymbolTable
 {
 public:
-	template <typename T>
-	Status add(std::string_view name, AST::Definition::Visibility visibility, T definition);
+	// Functions (FunctionDefinition, ExternDefinition) may overload: same name is allowed.
+	// All other declarations (types, variables) may not: duplicate name returns Error.
+	// Also returns Error if a function name collides with an existing non-function declaration.
+	Status add(std::string_view name, AST::Definition::Visibility visibility, Declaration definition);
 
-	const ResolvedDeclaration* get(std::string_view name) const;
+	// Returns all declarations for this name. Empty = not found.
+	std::vector<const ResolvedDeclaration*> get(std::string_view name) const;
 
 private:
-	std::unordered_map<std::string_view, ResolvedDeclaration> m_Symbols;
+	std::unordered_map<std::string_view, std::vector<ResolvedDeclaration>> m_Symbols;
 };
 
-template<typename T>
-inline Status SymbolTable::add(std::string_view name, AST::Definition::Visibility visibility, T definition)
+inline Status SymbolTable::add(std::string_view name, AST::Definition::Visibility visibility, Declaration definition)
 {
-	if (m_Symbols.try_emplace(name, visibility, Declaration(definition)).second)
-	{
-		return Status::Ok;
-	}
-	return Status::Error;
-}
+	bool isFunction =
+		std::holds_alternative<Required<AST::FunctionDefinition>>(definition) ||
+		std::holds_alternative<Required<AST::ExternDefinition>>(definition);
 
-inline const ResolvedDeclaration* SymbolTable::get(std::string_view name) const
-{
 	auto it = m_Symbols.find(name);
 	if (it != m_Symbols.end())
 	{
-		return &it->second;
+		// Name already exists — only function overloads are allowed.
+		if (!isFunction)
+			return Status::Error;  // non-function can't overload
+
+		for (const auto& existing : it->second)
+		{
+			bool existingIsFunction =
+				std::holds_alternative<Required<AST::FunctionDefinition>>(existing.definition) ||
+				std::holds_alternative<Required<AST::ExternDefinition>>(existing.definition);
+			if (!existingIsFunction)
+				return Status::Error;  // function collides with an existing type/variable
+		}
+
+		it->second.push_back({ visibility, std::move(definition) });
+		return Status::Ok;
 	}
-	return nullptr;
+
+	m_Symbols[name].push_back({ visibility, std::move(definition) });
+	return Status::Ok;
+}
+
+inline std::vector<const ResolvedDeclaration*> SymbolTable::get(std::string_view name) const
+{
+	auto it = m_Symbols.find(name);
+	if (it == m_Symbols.end())
+		return {};
+
+	std::vector<const ResolvedDeclaration*> result;
+	result.reserve(it->second.size());
+	for (const auto& decl : it->second)
+		result.push_back(&decl);
+	return result;
 }
 
 struct ResolvedModule
 {
-	// each IdentifierExpression resolved to its declaration
-	std::unordered_map<const AST::IdentifierExpression*, const ResolvedDeclaration*> names;
+	// Maps each IdentifierExpression to all matching declarations (overload set).
+	// Single-declaration names (types, variables) have a 1-element vector.
+	// Empty vector means resolution failed (error already logged).
+	std::unordered_map<const AST::IdentifierExpression*, std::vector<const ResolvedDeclaration*>> names;
 
-	// token-keyed resolutions: lambda capture sites and EnumVariantExpression::typeName
+	// Token-keyed resolutions for lambda captures (always single, variables can't overload).
 	std::unordered_map<const Token*, const ResolvedDeclaration*> tokenNames;
+
+	// Maps each TypeParameter interface token → its resolved interface.
+	// Built-in interfaces → BuiltinInterface enum.
+	// User-defined interfaces (future) → ResolvedDeclaration* of the InterfaceDefinition.
+	std::unordered_map<const Token*, ResolvedInterface> resolvedInterfaces;
 };
 
 /**

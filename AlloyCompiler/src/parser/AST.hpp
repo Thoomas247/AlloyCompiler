@@ -186,6 +186,12 @@ namespace AST
 		bool isSelf;   // true iff declared with 'self' keyword
 	};
 
+	struct TypeParameter
+	{
+		const Token& name;
+		Optional<Token> interface;
+	};
+
 	struct Function
 	{
 		Optional<ListNode<FunctionParameter>> parameters;
@@ -253,6 +259,7 @@ namespace AST
 	struct FunctionCallExpression
 	{
 		Required<Expression> function;
+		Optional<ListNode<Type>> typeArguments;
 		Optional<ListNode<Expression>> arguments;
 	};
 
@@ -362,6 +369,7 @@ namespace AST
 	struct FunctionDefinition
 	{
 		const Token& name;
+		Optional<ListNode<TypeParameter>> typeParameters;
 		Required<Function> function;
 	};
 
