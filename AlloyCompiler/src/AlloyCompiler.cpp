@@ -6,6 +6,8 @@
 #include "tokenizer/tokenizer.hpp"
 #include "parser/parser.hpp"
 #include "resolver/resolver.hpp"
+#include "typechecker/type_interner.hpp"
+#include "typechecker/type_checker.hpp"
 
 namespace fs = std::filesystem;
 
@@ -61,11 +63,12 @@ int main()
 			});
 
 		auto [resolveStatus, resolvedModule] = resolve(*m.source, m.moduleNode.value(), m.symbols, importedSymbols);
+
+		auto [internStatus, internedTypes] = intern(*m.source, m.moduleNode.value(), resolvedModule);
+		auto [checkStatus, typedModule] = typeCheck(*m.source, m.moduleNode.value(), resolvedModule, internedTypes, m.symbols);
+
 		__debugbreak();
 	}
-
-	// TODO:
-	// Type interning and type checking
 
 	__debugbreak();
 }

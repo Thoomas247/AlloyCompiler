@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <variant>
 #include <unordered_map>
 #include <vector>
@@ -99,6 +100,12 @@ struct ResolvedModule
 	// Built-in interfaces → BuiltinInterface enum.
 	// User-defined interfaces (future) → ResolvedDeclaration* of the InterfaceDefinition.
 	std::unordered_map<const Token*, ResolvedInterface> resolvedInterfaces;
+
+	// Stable storage for function-scope declarations (parameters, local variables, captures,
+	// type parameters). std::deque never moves elements on push_back, so all stored
+	// ResolvedDeclaration* pointers into this container remain valid for the
+	// lifetime of the ResolvedModule.
+	std::deque<ResolvedDeclaration> localDecls;
 };
 
 /**

@@ -74,7 +74,9 @@ Result<SymbolTable> declare(const Source& moduleSource, const AST::Module& modul
 struct ScopedSymbolTable
 {
 	ScopedSymbolTable* parent;
-	std::unordered_map<std::string_view, ResolvedDeclaration> locals;
+	// Stores stable pointers into ResolvedModule::localDecls.
+	// Never stores values directly — elements of this map do NOT own the declarations.
+	std::unordered_map<std::string_view, const ResolvedDeclaration*> locals;
 
 	explicit ScopedSymbolTable(ScopedSymbolTable* parent = nullptr)
 		: parent(parent) {
@@ -87,15 +89,16 @@ struct ScopedSymbolTable
 	{
 		auto it = locals.find(name);
 		if (it != locals.end())
-			return &it->second;
+			return it->second;
 		if (parent)
 			return parent->lookupLocal(name);
 		return nullptr;
 	}
 
-	Status declare(std::string_view name, ResolvedDeclaration decl)
+	// Stores a stable pointer. The pointed-to ResolvedDeclaration must outlive this scope.
+	Status declare(std::string_view name, const ResolvedDeclaration* decl)
 	{
-		if (!locals.try_emplace(name, std::move(decl)).second)
+		if (!locals.try_emplace(name, decl).second)
 			return Error;
 		return Ok;
 	}
@@ -134,6 +137,15 @@ struct ResolveState : ResolverState
 	{
 		auto it = importAliases.find(alias);
 		return it != importAliases.end() ? it->second : nullptr;
+	}
+
+	// Allocate a local declaration in stable storage (ResolvedModule::localDecls).
+	// std::deque never moves on push_back, so the returned pointer remains valid
+	// for the lifetime of the ResolvedModule.
+	const ResolvedDeclaration* allocateLocal(AST::Definition::Visibility vis, Declaration def)
+	{
+		result.localDecls.push_back({ vis, std::move(def) });
+		return &result.localDecls.back();
 	}
 };
 
@@ -360,7 +372,7 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 							state.logger.logErrorInRange(capture.value().variableName, capture.value().variableName, "Undefined name '{}' in capture.", name);
 						}
 						state.result.tokenNames[&capture.value().variableName] = outerDecl;
-						lambdaScope.declare(name, { AST::Definition::Visibility::Private, capture });
+						lambdaScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, capture));
 					});
 				resolveFunction(state, lambda.value().function.value(), &lambdaScope);
 			},
@@ -373,7 +385,7 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 					{
 						const auto& cap = ifExpr.value().capture.value();
 						auto name = state.getStringView(cap.variableName);
-						thenScope.declare(name, { AST::Definition::Visibility::Private, asRequired(cap) });
+						thenScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, asRequired(cap)));
 					}
 					resolveStatement(state, ifExpr.value().thenBranch.value(), &thenScope);
 				}
@@ -404,7 +416,7 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 			forExpr.value().iterators.forEach([&](const Required<AST::Capture>& capture)
 				{
 					auto name = state.getStringView(capture.value().variableName);
-					forScope.declare(name, { AST::Definition::Visibility::Private, capture });
+					forScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, capture));
 				});
 
 			resolveStatement(state, forExpr.value().body.value(), &forScope);
@@ -424,7 +436,7 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 						{
 							const auto& cap = arm.value().capture.value();
 							auto name = state.getStringView(cap.variableName);
-							armScope.declare(name, { AST::Definition::Visibility::Private, asRequired(cap) });
+							armScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, asRequired(cap)));
 						}
 						resolveStatement(state, arm.value().body.value(), &armScope);
 					});
@@ -451,7 +463,7 @@ static void resolveStatement(ResolveState& state, const AST::Statement& stmt, Sc
 			}
 			resolveExpression(state, varDef.value().value.value(), scope);
 			auto name = state.getStringView(varDef.value().name);
-			if (scope->declare(name, { AST::Definition::Visibility::Private, varDef }) == Error)
+			if (scope->declare(name, state.allocateLocal(AST::Definition::Visibility::Private, varDef)) == Error)
 			{
 				state.logger.logErrorInRange(varDef.value().name, varDef.value().name,
 					"Duplicate variable declaration '{}'.", name);
@@ -517,7 +529,7 @@ static void resolveFunction(ResolveState& state, const AST::Function& fn, Scoped
 		{
 			resolveType(state, param.value().type.value(), &fnScope);
 			auto name = state.getStringView(param.value().name);
-			fnScope.declare(name, { AST::Definition::Visibility::Private, param });
+			fnScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, param));
 		});
 
 	if (fn.returnType.hasValue())
@@ -588,7 +600,7 @@ Result<ResolvedModule> resolve(
 					fnDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
 						{
 							auto name = state.getStringView(tp.value().name);
-							typeParamScope.declare(name, { AST::Definition::Visibility::Private, tp });
+							typeParamScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, tp));
 						});
 
 					resolveFunction(state, fnDef.value().function.value(), &typeParamScope);
