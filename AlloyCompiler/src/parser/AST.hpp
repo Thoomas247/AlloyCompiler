@@ -68,7 +68,6 @@ namespace AST
 	struct ArrayAccessExpression;
 	struct ArrayLiteralExpression;
 	struct ArrayFillExpression;
-	struct EnumVariantExpression;
 	struct StructInitializerExpression;
 	struct LambdaExpression;
 	struct BinaryExpression;
@@ -93,7 +92,6 @@ namespace AST
 		Required<ArrayAccessExpression>,
 		Required<ArrayLiteralExpression>,
 		Required<ArrayFillExpression>,
-		Required<EnumVariantExpression>,
 		Required<StructInitializerExpression>,
 		Required<LambdaExpression>,
 		Required<BinaryExpression>,
@@ -211,7 +209,7 @@ namespace AST
 	struct Capture
 	{
 		Type::Modifier modifier;
-		const Token& variableName;
+		Token variableName;
 	};
 
 	struct IfExpression
@@ -278,12 +276,6 @@ namespace AST
 	{
 		Required<Expression> value;
 		const Token& size;
-	};
-
-	struct EnumVariantExpression
-	{
-		const Token& typeName;
-		const Token& variantName;
 	};
 
 	struct StructInitializerExpression

@@ -96,6 +96,7 @@
     <ClInclude Include="src\parser\token_iterator.hpp" />
     <ClInclude Include="src\resolver\resolver.hpp" />
     <ClInclude Include="src\util\allocator.hpp" />
+    <ClInclude Include="src\util\overloaded.hpp" />
     <ClInclude Include="src\util\pointers.hpp" />
     <ClInclude Include="src\parser\AST.hpp" />
     <ClInclude Include="src\parser\parser.hpp" />

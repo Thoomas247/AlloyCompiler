@@ -9,8 +9,6 @@
 		~ returns by reference
 */
 
-import a::b::c;
-
 extern printf(...);
 
 type CharArray = [u8];
@@ -97,7 +95,7 @@ fn main() -> u32 {
 	}
 
 	// match with payload, used as expression
-	const result = Result::Ok;
+	const result = Result::Ok({ .value = 255 });
 	const msg = match (result) {
 		Result::Ok |val| break val.value;
 		Result::Err |err| break err.errorCode;

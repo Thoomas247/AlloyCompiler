@@ -34,6 +34,11 @@ class Logger
 public:
 	Logger(const Source& source) : m_Source(source), m_HasError(false) {}
 
+	const Source& getSource() const
+	{
+		return m_Source;
+	}
+
 	template<typename... Args>
 	void logErrorInRange(TokenPosition startPos, TokenPosition, const std::string& format, Args&&... args)
 	{

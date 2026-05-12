@@ -1,10 +1,563 @@
 #include "resolver.hpp"
 
+#include <unordered_set>
+
+#include "../util/overloaded.hpp"
+
+using enum Status;
+
+struct ResolverState
+{
+	Logger logger;
+
+	ResolverState(const Source& source) : logger(source) {}
+
+	std::string_view getStringView(const Token& token) const
+	{
+		return std::string_view(&logger.getSource().data[token.start.index], token.end.index - token.start.index);
+	}
+};
+
 Result<SymbolTable> declare(const Source& moduleSource, const AST::Module& module)
 {
-    module.definitions.forEach([](auto& definition)
-        {
-            
-        });
-    return Result<SymbolTable>();
+	ResolverState state(moduleSource);
+	SymbolTable symbolTable;
+	Status status = Ok;
+
+	module.definitions.forEach([&](const Required<AST::Definition>& def)
+		{
+			auto visibility = def.value().visiblity;
+
+			auto s = std::visit(Overloaded
+				{
+					[&](const Required<AST::TypeDefinition>& typeDef) -> Status
+					{
+						auto name = state.getStringView(typeDef.value().name);
+						if (symbolTable.add(name, visibility, typeDef) == Error)
+						{
+							state.logger.logErrorInRange(typeDef.value().name, typeDef.value().name,
+								"Duplicate definition '{}'.", name);
+							return Error;
+						}
+						return Ok;
+					},
+					[&](const Required<AST::FunctionDefinition>& fnDef) -> Status
+					{
+						auto name = state.getStringView(fnDef.value().name);
+						if (symbolTable.add(name, visibility, fnDef) == Error)
+						{
+							state.logger.logErrorInRange(fnDef.value().name, fnDef.value().name,
+								"Duplicate definition '{}'.", name);
+							return Error;
+						}
+						return Ok;
+					},
+					[&](const Required<AST::ExternDefinition>& externDef) -> Status
+					{
+						auto name = state.getStringView(externDef.value().name);
+						if (symbolTable.add(name, visibility, externDef) == Error)
+						{
+							state.logger.logErrorInRange(externDef.value().name, externDef.value().name,
+								"Duplicate definition '{}'.", name);
+							return Error;
+						}
+						return Ok;
+					},
+				}, def.value().definition);
+
+			status &= s;
+		});
+
+	return { status, symbolTable };
+}
+
+struct ScopedSymbolTable
+{
+	ScopedSymbolTable* parent;
+	std::unordered_map<std::string_view, ResolvedDeclaration> locals;
+
+	explicit ScopedSymbolTable(ScopedSymbolTable* parent = nullptr)
+		: parent(parent) {
+	}
+
+	ScopedSymbolTable(const ScopedSymbolTable&) = delete;
+	ScopedSymbolTable& operator=(const ScopedSymbolTable&) = delete;
+
+	const ResolvedDeclaration* lookupLocal(std::string_view name) const
+	{
+		auto it = locals.find(name);
+		if (it != locals.end())
+			return &it->second;
+		if (parent)
+			return parent->lookupLocal(name);
+		return nullptr;
+	}
+
+	Status declare(std::string_view name, ResolvedDeclaration decl)
+	{
+		if (!locals.try_emplace(name, std::move(decl)).second)
+			return Error;
+		return Ok;
+	}
+};
+
+struct ResolveState : ResolverState
+{
+	const SymbolTable& moduleScope;
+	std::unordered_map<std::string_view, const SymbolTable*> importAliases;
+	ResolvedModule result;
+
+	ResolveState(const Source& source, const SymbolTable& moduleScope)
+		: ResolverState(source), moduleScope(moduleScope) {
+	}
+
+	const ResolvedDeclaration* lookup(std::string_view name, const ScopedSymbolTable* scope) const
+	{
+		if (scope)
+		{
+			if (auto* decl = scope->lookupLocal(name))
+				return decl;
+		}
+		return moduleScope.get(name);
+	}
+
+	const SymbolTable* findImport(std::string_view alias) const
+	{
+		auto it = importAliases.find(alias);
+		return it != importAliases.end() ? it->second : nullptr;
+	}
+};
+
+// Wraps arena-allocated node (const ref) in a non-const Required<T>.
+// Safe because arena allocations are non-const by origin.
+template<typename T>
+static Required<T> asRequired(const T& ref)
+{
+	return Required<T>(const_cast<T*>(&ref));
+}
+
+static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpression& ident, const ScopedSymbolTable* scope);
+static void resolveType(ResolveState& state, const AST::Type& type, const ScopedSymbolTable* scope);
+static void resolveBaseType(ResolveState& state, const AST::BaseType& baseType, const ScopedSymbolTable* scope);
+static void resolveExpression(ResolveState& state, const AST::Expression& expr, ScopedSymbolTable* scope);
+static void resolveStatement(ResolveState& state, const AST::Statement& stmt, ScopedSymbolTable* scope);
+static void resolveFunction(ResolveState& state, const AST::Function& fn, ScopedSymbolTable* parentScope);
+
+static const std::unordered_set<std::string_view> s_BuiltinTypeNames = {
+	"u8", "u16", "u32", "u64",
+	"i8", "i16", "i32", "i64",
+	"f32", "f64",
+	"bool"
+};
+
+static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpression& ident, const ScopedSymbolTable* scope)
+{
+	const auto& firstNode = ident.path.value();
+	const Token* firstToken = firstNode.item.value();
+
+	if (!firstNode.next.hasValue())
+	{
+		auto name = state.getStringView(*firstToken);
+
+
+		// check if built-in type
+		if (s_BuiltinTypeNames.contains(name))
+		{
+			return;
+		}
+
+		auto* decl = state.lookup(name, scope);
+		if (!decl)
+		{
+			state.logger.logErrorInRange(*firstToken, *firstToken, "Undefined name '{}'.", name);
+		}
+		state.result.names[&ident] = decl;
+	}
+	else
+	{
+		// Qualified path: A::B[::C...].
+		// Track A — module-qualified: first segment is an import alias.
+		// Track B — type-scoped: first segment is a TypeDefinition; remaining segments resolved by type-checker.
+		auto firstName = state.getStringView(*firstToken);
+
+		if (auto* importTable = state.findImport(firstName))
+		{
+			// Track A: walk to last segment and resolve in the imported module's symbol table.
+			const AST::ListNode<const Token*>* node = &firstNode;
+			while (node->next.hasValue())
+				node = node->next.ptr();
+
+			const Token* lastToken = node->item.value();
+			auto lastName = state.getStringView(*lastToken);
+			auto* decl = importTable->get(lastName);
+			if (!decl)
+				state.logger.logErrorInRange(*lastToken, *lastToken,
+					"Undefined name '{}' in module '{}'.", lastName, firstName);
+			state.result.names[&ident] = decl;
+		}
+		else
+		{
+			// Track B: first segment must be a TypeDefinition.
+			// Remaining segments (variant/member names) are resolved by the type-checker.
+			auto* decl = state.lookup(firstName, scope);
+			if (!decl)
+			{
+				state.logger.logErrorInRange(*firstToken, *firstToken,
+					"Undefined name '{}'.", firstName);
+				state.result.names[&ident] = nullptr;
+				return;
+			}
+
+			if (!std::holds_alternative<Required<AST::TypeDefinition>>(decl->definition))
+			{
+				state.logger.logErrorInRange(*firstToken, *firstToken,
+					"'{}' is not a type; '::' requires a type or module.", firstName);
+				state.result.names[&ident] = nullptr;
+				return;
+			}
+
+			// Store the TypeDefinition. Type-checker validates remaining path segments.
+			state.result.names[&ident] = decl;
+		}
+	}
+}
+
+static void resolveType(ResolveState& state, const AST::Type& type, const ScopedSymbolTable* scope)
+{
+	std::visit(Overloaded
+		{
+			[&](const Required<AST::BaseType>& baseType)
+			{
+				resolveBaseType(state, baseType.value(), scope);
+			},
+			[&](const Required<AST::Type>& innerType)
+			{
+				resolveType(state, innerType.value(), scope);
+			},
+		}, type.innerType);
+}
+
+static void resolveBaseType(ResolveState& state, const AST::BaseType& baseType, const ScopedSymbolTable* scope)
+{
+	std::visit(Overloaded
+		{
+			[&](const Required<AST::NamedType>& namedType)
+			{
+				resolveIdentifier(state, namedType.value().name.value(), scope);
+			},
+			[&](const Required<AST::StructType>& structType)
+			{
+				structType.value().members.forEach([&](const Required<AST::StructType::Member>& member)
+					{
+						resolveType(state, member.value().type.value(), scope);
+					});
+			},
+			[&](const Required<AST::EnumType>& enumType)
+			{
+				enumType.value().members.forEach([&](const Required<AST::EnumType::Member>& member)
+					{
+						if (member.value().payloadType.hasValue())
+						{
+							resolveType(state, member.value().payloadType.value(), scope);
+						}
+					});
+			},
+			[&](const Required<AST::ArrayType>& arrayType)
+			{
+				resolveType(state, arrayType.value().elementType.value(), scope);
+			},
+			[&](const Required<AST::FunctionType>& functionType)
+			{
+				functionType.value().parameterTypes.forEach([&](const Required<AST::Type>& paramType)
+					{
+						resolveType(state, paramType.value(), scope);
+					});
+				if (functionType.value().returnType.hasValue())
+				{
+					resolveType(state, functionType.value().returnType.value(), scope);
+				}
+			},
+		}, baseType);
+}
+
+static void resolveExpression(ResolveState& state, const AST::Expression& expr, ScopedSymbolTable* scope)
+{
+	std::visit(Overloaded
+		{
+			[&](const Required<AST::IdentifierExpression>& ident)
+			{
+				resolveIdentifier(state, ident.value(), scope);
+			},
+			[&](const Required<AST::LiteralExpression>&) {},
+			[&](const Required<AST::FunctionCallExpression>& call)
+			{
+				resolveExpression(state, call.value().function.value(), scope);
+				call.value().arguments.forEach([&](const Required<AST::Expression>& arg)
+					{
+						resolveExpression(state, arg.value(), scope);
+					});
+			},
+			[&](const Required<AST::MemberAccessExpression>& access)
+			{
+				resolveExpression(state, access.value().object.value(), scope);
+				// memberName resolved in type-checking pass
+			},
+			[&](const Required<AST::ArrayAccessExpression>& access)
+			{
+				resolveExpression(state, access.value().object.value(), scope);
+				resolveExpression(state, access.value().index.value(), scope);
+			},
+			[&](const Required<AST::UnaryExpression>& unary)
+			{
+				resolveExpression(state, unary.value().expression.value(), scope);
+			},
+			[&](const Required<AST::BinaryExpression>& binary)
+			{
+				resolveExpression(state, binary.value().left.value(), scope);
+				resolveExpression(state, binary.value().right.value(), scope);
+			},
+			[&](const Required<AST::ArrayLiteralExpression>& arrayLit)
+			{
+				arrayLit.value().elements.forEach([&](const Required<AST::Expression>& elem)
+					{
+						resolveExpression(state, elem.value(), scope);
+					});
+			},
+			[&](const Required<AST::ArrayFillExpression>& fill)
+			{
+				resolveExpression(state, fill.value().value.value(), scope);
+			},
+			[&](const Required<AST::StructInitializerExpression>& structInit)
+			{
+				resolveIdentifier(state, structInit.value().type.value().name.value(), scope);
+				structInit.value().initializers.forEach(
+					[&](const Required<AST::StructInitializerExpression::MemberInitializer>& init)
+					{
+						resolveExpression(state, init.value().value.value(), scope);
+						// init.value().name is a member field — resolved in type-checking pass
+					});
+			},
+			[&](const Required<AST::LambdaExpression>& lambda)
+			{
+				ScopedSymbolTable lambdaScope(scope);
+				lambda.value().captures.forEach([&](const Required<AST::Capture>& capture)
+					{
+						auto name = state.getStringView(capture.value().variableName);
+						auto* outerDecl = state.lookup(name, scope);
+						if (!outerDecl)
+						{
+							state.logger.logErrorInRange(capture.value().variableName, capture.value().variableName, "Undefined name '{}' in capture.", name);
+						}
+						state.result.tokenNames[&capture.value().variableName] = outerDecl;
+						lambdaScope.declare(name, { AST::Definition::Visibility::Private, capture });
+					});
+				resolveFunction(state, lambda.value().function.value(), &lambdaScope);
+			},
+			[&](const Required<AST::IfExpression>& ifExpr)
+			{
+				resolveExpression(state, ifExpr.value().condition.value(), scope);
+				{
+					ScopedSymbolTable thenScope(scope);
+					if (ifExpr.value().capture.hasValue())
+					{
+						const auto& cap = ifExpr.value().capture.value();
+						auto name = state.getStringView(cap.variableName);
+						thenScope.declare(name, { AST::Definition::Visibility::Private, asRequired(cap) });
+					}
+					resolveStatement(state, ifExpr.value().thenBranch.value(), &thenScope);
+				}
+				if (ifExpr.value().elseBranch.hasValue())
+				{
+					ScopedSymbolTable elseScope(scope);
+					resolveStatement(state, ifExpr.value().elseBranch.value(), &elseScope);
+				}
+			},
+			[&](const Required<AST::WhileExpression>& whileExpr)
+			{
+				resolveExpression(state, whileExpr.value().condition.value(), scope);
+				resolveStatement(state, whileExpr.value().body.value(), scope);
+				if (whileExpr.value().elseBody.hasValue())
+				{
+					resolveStatement(state, whileExpr.value().elseBody.value(), scope);
+				}
+			},
+			[&](const Required<AST::ForExpression>& forExpr)
+			{
+			// resolve iterables in outer scope, iterators bound in inner scope
+			forExpr.value().iterables.value().forEach([&](const Required<AST::Expression>& iterable)
+				{
+					resolveExpression(state, iterable.value(), scope);
+				});
+
+			ScopedSymbolTable forScope(scope);
+			forExpr.value().iterators.forEach([&](const Required<AST::Capture>& capture)
+				{
+					auto name = state.getStringView(capture.value().variableName);
+					forScope.declare(name, { AST::Definition::Visibility::Private, capture });
+				});
+
+			resolveStatement(state, forExpr.value().body.value(), &forScope);
+			if (forExpr.value().elseBody.hasValue())
+			{
+				resolveStatement(state, forExpr.value().elseBody.value(), scope);
+			}
+			},
+			[&](const Required<AST::MatchExpression>& match)
+			{
+				resolveExpression(state, match.value().subject.value(), scope);
+				match.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
+					{
+						resolveIdentifier(state, arm.value().variant.value(), scope);
+						ScopedSymbolTable armScope(scope);
+						if (arm.value().capture.hasValue())
+						{
+							const auto& cap = arm.value().capture.value();
+							auto name = state.getStringView(cap.variableName);
+							armScope.declare(name, { AST::Definition::Visibility::Private, asRequired(cap) });
+						}
+						resolveStatement(state, arm.value().body.value(), &armScope);
+					});
+				if (match.value().elseArm.hasValue())
+				{
+					ScopedSymbolTable elseScope(scope);
+					resolveStatement(state, match.value().elseArm.value(), &elseScope);
+				}
+			},
+		}, expr);
+}
+
+static void resolveStatement(ResolveState& state, const AST::Statement& stmt, ScopedSymbolTable* scope)
+{
+	std::visit(Overloaded
+		{
+			[&](const Required<AST::VariableDefinitionStatement>& varDef)
+			{
+			// resolve type annotation and value before adding name to scope
+			// (prevents `var x = x` from binding to itself)
+			if (varDef.value().type.hasValue())
+			{
+				resolveType(state, varDef.value().type.value(), scope);
+			}
+			resolveExpression(state, varDef.value().value.value(), scope);
+			auto name = state.getStringView(varDef.value().name);
+			if (scope->declare(name, { AST::Definition::Visibility::Private, varDef }) == Error)
+			{
+				state.logger.logErrorInRange(varDef.value().name, varDef.value().name,
+					"Duplicate variable declaration '{}'.", name);
+			}
+		},
+		[&](const Required<AST::AssignmentStatement>& assign)
+		{
+			resolveExpression(state, assign.value().target.value(), scope);
+			resolveExpression(state, assign.value().value.value(), scope);
+		},
+		[&](const Required<AST::ExpressionStatement>& exprStmt)
+		{
+			resolveExpression(state, exprStmt.value().expression.value(), scope);
+		},
+		[&](const Required<AST::StatementBlock>& block)
+		{
+			ScopedSymbolTable blockScope(scope);
+			block.value().statements.forEach([&](const Required<AST::Statement>& s)
+				{
+					resolveStatement(state, s.value(), &blockScope);
+				});
+		},
+		[&](const Required<AST::BreakStatement>& breakStmt)
+		{
+			if (breakStmt.value().value.hasValue())
+			{
+				resolveExpression(state, breakStmt.value().value.value(), scope);
+			}
+		},
+		[&](const Required<AST::ReturnStatement>& retStmt)
+		{
+			if (retStmt.value().value.hasValue())
+			{
+				resolveExpression(state, retStmt.value().value.value(), scope);
+			}
+		},
+
+		// control-flow expressions used as statements — delegate to resolveExpression
+		[&](const Required<AST::IfExpression>& ifExpr)
+		{
+			resolveExpression(state, AST::Expression(ifExpr), scope);
+		},
+		[&](const Required<AST::ForExpression>& forExpr)
+		{
+			resolveExpression(state, AST::Expression(forExpr), scope);
+		},
+		[&](const Required<AST::WhileExpression>& whileExpr)
+		{
+			resolveExpression(state, AST::Expression(whileExpr), scope);
+		},
+		[&](const Required<AST::MatchExpression>& matchExpr)
+		{
+			resolveExpression(state, AST::Expression(matchExpr), scope);
+		},
+		}, stmt);
+}
+
+static void resolveFunction(ResolveState& state, const AST::Function& fn, ScopedSymbolTable* parentScope)
+{
+	ScopedSymbolTable fnScope(parentScope);
+
+	fn.parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+		{
+			resolveType(state, param.value().type.value(), &fnScope);
+			auto name = state.getStringView(param.value().name);
+			fnScope.declare(name, { AST::Definition::Visibility::Private, param });
+		});
+
+	if (fn.returnType.hasValue())
+	{
+		resolveType(state, fn.returnType.value(), &fnScope);
+	}
+
+	resolveStatement(state, AST::Statement(fn.body), &fnScope);
+}
+
+Result<ResolvedModule> resolve(
+	const Source& moduleSource,
+	const AST::Module& module,
+	const SymbolTable& moduleSymbols,
+	const std::vector<const SymbolTable*>& importedSymbols)
+{
+	ResolveState state(moduleSource, moduleSymbols);
+
+	// build import alias map (imports and importedSymbols are in the same order)
+	size_t importIdx = 0;
+	module.imports.forEach([&](const Required<AST::Import>& imp)
+		{
+			if (importIdx < importedSymbols.size())
+			{
+				state.importAliases[imp.value().alias] = importedSymbols[importIdx++];
+			}
+		});
+
+	// resolve each top-level definition
+	module.definitions.forEach([&](const Required<AST::Definition>& def)
+		{
+			std::visit(Overloaded
+				{
+					[&](const Required<AST::TypeDefinition>& typeDef)
+					{
+						resolveBaseType(state, typeDef.value().baseType.value(), nullptr);
+					},
+					[&](const Required<AST::FunctionDefinition>& fnDef)
+					{
+						resolveFunction(state, fnDef.value().function.value(), nullptr);
+					},
+					[&](const Required<AST::ExternDefinition>& externDef)
+					{
+						externDef.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+							{
+								resolveType(state, param.value().type.value(), nullptr);
+							});
+					},
+				}, def.value().definition);
+		});
+
+	Status status = state.logger.hasError() ? Error : Ok;
+	return { status, std::move(state.result) };
 }
