@@ -769,12 +769,9 @@ static Result<Required<AST::LambdaExpression>> parseLambdaExpression(ParserState
 	return { Ok, state.allocator.allocate<AST::LambdaExpression>(captures, function) };
 }
 
-static Result<Required<AST::StructInitializerExpression>> parseStructInitializerExpression(ParserState& state)
+static Result<Required<AST::StructInitializerExpression>> parseStructInitializerExpression(ParserState& state, Optional<AST::NamedType> type)
 {
-	auto [typeStatus, type] = parseNamedType(state);
-	ERROR_IF_ERROR(typeStatus);
-
-	ERROR_IF_FALSE(state.it.consume<LBrace>("'{' after struct type name"));
+	ERROR_IF_FALSE(state.it.consume<LBrace>("'{'"));
 
 	auto [status, initializers] = commaSeparatedList<RBrace, AST::StructInitializerExpression::MemberInitializer>(
 		state,
@@ -901,11 +898,20 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 		) };
 	}
 
+	case LBrace:
+	{
+		auto [status, expression] = parseStructInitializerExpression(state, Optional<AST::NamedType>());
+		ERROR_IF_ERROR(status);
+		return { Ok, state.allocator.allocate<AST::Expression>(expression) };
+	}
+
 	case Identifier:
 	{
 		if (state.it.peek(1).kind == LBrace)
 		{
-			auto [status, expression] = parseStructInitializerExpression(state);
+			auto [typeStatus, type] = parseNamedType(state);
+			ERROR_IF_ERROR(typeStatus);
+			auto [status, expression] = parseStructInitializerExpression(state, Optional<AST::NamedType>(type.ptr()));
 			ERROR_IF_ERROR(status);
 			return { Ok, state.allocator.allocate<AST::Expression>(expression) };
 		}

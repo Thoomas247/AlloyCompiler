@@ -329,7 +329,10 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 			},
 			[&](const Required<AST::StructInitializerExpression>& structInit)
 			{
-				resolveIdentifier(state, structInit.value().type.value().name.value(), scope);
+				if (structInit.value().type.hasValue())
+				{
+					resolveIdentifier(state, structInit.value().type.value().name.value(), scope);
+				}
 				structInit.value().initializers.forEach(
 					[&](const Required<AST::StructInitializerExpression::MemberInitializer>& init)
 					{

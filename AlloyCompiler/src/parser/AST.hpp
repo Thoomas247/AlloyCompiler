@@ -286,7 +286,7 @@ namespace AST
 			Required<Expression> value;
 		};
 
-		Required<NamedType> type;
+		Optional<NamedType> type;
 		Optional<ListNode<MemberInitializer>> initializers;
 	};
 
