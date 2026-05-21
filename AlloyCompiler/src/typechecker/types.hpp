@@ -115,7 +115,8 @@ struct TypeInfo
 	struct TypeParamData
 	{
 		std::string_view name;
-		std::optional<BuiltinInterface> constraint;
+		std::optional<BuiltinInterface> constraint;       // built-in interface bound (Number/Iterable)
+		std::optional<TypeId> interfaceConstraint;        // A4: user-defined interface bound (Interface TypeId)
 	};
 
 	struct InterfaceData

@@ -195,40 +195,77 @@ all-paths-yield-a-value control-flow analysis is **not** implemented — only th
 "no break value at all" case is caught. Break-type mismatch is unified leniently (no
 error) to avoid false positives.
 
-**A4. User-defined interface as a generic constraint.** (§5.2)
-`resolveInterfaceToken` ([`resolver.cpp`](src/resolver/resolver.cpp)) resolves
-`fn f<T: MyInterface>` constraints, but `TypeInfo::TypeParamData::constraint` is only
-`std::optional<BuiltinInterface>` ([`types.hpp`](src/typechecker/types.hpp)). At a generic
-call site, `satisfiesConstraint` in [`type_checker.cpp`](src/typechecker/type_checker.cpp)
-therefore cannot enforce a user-interface bound. Extend `TypeParamData::constraint` to hold
-a user interface (e.g. an interface `TypeId`) and check, at the call site, that the bound
-concrete type's `implementedInterfaces` set contains it. Also handle `Iterable` as a
-constraint structurally (it has no primitive member set).
+**A4. User-defined interface as a generic constraint — DONE.** (§5.2)
+`TypeInfo::TypeParamData` now carries `interfaceConstraint` (`std::optional<TypeId>`, the
+user interface's Interface `TypeId`) alongside the built-in `constraint`
+([`types.hpp`](src/typechecker/types.hpp)). The interner fills it from
+`resolved.resolvedInterfaces` ([`type_interner.cpp`](src/typechecker/type_interner.cpp)).
+At a generic call site, `tryGenericOverload` checks `satisfiesInterfaceConstraint` — the
+bound concrete type's `implementedInterfaces` set must contain the interface. `Iterable`
+is now satisfied structurally (any `Array`/`Slice`). NOTE: a generic call whose constraint
+fails simply selects no overload and yields `INVALID_TYPE_ID` — there is still no
+"no matching overload" diagnostic (blocked by the absence of function-type assignability;
+`examples/main.alloy`'s `call(...)` already relies on that silence).
 
-**A5. Memory-model assignment rules.** (§4.2)
-Not enforced: assigning to a `&`/`&var` requires `&` on the RHS; assigning to a `*`/`*var`
-or `*[T]` requires `new` or `move`. Add these checks in the `VariableDefinitionStatement`
-and `AssignmentStatement` handlers of [`type_checker.cpp`](src/typechecker/type_checker.cpp),
-keyed on the declared type's `TypeInfo::Kind` (`Reference`/`RefMut` vs `Pointer`/`PtrMut`).
+**A5. Memory-model assignment rules — DONE.** (§4.2)
+`checkIndirectionAssignment` in [`type_checker.cpp`](src/typechecker/type_checker.cpp)
+enforces, against the *unstripped* declared `TypeInfo::Kind`: a `Reference`/`RefMut`
+binding requires a `&` (address-of) RHS; a `Pointer`/`PtrMut` binding requires a `new`/
+`move` RHS. Checked in the `VariableDefinitionStatement` handler and, for plain `=`, in
+the `AssignmentStatement` handler (target must be an identifier resolving to a declared
+binding). Note: per the literal §4.2 wording the RHS must *syntactically* be `&`/`new`/
+`move` — copying an existing pointer/reference variable is rejected. If that proves too
+strict it is a spec question (§7), not a checker bug.
 
-**A6. Mutability through indirections.** `&var`/`*var` vs `&`/`*` are interned but mutation
-through an immutable reference/pointer is not rejected. `var`/`const` *local* mutability is
-checked (see `ScopedVarMap::mutability`); extend that to indirections.
+**A6. Mutability through indirections — DONE.** The `AssignmentStatement` handler in
+[`type_checker.cpp`](src/typechecker/type_checker.cpp), for any target that is a `.field`
+/ `[index]` access (a mutation *through* something), walks to the root identifier
+(`rootIdentifier`) and reports an error when that root is an immutable reference/pointer
+(`Reference`/`Pointer` kind) or a `const` binding. `&var`/`*var` (`RefMut`/`PtrMut`) and
+`var` bindings are permitted. This also closes a D3 gap — `const v; v.x = …;` (an access
+chain, not a bare identifier) is now caught. Limitation: only the *root* of the chain is
+checked; an immutable reference *field* mid-chain (`r.immutRefField.x = …`) is not yet
+rejected.
 
-**A7. Bare interface value type.** An interface used as a type *without* an indirection
-(`var x: Shape`) is unsized and should be a compile-time error. Currently interned and
-silently allowed. Reject in `type_checker` / `type_interner`.
+*Reference/pointer expression typing — DONE (prerequisite for A6).* The `&` operator now
+yields `&T` and `new`/`move` yield `*T` (see the unary handler in
+[`type_checker.cpp`](src/typechecker/type_checker.cpp)), so `var r = &x;` correctly infers
+`r : &T` and `var p = new e;` infers `p : *T`. Using such a binding as a value
+transparently dereferences to `T` (§4.2) — the identifier handler strips one indirection
+for both annotated and inferred bindings. Comparison sites that may receive an
+indirection-typed expression (`var`-init mismatch, assignment, `return`, overload
+exact-match) strip before calling `isAssignable`. `stripIndirection` is sentinel-safe.
+Note: a few non-load-bearing sites (struct-member initialisers, array-literal elements,
+generic `unifyParam`) do **not** yet strip — fine today since nothing exercises an
+indirection expression there, but revisit if it does.
 
-**A8. String literal typing.** Currently simplified to `u8`. Spec treats a string as an
-array of integral numbers — type it as `&[u8]` or `*[u8]` consistently and update `match`
-on string subjects.
+**A7. Bare interface value type — DONE.** An interface used as a type without an
+indirection (`var x: Shape`, `fn f(s: Shape)`) is now a compile-time error, reported in
+`internASTType` ([`type_interner.cpp`](src/typechecker/type_interner.cpp)) in the
+`Modifier::None` branch when the inner type is `Kind::Interface`. `&I`/`*I` forms are
+unaffected. (Because this is an interner error, the F2 loop-2 guard skips `typeCheck` for
+that module — so a file with a bare-interface error suppresses its *type* errors. Keep
+positive/negative cases in separate files when testing.)
 
-**A9. `self` receiver indirection context.** (§5.2 item 3) The receiver qualifier
-(`self: &T` vs `self: *var T` …) is not validated against the call-site value's mutability.
+**A8. String literal typing — DONE.** A string literal is now typed `&[u8]` (the literal
+handler in [`type_checker.cpp`](src/typechecker/type_checker.cpp) interns
+`Reference(Slice(u8))`) rather than the old `u8` simplification. Used as a value it
+transparently derefs to `[u8]`. `match` on a string subject still falls through the
+enum path leniently (string-pattern matching is not specially typed).
 
-**A10. Unify the error model.** Replace `Log::error` soft-errors in `type_checker.cpp`
-with `logErrorInRange` (or a new accumulating diagnostic API — see F1) so all type errors
-are actually fatal and reported with source locations.
+**A9. `self` receiver indirection context — DONE.** (§5.2 item 3) When a member call's
+selected overload has a `self` parameter of *mutable* indirection kind (`&var`/`*var` —
+`RefMut`/`PtrMut`), the type checker now rejects the call if the receiver is provably
+immutable — a `const` binding or a value behind an immutable `&`/`*` indirection
+(`receiverIsImmutable` in [`type_checker.cpp`](src/typechecker/type_checker.cpp), reusing
+the A6 root-identifier walk). Immutable-`self` methods accept any receiver.
+
+**A10. Unify the error model — DONE.** F1 already made `Log::error` a counted, fatal
+diagnostic. The remaining location-less type errors in `type_checker.cpp` (ambiguous call
+×2, assignment mismatch, return mismatch) now use `logErrorInRange` with a token position
+when one is recoverable (the callee token, or the target/return expression's root
+identifier); they fall back to location-less `Log::error` only for token-less expressions
+(e.g. `return 5;`).
 
 ### B. Compile-time evaluation & macros (§6) — currently front-end only
 
@@ -274,15 +311,19 @@ emission.
 
 ### D. Module system & visibility
 
-**D1. Enforce visibility.** `pub`/`exp`/private are parsed and stored
-(`AST::Definition::Visibility`) but the resolver does **not** restrict cross-module access.
-A private definition is currently importable. Enforce in `resolve()` when resolving names
-through an import alias ([`resolver.cpp`](src/resolver/resolver.cpp), the import-alias
-branch of `resolveIdentifier`).
+**D1. Enforce visibility — DONE.** `resolveIdentifier`'s Track A (import-alias branch,
+[`resolver.cpp`](src/resolver/resolver.cpp)) now filters out `Private` declarations when
+resolving `alias::name` through an imported module; only `pub`/`exp` declarations cross
+the boundary. An all-private match reports "`X` is private to module `M`". Same-module
+lookup is unaffected (a module still sees its own privates).
 
-**D2. Import validation.** Detect missing modules cleanly (currently a soft `Log::error`),
-and detect/handle circular imports. `import a::b::c` ⇒ `a/b/c.alloy` mapping (§5.4) is
-implemented in `source.cpp`/the driver.
+**D2. Import validation — mostly addressed.** Missing imported modules are reported by the
+driver's `Log::error` ([`AlloyCompiler.cpp`](src/AlloyCompiler.cpp)), which since F1 is a
+counted, exit-code-affecting error — no longer "soft". Circular imports are *benign* in
+the current architecture: `declare()` runs per-module independently and `resolve()`
+consumes already-built `SymbolTable`s, so a cycle cannot cause infinite recursion. A
+dedicated cycle *diagnostic* is still absent but not load-bearing. `import a::b::c` ⇒
+`a/b/c.alloy` mapping (§5.4) is implemented in `source.cpp`/the driver.
 
 ### E. Standard library
 
@@ -351,8 +392,14 @@ There is no automated test suite. To verify a change:
 1. ~~**F1 + F2** — proper diagnostics and exit codes.~~ **DONE.**
 2. ~~**A1** — enum variant construction.~~ **DONE.**
 3. ~~**A2/A3** — loop/match as expressions.~~ **DONE.**
-4. **F3** — test harness. Next highest-leverage item now that F1/F2 unblock it.
-5. **A4–A10, D1–D2** — remaining front-end semantic gaps and visibility.
-6. **B1–B4** — comptime/macro evaluation.
-7. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
-   correct one.
+4. ~~**A5** — memory-model assignment rules.~~ **DONE.**
+5. ~~**A7** — bare interface value type.~~ **DONE.**
+6. ~~**A6** — mutability through indirections (+ reference/pointer expression typing).~~ **DONE.**
+7. ~~**A4** — user-defined interface as a generic constraint.~~ **DONE.**
+8. ~~**A8** — string literal typing.~~ **DONE.**
+9. ~~**D1/D2** — cross-module visibility + import validation.~~ **DONE.**
+10. ~~**A9/A10** — `self`-receiver indirection context; located error model.~~ **DONE.**
+11. **F3** — test harness. Next highest-leverage item now that F1/F2 unblock it.
+12. **B1–B4** — comptime/macro evaluation.
+13. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
+    correct one.

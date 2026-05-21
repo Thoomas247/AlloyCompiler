@@ -379,6 +379,27 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
 // Intern an AST::Type (handles modifier wrapping).
 // ---------------------------------------------------------------------------
 
+// A7: first identifier token of a type annotation, for diagnostics. Returns
+// nullptr when the type's base is not a named type.
+static const Token* firstTokenOfType(const AST::Type& type)
+{
+    const AST::Type* t = &type;
+    while (true)
+    {
+        if (auto* inner = std::get_if<Required<AST::Type>>(&t->innerType))
+        {
+            t = inner->ptr();
+            continue;
+        }
+        auto* base = std::get_if<Required<AST::BaseType>>(&t->innerType);
+        if (!base)
+            return nullptr;
+        if (auto* nt = std::get_if<Required<AST::NamedType>>(&base->value()))
+            return nt->value().name.value().path.value().item.value();
+        return nullptr;
+    }
+}
+
 static TypeId internASTType(InternState& state, const AST::Type& type, const ResolvedModule& resolved)
 {
     // Recursively intern whatever is inside first.
@@ -402,6 +423,17 @@ static TypeId internASTType(InternState& state, const AST::Type& type, const Res
     switch (type.modifier)
     {
         case AST::Type::Modifier::None:
+            // A7: an interface is unsized — it may only be used as a type behind
+            // an indirection (&I / *I, the interface-object form, §3.2). A bare
+            // interface value type is a compile-time error.
+            if (innerId < static_cast<TypeId>(state.result.table.size())
+                && state.result.table[innerId].kind == TypeInfo::Kind::Interface)
+            {
+                if (const Token* tok = firstTokenOfType(type))
+                    state.logger.logErrorInRange(*tok, *tok,
+                        "Interface '{}' cannot be used as a value type; an interface "
+                        "type must appear behind '&' or '*'.", state.getStringView(*tok));
+            }
             // Cache the mapping and return directly (no wrapper).
             state.result.astTypes[&type] = innerId;
             return innerId;
@@ -711,14 +743,33 @@ Result<InternedTypes> intern(
                     info.kind = TypeInfo::Kind::TypeParam;
                     auto tpName = state.getStringView(tp.value().name);
                     std::optional<BuiltinInterface> constraint;
+                    std::optional<TypeId> interfaceConstraint;   // A4: user-defined interface bound
                     if (tp.value().interface.hasValue())
                     {
-                        auto ifName = state.getStringView(tp.value().interface.value());
-                        auto it = s_BuiltinInterfaces.find(ifName);
-                        if (it != s_BuiltinInterfaces.end())
-                            constraint = it->second;
+                        // Prefer the resolver's classification (built-in vs user interface);
+                        // fall back to a built-in name lookup.
+                        auto riIt = resolved.resolvedInterfaces.find(&tp.value().interface.value());
+                        if (riIt != resolved.resolvedInterfaces.end())
+                        {
+                            std::visit(Overloaded
+                            {
+                                [&](BuiltinInterface bi) { constraint = bi; },
+                                [&](const ResolvedDeclaration* decl)
+                                {
+                                    if (auto* ifReq = std::get_if<Required<AST::InterfaceDefinition>>(&decl->definition))
+                                        interfaceConstraint = internInterfaceType(state, ifReq->value());
+                                },
+                            }, riIt->second);
+                        }
+                        else
+                        {
+                            auto ifName = state.getStringView(tp.value().interface.value());
+                            auto it = s_BuiltinInterfaces.find(ifName);
+                            if (it != s_BuiltinInterfaces.end())
+                                constraint = it->second;
+                        }
                     }
-                    info.data = TypeInfo::TypeParamData{ tpName, constraint };
+                    info.data = TypeInfo::TypeParamData{ tpName, constraint, interfaceConstraint };
                     TypeId tpId = state.internUnique(std::move(info));
                     state.typeParamScope[tpName] = tpId;
                     state.result.typeParamIds[&tp.value().name] = tpId;

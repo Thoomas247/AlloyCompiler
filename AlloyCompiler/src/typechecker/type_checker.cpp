@@ -222,10 +222,12 @@ static TypeId declStorageType(const ResolvedDeclaration& decl, const InternedTyp
 		}, decl.definition);
 }
 
-// Strip outermost pointer/reference to get the value type
+// Strip outermost pointer/reference to get the value type.
+// Sentinel TypeIds (INVALID, untyped literals) are not in the table and pass through.
 static TypeId stripIndirection(TypeId id, const InternedTypes& interned)
 {
-	if (id == INVALID_TYPE_ID) return INVALID_TYPE_ID;
+	if (id == INVALID_TYPE_ID || id == TYPE_UNTYPED_INT || id == TYPE_UNTYPED_FLOAT)
+		return id;
 	const auto& info = interned.get(id);
 	if (info.isIndirection())
 	{
@@ -387,6 +389,104 @@ static TypeId unifyBreakTypes(const std::vector<TypeId>& types, const InternedTy
 			result = t;          // incompatible — keep the most recent (lenient)
 	}
 	return result;
+}
+
+// A5: §4.2 — RHS expression forms required when assigning to an indirection-typed binding.
+static bool rhsIsAddressOf(const AST::Expression& e)
+{
+	if (auto* u = std::get_if<Required<AST::UnaryExpression>>(&e))
+		return u->value().op == TokenKind::BitwiseAnd;
+	return false;
+}
+
+static bool rhsIsAllocation(const AST::Expression& e)
+{
+	if (auto* u = std::get_if<Required<AST::UnaryExpression>>(&e))
+		return u->value().op == TokenKind::New || u->value().op == TokenKind::Move;
+	return false;
+}
+
+// A5: validate the RHS form against an indirection-typed declaration (§4.2).
+// `rawDeclType` is the *unstripped* declared TypeId; `loc` is the error location.
+static void checkIndirectionAssignment(CheckState& state, TypeId rawDeclType,
+	const AST::Expression& rhs, const Token& loc)
+{
+	if (rawDeclType == INVALID_TYPE_ID || rawDeclType >= static_cast<TypeId>(state.interned.table.size()))
+		return;
+
+	switch (state.interned.get(rawDeclType).kind)
+	{
+		case TypeInfo::Kind::Reference:
+		case TypeInfo::Kind::RefMut:
+			if (!rhsIsAddressOf(rhs))
+				state.logger.logErrorInRange(loc, loc,
+					"Assignment to a reference type requires the address-of operator "
+					"'&' on the right-hand side.");
+			break;
+		case TypeInfo::Kind::Pointer:
+		case TypeInfo::Kind::PtrMut:
+			if (!rhsIsAllocation(rhs))
+				state.logger.logErrorInRange(loc, loc,
+					"Assignment to a heap pointer type requires 'new' or 'move' "
+					"on the right-hand side.");
+			break;
+		default:
+			break;
+	}
+}
+
+// A6: peel .field / [index] suffixes off an lvalue to reach its root identifier.
+static const AST::IdentifierExpression* rootIdentifier(const AST::Expression& e)
+{
+	const AST::Expression* cur = &e;
+	while (true)
+	{
+		if (auto* id = std::get_if<Required<AST::IdentifierExpression>>(cur))
+			return id->ptr();
+		if (auto* m = std::get_if<Required<AST::MemberAccessExpression>>(cur))
+		{
+			cur = &m->value().object.value();
+			continue;
+		}
+		if (auto* a = std::get_if<Required<AST::ArrayAccessExpression>>(cur))
+		{
+			cur = &a->value().object.value();
+			continue;
+		}
+		return nullptr;
+	}
+}
+
+// A9: is the call-site receiver provably immutable — a 'const' binding or a value
+// behind an immutable '&'/'*' indirection? Conservative: returns false when unknown.
+static bool receiverIsImmutable(CheckState& state, const AST::Expression& receiver, ScopedVarMap* scope)
+{
+	const AST::IdentifierExpression* root = rootIdentifier(receiver);
+	if (!root)
+		return false;
+
+	auto it = state.resolved.names.find(root);
+	if (it == state.resolved.names.end() || it->second.empty())
+		return false;
+
+	const ResolvedDeclaration* decl = it->second[0];
+	TypeId storage = declStorageType(*decl, state.interned);
+
+	if (auto* vd = std::get_if<Required<AST::VariableDefinitionStatement>>(&decl->definition))
+	{
+		if (storage == INVALID_TYPE_ID && scope)
+			storage = scope->lookupVar(&vd->value());
+		if (scope && !scope->lookupMutability(&vd->value()))
+			return true;   // 'const' binding
+	}
+
+	if (storage != INVALID_TYPE_ID && storage < static_cast<TypeId>(state.interned.table.size()))
+	{
+		TypeInfo::Kind k = state.interned.get(storage).kind;
+		if (k == TypeInfo::Kind::Reference || k == TypeInfo::Kind::Pointer)
+			return true;   // behind an immutable indirection
+	}
+	return false;
 }
 
 static const AST::Function* getDeclFunction(const ResolvedDeclaration& decl)
@@ -566,6 +666,10 @@ static bool satisfiesConstraint(TypeId id, BuiltinInterface iface, const Interne
 			cur = info.asNamed().underlying;
 			continue;
 		}
+		// A4: Iterable has no primitive member set — it is satisfied structurally
+		// by fixed arrays and slices (and, transparently, dynamic heap arrays).
+		if (iface == BuiltinInterface::Iterable)
+			return info.kind == TypeInfo::Kind::Array || info.kind == TypeInfo::Kind::Slice;
 		if (info.kind == TypeInfo::Kind::Primitive)
 		{
 			auto it = s_BuiltinInterfaceMembers.find(iface);
@@ -573,6 +677,21 @@ static bool satisfiesConstraint(TypeId id, BuiltinInterface iface, const Interne
 		}
 		return false;
 	}
+}
+
+// A4: check whether a concrete type satisfies a user-defined interface bound —
+// i.e. its 'type T : I' markers (interned into implementedInterfaces) include I.
+static bool satisfiesInterfaceConstraint(TypeId id, TypeId interfaceTypeId, const InternedTypes& interned)
+{
+	if (id == INVALID_TYPE_ID || interfaceTypeId == INVALID_TYPE_ID)
+		return false;
+	auto it = interned.implementedInterfaces.find(id);
+	if (it == interned.implementedInterfaces.end())
+		return false;
+	for (TypeId iface : it->second)
+		if (iface == interfaceTypeId)
+			return true;
+	return false;
 }
 
 // try a generic overload for a given arg-type list
@@ -634,9 +753,17 @@ static TypeId tryGenericOverload(const ResolvedDeclaration& decl, const std::vec
 			}
 
 			const TypeInfo& tpInfo = interned.get(tpId);
-			if (tpInfo.kind == TypeInfo::Kind::TypeParam && tpInfo.asTypeParam().constraint.has_value())
+			if (tpInfo.kind == TypeInfo::Kind::TypeParam)
 			{
-				if (!satisfiesConstraint(bindIt->second, *tpInfo.asTypeParam().constraint, interned))
+				const auto& tpData = tpInfo.asTypeParam();
+				if (tpData.constraint.has_value()
+					&& !satisfiesConstraint(bindIt->second, *tpData.constraint, interned))
+				{
+					ok = false;
+				}
+				// A4: user-defined interface bound (fn f<T: MyInterface>).
+				if (tpData.interfaceConstraint.has_value()
+					&& !satisfiesInterfaceConstraint(bindIt->second, *tpData.interfaceConstraint, interned))
 				{
 					ok = false;
 				}
@@ -698,7 +825,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 						TypeId inferred = scope->lookupVar(&varDef->value());
 						if (inferred != INVALID_TYPE_ID)
 						{
-							resultType = inferred;
+							// An inferred binding stores its full type (e.g. &T for `var r = &x`);
+							// using it as a value transparently dereferences to T (§4.2).
+							resultType = stripIndirection(inferred, state.interned);
 							return;
 						}
 					}
@@ -752,7 +881,20 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			{
 				case TokenKind::IntegerLiteral: resultType = TYPE_UNTYPED_INT;   break;
 				case TokenKind::FloatLiteral:   resultType = TYPE_UNTYPED_FLOAT; break;
-				case TokenKind::StringLiteral:  resultType = TYPE_U8;  break;  // *[u8], simplified
+				case TokenKind::StringLiteral:
+				{
+					// §1.6/§4.3: a string literal is a sequence of integral numbers —
+					// typed as &[u8], an unmanaged view over the literal data.
+					TypeInfo sliceInfo;
+					sliceInfo.kind = TypeInfo::Kind::Slice;
+					sliceInfo.data = TypeInfo::SliceData{ TYPE_U8 };
+					TypeId sliceId = state.internType(std::move(sliceInfo));
+					TypeInfo refInfo;
+					refInfo.kind = TypeInfo::Kind::Reference;
+					refInfo.data = TypeInfo::IndirectionData{ sliceId };
+					resultType = state.internType(std::move(refInfo));
+					break;
+				}
 				case TokenKind::True:
 				case TokenKind::False:          resultType = TYPE_BOOL; break;
 				case TokenKind::CharLiteral:
@@ -783,13 +925,27 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			switch (unary.value().op)
 			{
 				case TokenKind::BitwiseAnd:
-					// &expr → value type stays T (the reference is the storage; callee uses value type).
-					resultType = innerType;
+				{
+					// &expr takes the address of expr — its type is &T, so a binding
+					// initialised from it is correctly inferred as a reference type.
+					if (innerType == INVALID_TYPE_ID) { resultType = INVALID_TYPE_ID; break; }
+					TypeInfo refInfo;
+					refInfo.kind = TypeInfo::Kind::Reference;
+					refInfo.data = TypeInfo::IndirectionData{ innerType };
+					resultType = state.internType(std::move(refInfo));
 					break;
+				}
+				case TokenKind::New:
 				case TokenKind::Move:
-					// move expr — value type is still T (caller assigns to *T variable).
-					resultType = innerType;
+				{
+					// new/move yield a managed heap pointer — the expression's type is *T.
+					if (innerType == INVALID_TYPE_ID) { resultType = INVALID_TYPE_ID; break; }
+					TypeInfo ptrInfo;
+					ptrInfo.kind = TypeInfo::Kind::Pointer;
+					ptrInfo.data = TypeInfo::IndirectionData{ innerType };
+					resultType = state.internType(std::move(ptrInfo));
 					break;
+				}
 				default:
 					resultType = innerType;
 					break;
@@ -883,6 +1039,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			std::vector<const ResolvedDeclaration*> candidates;
 			bool isMemberCall = false;
 			TypeId selfType = INVALID_TYPE_ID;
+			const AST::Expression* receiverExpr = nullptr;   // A9: member-call receiver
+			const Token* memberCallTok = nullptr;            // A9: method-name token (diagnostics)
+			const Token* callTok = nullptr;                  // A10: callee token (diagnostics)
 			const AST::Expression& calleeExpr = call.value().function.value();
 
 			// A1: enum variant construction — Enum::Variant(payload). The callee
@@ -943,11 +1102,15 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				auto it = state.resolved.names.find(&identReq->value());
 				if (it != state.resolved.names.end())
 					candidates = it->second;
+				callTok = identReq->value().path.value().item.value();
 			}
 			else if (auto* memberReq = std::get_if<Required<AST::MemberAccessExpression>>(&calleeExpr))
 			{
 				isMemberCall = true;
 				selfType = checkExpression(state, memberReq->value().object.value(), scope);
+				receiverExpr = &memberReq->value().object.value();
+				memberCallTok = &memberReq->value().memberName;
+				callTok = memberCallTok;
 				auto methodName = state.getStringView(memberReq->value().memberName);
 				// Built-in methods (5.1): reinterpret<T>, convert<T>, length.
 				{
@@ -1101,7 +1264,7 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				for (size_t i = 0; i < paramTypes.size(); ++i)
 				{
 					TypeId pv  = stripIndirection(paramTypes[i], state.interned);
-					TypeId arg = argTypes[i];
+					TypeId arg = stripIndirection(argTypes[i], state.interned);
 					if (arg != INVALID_TYPE_ID && pv != INVALID_TYPE_ID &&
 						!isAssignable(arg, pv, state.interned))
 					{
@@ -1133,7 +1296,13 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			{
 				selected = exactMatches[0];
 				if (exactMatches.size() > 1)
-					Log::error("Ambiguous function call — multiple non-generic overloads match.");
+				{
+					if (callTok)
+						state.logger.logErrorInRange(*callTok, *callTok,
+							"Ambiguous function call — multiple non-generic overloads match.");
+					else
+						Log::error("Ambiguous function call — multiple non-generic overloads match.");
+				}
 
 				const AST::Function* fn = getDeclFunction(*selected);
 				if (fn && fn->returnType.hasValue())
@@ -1201,7 +1370,13 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				if (!genericMatches.empty())
 				{
 					if (genericMatches.size() > 1)
-						Log::error("Ambiguous function call — multiple generic overloads match.");
+					{
+						if (callTok)
+							state.logger.logErrorInRange(*callTok, *callTok,
+								"Ambiguous function call — multiple generic overloads match.");
+						else
+							Log::error("Ambiguous function call — multiple generic overloads match.");
+					}
 
 					selected = genericMatches[0].first;
 					auto& bindings = genericMatches[0].second;
@@ -1235,6 +1410,32 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 
 			if (selected)
 				state.result.selectedOverloads[&call.value()] = selected;
+
+			// A9: §5.2 item 3 — a method whose `self` receiver is a mutable
+			// indirection (&var/*var) cannot be invoked on an immutable receiver.
+			if (isMemberCall && selected && receiverExpr && memberCallTok)
+			{
+				if (const AST::Function* fn = getDeclFunction(*selected))
+				{
+					if (const auto* paramList = fn->parameters.ptr())
+					{
+						const auto& selfParam = paramList->item.value();
+						auto it = state.interned.astTypes.find(&selfParam.type.value());
+						if (selfParam.isSelf && it != state.interned.astTypes.end()
+							&& it->second < static_cast<TypeId>(state.interned.table.size()))
+						{
+							TypeInfo::Kind k = state.interned.get(it->second).kind;
+							const bool mutableSelf =
+								k == TypeInfo::Kind::RefMut || k == TypeInfo::Kind::PtrMut;
+							if (mutableSelf && receiverIsImmutable(state, *receiverExpr, scope))
+								state.logger.logErrorInRange(*memberCallTok, *memberCallTok,
+									"Method '{}' requires a mutable receiver ('&var'/'*var' self), "
+									"but the receiver is immutable.",
+									state.getStringView(*memberCallTok));
+						}
+					}
+				}
+			}
 
 			resultType = selectedRetId;
 		},
@@ -1694,18 +1895,25 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 				// Pre-compute annotation type so we can pass it as contextType to the RHS expression
 				// (enables contextual typing for array literals and other context-sensitive constructs).
 				TypeId annotatedValueType = INVALID_TYPE_ID;
+				TypeId rawAnnotated = INVALID_TYPE_ID;
 				if (varDef.value().type.hasValue())
 				{
 					auto it = state.interned.astTypes.find(&varDef.value().type.value());
 					if (it != state.interned.astTypes.end())
+					{
+						rawAnnotated = it->second;
 						annotatedValueType = stripIndirection(it->second, state.interned);
+					}
 				}
 
 				TypeId valueT = checkExpression(state, varDef.value().value.value(), scope, annotatedValueType);
 
 				if (annotatedValueType != INVALID_TYPE_ID)
 				{
-					if (valueT != INVALID_TYPE_ID && !isAssignable(valueT, annotatedValueType, state.interned))
+					// Compare value types: an indirection-typed RHS (&x, new e) is
+					// matched against the annotation's stripped value type.
+					if (valueT != INVALID_TYPE_ID
+						&& !isAssignable(stripIndirection(valueT, state.interned), annotatedValueType, state.interned))
 					{
 						state.logger.logErrorInRange(varDef.value().name, varDef.value().name,
 							"Type mismatch in variable declaration '{}'.",
@@ -1713,6 +1921,12 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 					}
 					valueT = annotatedValueType;
 				}
+
+				// A5: §4.2 — a reference-typed binding requires '&' on the RHS;
+				// a heap-pointer-typed binding requires 'new' or 'move'.
+				if (rawAnnotated != INVALID_TYPE_ID)
+					checkIndirectionAssignment(state, rawAnnotated,
+						varDef.value().value.value(), varDef.value().name);
 
 				if (scope)
 				{
@@ -1744,12 +1958,80 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 					}
 				}
 
+				// A6: §4.2 — mutating a field/element *through* an indirection, or
+				// through an immutable binding, when the access chain is rooted in
+				// an immutable reference/pointer (`&`/`*`) or a `const` binding.
+				{
+					const AST::Expression& tgt = assign.value().target.value();
+					const bool throughAccess =
+						std::holds_alternative<Required<AST::MemberAccessExpression>>(tgt) ||
+						std::holds_alternative<Required<AST::ArrayAccessExpression>>(tgt);
+					if (throughAccess)
+					{
+						if (const AST::IdentifierExpression* root = rootIdentifier(tgt))
+						{
+							auto rIt = state.resolved.names.find(root);
+							if (rIt != state.resolved.names.end() && !rIt->second.empty())
+							{
+								const ResolvedDeclaration* decl = rIt->second[0];
+								const Token* tok = root->path.value().item.value();
+
+								TypeId storage = declStorageType(*decl, state.interned);
+								if (auto* vd = std::get_if<Required<AST::VariableDefinitionStatement>>(&decl->definition))
+								{
+									if (storage == INVALID_TYPE_ID && scope)
+										storage = scope->lookupVar(&vd->value());
+									if (scope && !scope->lookupMutability(&vd->value()))
+										state.logger.logErrorInRange(*tok, *tok,
+											"Cannot mutate through immutable binding '{}'.",
+											state.getStringView(*tok));
+								}
+
+								if (storage != INVALID_TYPE_ID && storage < static_cast<TypeId>(state.interned.table.size()))
+								{
+									TypeInfo::Kind k = state.interned.get(storage).kind;
+									if (k == TypeInfo::Kind::Reference || k == TypeInfo::Kind::Pointer)
+										state.logger.logErrorInRange(*tok, *tok,
+											"Cannot mutate through an immutable reference or pointer; "
+											"declare '{}' as '&var' or '*var'.", state.getStringView(*tok));
+								}
+							}
+						}
+					}
+				}
+
 				// D4 + type check: for all assignment operators (= and compound),
 				// RHS value type must be assignable to LHS value type.
 				if (targetType != INVALID_TYPE_ID && valueT != INVALID_TYPE_ID)
 				{
-					if (!isAssignable(valueT, targetType, state.interned))
-						Log::error("Type mismatch in assignment.");
+					if (!isAssignable(stripIndirection(valueT, state.interned),
+						stripIndirection(targetType, state.interned), state.interned))
+					{
+						if (const AST::IdentifierExpression* r = rootIdentifier(assign.value().target.value()))
+						{
+							const Token* t = r->path.value().item.value();
+							state.logger.logErrorInRange(*t, *t, "Type mismatch in assignment.");
+						}
+						else
+							Log::error("Type mismatch in assignment.");
+					}
+				}
+
+				// A5: §4.2 — plain '=' to an indirection-typed binding requires the
+				// matching RHS form ('&' for references, 'new'/'move' for pointers).
+				if (assign.value().op == TokenKind::Assign)
+				{
+					if (auto* identReq = std::get_if<Required<AST::IdentifierExpression>>(&assign.value().target.value()))
+					{
+						auto resolvedIt = state.resolved.names.find(&identReq->value());
+						if (resolvedIt != state.resolved.names.end() && !resolvedIt->second.empty())
+						{
+							TypeId rawTarget = declStorageType(*resolvedIt->second[0], state.interned);
+							const Token* tok = identReq->value().path.value().item.value();
+							checkIndirectionAssignment(state, rawTarget,
+								assign.value().value.value(), *tok);
+						}
+					}
 				}
 			},
 
@@ -1790,8 +2072,16 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 					if (state.currentReturnType != INVALID_TYPE_ID && retType != INVALID_TYPE_ID)
 					{
 						TypeId expectedVal = stripIndirection(state.currentReturnType, state.interned);
-						if (!isAssignable(retType, expectedVal, state.interned))
-							Log::error("Return type mismatch.");
+						if (!isAssignable(stripIndirection(retType, state.interned), expectedVal, state.interned))
+						{
+							if (const AST::IdentifierExpression* r = rootIdentifier(ret.value().value.value()))
+							{
+								const Token* t = r->path.value().item.value();
+								state.logger.logErrorInRange(*t, *t, "Return type mismatch.");
+							}
+							else
+								Log::error("Return type mismatch.");
+						}
 					}
 				}
 			},

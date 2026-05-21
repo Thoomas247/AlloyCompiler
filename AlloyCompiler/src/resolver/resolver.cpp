@@ -260,8 +260,23 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 			auto lastName = state.getStringView(*lastToken);
 			auto candidates = importTable->get(lastName);
 			if (candidates.empty())
+			{
 				state.logger.logErrorInRange(*lastToken, *lastToken,
 					"Undefined name '{}' in module '{}'.", lastName, firstName);
+			}
+			else
+			{
+				// D1: a private definition is not visible across a module boundary —
+				// only 'pub'/'exp' declarations may be imported.
+				std::vector<const ResolvedDeclaration*> visible;
+				for (const auto* decl : candidates)
+					if (decl->visibility != AST::Definition::Visibility::Private)
+						visible.push_back(decl);
+				if (visible.empty())
+					state.logger.logErrorInRange(*lastToken, *lastToken,
+						"'{}' is private to module '{}' and cannot be imported.", lastName, firstName);
+				candidates = std::move(visible);
+			}
 			state.result.names[&ident] = std::move(candidates);
 		}
 		else
