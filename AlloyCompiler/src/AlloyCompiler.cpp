@@ -62,13 +62,30 @@ int main()
 				}
 			});
 
+		// Stages are dependent: a failed stage produces output the next stage
+		// cannot safely consume, so skip the rest of this module. Other modules
+		// are still compiled — one error no longer aborts the whole batch.
 		auto [resolveStatus, resolvedModule] = resolve(*m.source, m.moduleNode.value(), m.symbols, importedSymbols);
+		if (resolveStatus != Status::Ok)
+			continue;
 
 		auto [internStatus, internedTypes] = intern(*m.source, m.moduleNode.value(), resolvedModule);
-		auto [checkStatus, typedModule] = typeCheck(*m.source, m.moduleNode.value(), resolvedModule, internedTypes, m.symbols);
+		if (internStatus != Status::Ok)
+			continue;
 
-		__debugbreak();
+		auto [checkStatus, typedModule] = typeCheck(*m.source, m.moduleNode.value(), resolvedModule, internedTypes, m.symbols);
+		(void)checkStatus;
 	}
 
-	__debugbreak();
+	auto& diagnostics = DiagnosticEngine::instance();
+	diagnostics.printAll();
+
+	if (diagnostics.hasError())
+	{
+		std::fprintf(stderr, "Compilation failed with %zu error(s).\n", diagnostics.getErrorCount());
+		return 1;
+	}
+
+	std::println("Compilation succeeded ({} module(s)).", modules.size());
+	return 0;
 }

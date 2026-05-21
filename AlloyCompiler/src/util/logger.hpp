@@ -1,23 +1,92 @@
 #pragma once
 
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <format>
 #include <print>
+#include <vector>
 
 #include "../tokenizer/tokenizer.hpp"
 
+struct Token;
+
+// A single compiler diagnostic, with an optional source location.
+struct Diagnostic
+{
+	enum class Severity { Error, Warning, Info };
+
+	Severity severity;
+	bool hasLocation;
+	uint32_t line;
+	uint32_t col;
+	std::string message;
+};
+
+// Process-wide diagnostic sink. Every compiler stage reports here instead of
+// aborting on the first error; the driver prints the accumulated list at the
+// end of compilation and derives a meaningful exit code from getErrorCount().
+class DiagnosticEngine
+{
+public:
+	static DiagnosticEngine& instance()
+	{
+		static DiagnosticEngine engine;
+		return engine;
+	}
+
+	void report(Diagnostic diagnostic)
+	{
+		if (diagnostic.severity == Diagnostic::Severity::Error)
+			++m_ErrorCount;
+		m_Diagnostics.push_back(std::move(diagnostic));
+	}
+
+	const std::vector<Diagnostic>& diagnostics() const { return m_Diagnostics; }
+	size_t getErrorCount() const { return m_ErrorCount; }
+	bool hasError() const { return m_ErrorCount > 0; }
+
+	// Prints every accumulated diagnostic to stderr (unbuffered — survives a crash).
+	void printAll() const
+	{
+		for (const auto& d : m_Diagnostics)
+		{
+			const char* tag =
+				d.severity == Diagnostic::Severity::Error   ? "ERROR" :
+				d.severity == Diagnostic::Severity::Warning ? "WARNING" : "INFO";
+			if (d.hasLocation)
+				std::fprintf(stderr, "%s:%u:%u: %s\n", tag, d.line, d.col, d.message.c_str());
+			else
+				std::fprintf(stderr, "%s: %s\n", tag, d.message.c_str());
+		}
+		std::fflush(stderr);
+	}
+
+private:
+	std::vector<Diagnostic> m_Diagnostics;
+	size_t m_ErrorCount = 0;
+};
+
 namespace Log
 {
+	// Reports a fatal (location-less) error into the diagnostic engine.
 	template<typename... Args>
 	static void fatal(const std::string& format, Args&&... args)
 	{
-		std::println("FATAL:{}", std::vformat(format, std::make_format_args(args...)));
+		DiagnosticEngine::instance().report(Diagnostic{
+			Diagnostic::Severity::Error, false, 0, 0,
+			std::vformat(format, std::make_format_args(args...))
+		});
 	}
 
+	// Reports a location-less error into the diagnostic engine.
 	template<typename... Args>
 	static void error(const std::string& format, Args&&... args)
 	{
-		std::println("ERROR:{}", std::vformat(format, std::make_format_args(args...)));
+		DiagnosticEngine::instance().report(Diagnostic{
+			Diagnostic::Severity::Error, false, 0, 0,
+			std::vformat(format, std::make_format_args(args...))
+		});
 	}
 
 	template<typename... Args>
@@ -26,8 +95,6 @@ namespace Log
 		std::println("INFO:{}", std::vformat(format, std::make_format_args(args...)));
 	}
 }
-
-struct Token;
 
 class Logger
 {
@@ -43,8 +110,10 @@ public:
 	void logErrorInRange(TokenPosition startPos, TokenPosition, const std::string& format, Args&&... args)
 	{
 		m_HasError = true;
-		Log::error("{}:{}:{}", startPos.line, startPos.col, makeFormatted(format, args...));
-		__debugbreak();
+		DiagnosticEngine::instance().report(Diagnostic{
+			Diagnostic::Severity::Error, true, startPos.line, startPos.col,
+			makeFormatted(format, args...)
+		});
 	}
 
 	template<typename... Args>

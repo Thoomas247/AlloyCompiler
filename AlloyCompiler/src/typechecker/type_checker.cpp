@@ -62,6 +62,15 @@ struct CheckState
 	// D2: expected return type of the current function being checked (INVALID = void/unknown)
 	TypeId currentReturnType = INVALID_TYPE_ID;
 
+	// A2/A3: collects the value types of `break value;` statements targeting the
+	// innermost enclosing loop/match. nullptr when no loop/match is active.
+	std::vector<TypeId>* breakCollector = nullptr;
+
+	// A2/A3: set by checkStatement when a loop/match is reached in statement
+	// position; the construct handler reads and clears it. A trailing `else`
+	// clause is only legal when the construct is used as a value expression.
+	bool constructInStatementPosition = false;
+
 	explicit CheckState(const Source& source,
 		const ResolvedModule& resolved,
 		InternedTypes& interned,
@@ -356,6 +365,30 @@ static bool isAssignable(TypeId from, TypeId to, const InternedTypes& interned)
 	return false;
 }
 
+// A2/A3: unify the value types yielded by the break statements of a loop/match
+// (and its else block). Untyped literals are resolved; the widest compatible
+// type wins. Returns INVALID_TYPE_ID when no typed break value was found.
+static TypeId unifyBreakTypes(const std::vector<TypeId>& types, const InternedTypes& interned)
+{
+	TypeId result = INVALID_TYPE_ID;
+	for (TypeId raw : types)
+	{
+		TypeId t = resolveUntypedLiteral(raw);
+		if (t == INVALID_TYPE_ID)
+			continue;
+		if (result == INVALID_TYPE_ID || result == t)
+		{
+			result = t;
+			continue;
+		}
+		if (isAssignable(result, t, interned))
+			result = t;          // t is the wider / more general type
+		else if (!isAssignable(t, result, interned))
+			result = t;          // incompatible — keep the most recent (lenient)
+	}
+	return result;
+}
+
 static const AST::Function* getDeclFunction(const ResolvedDeclaration& decl)
 {
 	if (auto* fn = std::get_if<Required<AST::FunctionDefinition>>(&decl.definition))
@@ -448,6 +481,72 @@ static TypeId substituteTypeParams(TypeId id, const std::unordered_map<TypeId, T
 		return (innerSub == info.asIndirection().inner) ? id : innerSub;
 	}
 	return id;
+}
+
+// A1: result of resolving a qualified identifier as an enum-variant path
+// (Enum::Variant). enumTypeId is INVALID unless the first path segment names an
+// enum TypeDefinition; variantFound indicates the last segment named a variant.
+struct EnumVariantInfo
+{
+	TypeId enumTypeId = INVALID_TYPE_ID;   // the enum's Named TypeId (the value's type)
+	bool variantFound = false;
+	bool hasPayload = false;
+	TypeId payloadType = INVALID_TYPE_ID;
+	const Token* variantToken = nullptr;   // last path segment, for diagnostics
+};
+
+// A1: classify a qualified identifier (A::B) as an enum-variant access.
+static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::IdentifierExpression& ident)
+{
+	EnumVariantInfo result;
+
+	const AST::ListNode<const Token*>* first = ident.path.ptr();
+	if (!first || !first->next.hasValue())
+		return result;   // not a qualified path
+
+	auto declIt = state.resolved.names.find(&ident);
+	if (declIt == state.resolved.names.end() || declIt->second.empty())
+		return result;
+
+	auto* typeDefReq = std::get_if<Required<AST::TypeDefinition>>(&declIt->second[0]->definition);
+	if (!typeDefReq)
+		return result;
+
+	auto namedIt = state.interned.namedTypeIds.find(&typeDefReq->value().name);
+	if (namedIt == state.interned.namedTypeIds.end())
+		return result;
+
+	// unwrap the Named chain to the underlying type
+	TypeId cur = namedIt->second;
+	while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size())
+		&& state.interned.get(cur).kind == TypeInfo::Kind::Named)
+		cur = state.interned.get(cur).asNamed().underlying;
+
+	if (cur == INVALID_TYPE_ID || cur >= static_cast<TypeId>(state.interned.table.size())
+		|| state.interned.get(cur).kind != TypeInfo::Kind::Enum)
+		return result;   // first segment is a type, but not an enum
+
+	result.enumTypeId = namedIt->second;
+
+	// the last path segment names the variant
+	const AST::ListNode<const Token*>* node = first;
+	while (node->next.hasValue())
+		node = node->next.ptr();
+	result.variantToken = node->item.value();
+	std::string_view variantName = state.getStringView(*result.variantToken);
+
+	for (const auto& v : state.interned.get(cur).asEnum().variants)
+	{
+		if (v.name == variantName)
+		{
+			result.variantFound = true;
+			result.hasPayload = v.payloadType.has_value();
+			if (result.hasPayload)
+				result.payloadType = *v.payloadType;
+			break;
+		}
+	}
+	return result;
 }
 
 // check whether a TypeId satisfies a BuiltinInterface constraint
@@ -634,6 +733,16 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					resultType = state.internType(std::move(fnInfo));
 					return;
 				}
+
+				// A1: enum variant used as a value (Code::Success). A payload-less
+				// variant is a complete value of the enum type. A payload-carrying
+				// variant referenced without an argument list is incomplete and is
+				// left untyped (lenient — see §7.3 of the spec).
+				{
+					EnumVariantInfo ev = resolveEnumVariant(state, ident.value());
+					if (ev.enumTypeId != INVALID_TYPE_ID && ev.variantFound && !ev.hasPayload)
+						resultType = ev.enumTypeId;
+				}
 			},
 
 		// literal
@@ -775,6 +884,59 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			bool isMemberCall = false;
 			TypeId selfType = INVALID_TYPE_ID;
 			const AST::Expression& calleeExpr = call.value().function.value();
+
+			// A1: enum variant construction — Enum::Variant(payload). The callee
+			// resolves to the enum's TypeDefinition; type the call as the enum
+			// type and check the argument against the variant payload type.
+			if (auto* enumIdent = std::get_if<Required<AST::IdentifierExpression>>(&calleeExpr))
+			{
+				EnumVariantInfo ev = resolveEnumVariant(state, enumIdent->value());
+				if (ev.enumTypeId != INVALID_TYPE_ID)
+				{
+					const Token& loc = *ev.variantToken;
+					std::string_view variantName = state.getStringView(loc);
+
+					if (!ev.variantFound)
+					{
+						state.logger.logErrorInRange(loc, loc,
+							"'{}' is not a variant of the enum.", variantName);
+					}
+					else if (ev.hasPayload)
+					{
+						const AST::Expression* firstArg = nullptr;
+						call.value().arguments.forEach([&](const Required<AST::Expression>& a)
+						{
+							if (!firstArg) firstArg = &a.value();
+						});
+
+						if (argTypes.size() != 1 || !firstArg)
+						{
+							state.logger.logErrorInRange(loc, loc,
+								"Enum variant '{}' expects a single payload argument.", variantName);
+						}
+						else
+						{
+							// Re-check the argument with the payload type as context so
+							// untyped literals inside it concretise correctly.
+							TypeId payloadArg = checkExpression(state, *firstArg, scope, ev.payloadType);
+							if (payloadArg != INVALID_TYPE_ID &&
+								!isAssignable(resolveUntypedLiteral(payloadArg), ev.payloadType, state.interned))
+							{
+								state.logger.logErrorInRange(loc, loc,
+									"Enum variant '{}' payload type mismatch.", variantName);
+							}
+						}
+					}
+					else if (!argTypes.empty())
+					{
+						state.logger.logErrorInRange(loc, loc,
+							"Enum variant '{}' carries no payload.", variantName);
+					}
+
+					resultType = ev.enumTypeId;
+					return;
+				}
+			}
 
 			if (auto* identReq = std::get_if<Required<AST::IdentifierExpression>>(&calleeExpr))
 			{
@@ -1193,6 +1355,20 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				}
 			}
 
+			// A1: with no explicit named type, fall back to contextType (e.g. an
+			// enum-variant payload or an annotated variable) so member initializers
+			// still get contextual typing and untyped literals concretise correctly.
+			if (!structData && contextType != INVALID_TYPE_ID)
+			{
+				TypeId cur = contextType;
+				while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size())
+					&& state.interned.get(cur).kind == TypeInfo::Kind::Named)
+					cur = state.interned.get(cur).asNamed().underlying;
+				if (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size())
+					&& state.interned.get(cur).kind == TypeInfo::Kind::Struct)
+					structData = &state.interned.get(cur).asStruct();
+			}
+
 			// Check each member initializer, using its declared member type as context (C2)
 			// and collect inferred types for anonymous struct (C1)
 			TypeInfo::StructData inferredStruct;
@@ -1305,15 +1481,37 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 		// --- While expression ---
 		[&](const Required<AST::WhileExpression>& whileExpr)
 		{
+			const bool isStatement = state.constructInStatementPosition;
+			state.constructInStatementPosition = false;
+
 			checkExpression(state, whileExpr.value().condition.value(), scope);
+
+			// A2/A3: collect break values from the body (and else block) so the
+			// while can be used as a value-producing expression.
+			std::vector<TypeId> breaks;
+			std::vector<TypeId>* prevCollector = state.breakCollector;
+			state.breakCollector = &breaks;
 			checkStatement(state, whileExpr.value().body.value(), scope);
 			if (whileExpr.value().elseBody.hasValue())
 				checkStatement(state, whileExpr.value().elseBody.value(), scope);
+			state.breakCollector = prevCollector;
+
+			const bool hasElse = whileExpr.value().elseBody.hasValue();
+			if (hasElse && isStatement)
+				Log::error("An 'else' clause on a 'while' loop is only valid when the loop is used as a value expression.");
+
+			resultType = unifyBreakTypes(breaks, state.interned);
+
+			if (hasElse && !isStatement && resultType == INVALID_TYPE_ID)
+				Log::error("A 'while' expression with an 'else' clause must yield a value via 'break'.");
 		},
 
 		// --- For expression ---
 		[&](const Required<AST::ForExpression>& forExpr)
 		{
+			const bool isStatement = state.constructInStatementPosition;
+			state.constructInStatementPosition = false;
+
 			// B3: collect iterable element types in order
 			std::vector<TypeId> elemTypes;
 			forExpr.value().iterables.value().forEach([&](const Required<AST::Expression>& it)
@@ -1342,15 +1540,38 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				});
 			}
 
+			// A2/A3: collect break values from the body (and else block).
+			std::vector<TypeId> breaks;
+			std::vector<TypeId>* prevCollector = state.breakCollector;
+			state.breakCollector = &breaks;
 			checkStatement(state, forExpr.value().body.value(), &forScope);
 			if (forExpr.value().elseBody.hasValue())
 				checkStatement(state, forExpr.value().elseBody.value(), &forScope);
+			state.breakCollector = prevCollector;
+
+			const bool hasElse = forExpr.value().elseBody.hasValue();
+			if (hasElse && isStatement)
+				Log::error("An 'else' clause on a 'for' loop is only valid when the loop is used as a value expression.");
+
+			resultType = unifyBreakTypes(breaks, state.interned);
+
+			if (hasElse && !isStatement && resultType == INVALID_TYPE_ID)
+				Log::error("A 'for' expression with an 'else' clause must yield a value via 'break'.");
 		},
 
 		// --- Match expression ---
 		[&](const Required<AST::MatchExpression>& match)
 		{
+			const bool isStatement = state.constructInStatementPosition;
+			state.constructInStatementPosition = false;
+
 			TypeId subjectType = checkExpression(state, match.value().subject.value(), scope);
+
+			// A2/A3: collect break values from every arm body and the external
+			// else block so the match can be used as a value-producing expression.
+			std::vector<TypeId> breaks;
+			std::vector<TypeId>* prevCollector = state.breakCollector;
+			state.breakCollector = &breaks;
 
 			// B5: resolve the enum type to get variant payload types
 			TypeId enumTypeId = INVALID_TYPE_ID;
@@ -1424,6 +1645,17 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 
 			if (match.value().externalElse.hasValue())
 				checkStatement(state, match.value().externalElse.value(), scope);
+
+			state.breakCollector = prevCollector;
+
+			const bool hasElse = match.value().externalElse.hasValue();
+			if (hasElse && isStatement)
+				Log::error("An external 'else' block on a 'match' is only valid when the match is used as a value expression.");
+
+			resultType = unifyBreakTypes(breaks, state.interned);
+
+			if (hasElse && !isStatement && resultType == INVALID_TYPE_ID)
+				Log::error("A 'match' expression with an external 'else' block must yield a value via 'break'.");
 		},
 
 		// --- Macro call (front-end only) ---
@@ -1538,7 +1770,12 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 			[&](const Required<AST::BreakStatement>& brk)
 			{
 				if (brk.value().value.hasValue())
-					checkExpression(state, brk.value().value.value(), scope);
+				{
+					TypeId t = checkExpression(state, brk.value().value.value(), scope);
+					// A2/A3: contribute this break's value type to the enclosing loop/match.
+					if (state.breakCollector && t != INVALID_TYPE_ID)
+						state.breakCollector->push_back(t);
+				}
 			},
 
 			[&](const Required<AST::ReturnStatement>& ret)
@@ -1565,14 +1802,18 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 			},
 			[&](const Required<AST::ForExpression>& forExpr)
 			{
+				// A2/A3: reached in statement position — a trailing `else` is illegal here.
+				state.constructInStatementPosition = true;
 				checkExpression(state, AST::Expression(forExpr), scope);
 			},
 			[&](const Required<AST::WhileExpression>& whileExpr)
 			{
+				state.constructInStatementPosition = true;
 				checkExpression(state, AST::Expression(whileExpr), scope);
 			},
 			[&](const Required<AST::MatchExpression>& matchExpr)
 			{
+				state.constructInStatementPosition = true;
 				checkExpression(state, AST::Expression(matchExpr), scope);
 			},
 		}, stmt);
