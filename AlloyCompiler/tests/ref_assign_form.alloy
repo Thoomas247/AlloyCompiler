@@ -1,0 +1,9 @@
+// A5 — reference/pointer bindings require the matching RHS form.
+
+fn run() -> u32 {
+	//@expect-error requires the address-of operator
+	var r: &i32 = 5;
+	//@expect-error requires 'new' or 'move'
+	var p: *i32 = 7;
+	return 0;
+}

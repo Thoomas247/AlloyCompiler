@@ -1,0 +1,16 @@
+// §4.3 + A1 — a payload-less enum value drives a value-producing match.
+
+type Code = enum {
+	Ok;
+	Err;
+};
+
+fn run() -> i32 {
+	const c = Code::Ok;
+	const result = match (c) {
+		Code::Ok break 1;
+		Code::Err break 2;
+		else break 0;
+	};
+	return result;
+}

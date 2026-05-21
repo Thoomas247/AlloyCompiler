@@ -1,0 +1,6 @@
+// §1.6 — well-formed escape sequences in a string literal. Positive test.
+
+fn run() -> u32 {
+	const s = "tab=\t nl=\n cr=\r nul=\0 hex=\x41 uni=\u{1F600} quote=\" bs=\\";
+	return 0;
+}

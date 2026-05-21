@@ -1,0 +1,16 @@
+// Positive test — no annotations, must compile clean.
+
+type Vec = struct {
+	x: u32;
+	y: u32;
+};
+
+fn add(a: u32, b: u32) -> u32 {
+	return a + b;
+}
+
+fn main() -> u32 {
+	const v = Vec { .x = 1, .y = 2 };
+	const s = add(v.x, v.y);
+	return s;
+}

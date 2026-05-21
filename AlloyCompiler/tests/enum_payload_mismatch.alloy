@@ -1,0 +1,13 @@
+// A1 — enum variant construction checks the payload type.
+
+type Res = enum {
+	Ok: struct {
+		value: u32;
+	};
+};
+
+fn make() -> u32 {
+	//@expect-error payload type mismatch
+	const r = Res::Ok({ .wrong = 5 });
+	return 0;
+}

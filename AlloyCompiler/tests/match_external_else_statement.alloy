@@ -1,0 +1,11 @@
+// §4.3 — an external 'else' block on a 'match' used as a statement is an error.
+
+fn run() -> u32 {
+	const n: u32 = 1;
+	//@expect-error external 'else' block on a 'match'
+	match (n) {
+		1 { break 0; }
+		else { break 0; }
+	} else { break 0; }
+	return 0;
+}

@@ -1,0 +1,6 @@
+// §3 — referencing an undeclared name is an error.
+
+fn run() -> u32 {
+	//@expect-error Undefined name 'doesNotExist'
+	return doesNotExist;
+}

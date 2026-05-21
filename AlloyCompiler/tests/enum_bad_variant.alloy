@@ -1,0 +1,12 @@
+// A1 — naming a variant the enum does not declare is an error.
+
+type Code = enum {
+	Ok;
+	Err;
+};
+
+fn run() -> u32 {
+	//@expect-error is not a variant of the enum
+	const x = Code::Nope();
+	return 0;
+}

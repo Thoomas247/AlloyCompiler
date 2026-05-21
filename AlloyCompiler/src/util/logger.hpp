@@ -46,6 +46,13 @@ public:
 	size_t getErrorCount() const { return m_ErrorCount; }
 	bool hasError() const { return m_ErrorCount > 0; }
 
+	// Resets the sink — used by the test runner to isolate per-test diagnostics.
+	void clear()
+	{
+		m_Diagnostics.clear();
+		m_ErrorCount = 0;
+	}
+
 	// Prints every accumulated diagnostic to stderr (unbuffered — survives a crash).
 	void printAll() const
 	{

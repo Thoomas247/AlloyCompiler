@@ -1,0 +1,13 @@
+// §3.2 — accessing a field a struct does not declare is an error.
+
+type Pt = struct {
+	x: u32;
+	y: u32;
+};
+
+fn run() -> u32 {
+	const p = Pt { .x = 1, .y = 2 };
+	//@expect-error No field 'z' on type
+	const bad = p.z;
+	return 0;
+}

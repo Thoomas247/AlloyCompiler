@@ -1,0 +1,8 @@
+// §3.3 rule 5 — narrowing is not an implicit conversion.
+
+fn run() -> u32 {
+	var big: u64 = 5;
+	//@expect-error Type mismatch in variable declaration 'small'
+	var small: u8 = big;
+	return 0;
+}

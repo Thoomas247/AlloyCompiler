@@ -1,0 +1,15 @@
+// A6 — mutation through an immutable reference or a const binding is an error.
+
+type Box = struct {
+	v: u32;
+};
+
+fn run(ib: &Box) -> u32 {
+	//@expect-error mutate through an immutable reference
+	ib.v = 1;
+
+	const cb: Box = Box { .v = 2 };
+	//@expect-error mutate through immutable binding
+	cb.v = 3;
+	return 0;
+}

@@ -1,4 +1,6 @@
 #include <filesystem>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -20,7 +22,11 @@ struct CompiledModule
 	SymbolTable symbols;
 };
 
-int main()
+// ---------------------------------------------------------------------------
+// Normal compilation — compiles every *.alloy under ./examples as one program.
+// ---------------------------------------------------------------------------
+
+static int compileExamples()
 {
 	fs::path rootDir = "./examples";
 	const auto sources = getSources(rootDir);
@@ -88,4 +94,148 @@ int main()
 
 	std::println("Compilation succeeded ({} module(s)).", modules.size());
 	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test harness (F3) — runs each *.alloy under ./tests in isolation and checks
+// it against expectation annotations embedded in the source as comments:
+//
+//   //@expect-error <substring>   one per expected error; the substring must
+//                                 appear in some diagnostic message.
+//
+// A file with no annotations is a positive test — it must compile clean.
+// A file passes when the expected and actual error counts match and every
+// expected substring is matched by a distinct diagnostic.
+// ---------------------------------------------------------------------------
+
+// Compiles a single self-contained source (no cross-file imports) through the
+// full pipeline. Diagnostics land in the process-wide DiagnosticEngine.
+static void compileSource(const Source& source)
+{
+	auto [tokenStatus, tokens] = tokenize(source);
+	auto [parseStatus, parseResult] = parse(source, tokens);
+	auto& [moduleNode, allocator] = parseResult;
+	auto [declareStatus, symbols] = declare(source, moduleNode.value());
+
+	std::vector<const SymbolTable*> noImports;
+	auto [resolveStatus, resolved] = resolve(source, moduleNode.value(), symbols, noImports);
+	if (resolveStatus != Status::Ok)
+		return;
+
+	auto [internStatus, interned] = intern(source, moduleNode.value(), resolved);
+	if (internStatus != Status::Ok)
+		return;
+
+	auto [checkStatus, typed] = typeCheck(source, moduleNode.value(), resolved, interned, symbols);
+	(void)checkStatus;
+}
+
+static std::string trim(std::string_view s)
+{
+	size_t b = s.find_first_not_of(" \t\r\n");
+	if (b == std::string_view::npos)
+		return {};
+	size_t e = s.find_last_not_of(" \t\r\n");
+	return std::string(s.substr(b, e - b + 1));
+}
+
+// Collects every "//@expect-error <substring>" annotation from a test source.
+static std::vector<std::string> parseExpectations(const std::string& text)
+{
+	std::vector<std::string> expectations;
+	const std::string marker = "//@expect-error";
+	size_t pos = 0;
+	while ((pos = text.find(marker, pos)) != std::string::npos)
+	{
+		size_t start = pos + marker.size();
+		size_t end = text.find('\n', start);
+		std::string_view rest = (end == std::string::npos)
+			? std::string_view(text).substr(start)
+			: std::string_view(text).substr(start, end - start);
+		expectations.push_back(trim(rest));
+		pos = (end == std::string::npos) ? text.size() : end;
+	}
+	return expectations;
+}
+
+// True when actual error messages exactly satisfy the expected substrings:
+// equal counts, and every expected pattern matched by a distinct message.
+static bool matchExpectations(const std::vector<std::string>& expected,
+	const std::vector<std::string>& errors)
+{
+	if (expected.size() != errors.size())
+		return false;
+
+	std::vector<bool> used(errors.size(), false);
+	for (const auto& pattern : expected)
+	{
+		bool found = false;
+		for (size_t i = 0; i < errors.size(); ++i)
+		{
+			if (!used[i] && errors[i].find(pattern) != std::string::npos)
+			{
+				used[i] = true;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+static int runTests()
+{
+	fs::path testDir = "./tests";
+	if (!fs::exists(testDir))
+	{
+		std::println("No './tests' directory — nothing to run.");
+		return 0;
+	}
+
+	const auto sources = getSources(testDir);
+	int passed = 0;
+	int failed = 0;
+
+	for (const auto& source : sources)
+	{
+		const auto expectations = parseExpectations(source.data);
+
+		DiagnosticEngine::instance().clear();
+		compileSource(source);
+
+		std::vector<std::string> errors;
+		for (const auto& d : DiagnosticEngine::instance().diagnostics())
+			if (d.severity == Diagnostic::Severity::Error)
+				errors.push_back(d.message);
+
+		if (matchExpectations(expectations, errors))
+		{
+			++passed;
+			std::println("PASS  {}", source.moduleName);
+		}
+		else
+		{
+			++failed;
+			std::println("FAIL  {}  (expected {} error(s), got {})",
+				source.moduleName, expectations.size(), errors.size());
+			for (const auto& e : errors)
+				std::println("        actual: {}", e);
+			for (const auto& x : expectations)
+				std::println("        expected: {}", x);
+		}
+	}
+
+	std::println("---");
+	std::println("{} passed, {} failed ({} total).", passed, failed, passed + failed);
+	return failed == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv)
+{
+	if (argc > 1 && std::string_view(argv[1]) == "--test")
+		return runTests();
+
+	return compileExamples();
 }

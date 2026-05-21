@@ -1,0 +1,7 @@
+// §1.6 — a char literal may pack at most 8 bytes.
+
+fn run() -> u32 {
+	//@expect-error Char literal must be between 1 and 8 bytes
+	const c = 'abcdefghi';
+	return 0;
+}

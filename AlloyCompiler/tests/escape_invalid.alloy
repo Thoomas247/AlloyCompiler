@@ -1,0 +1,13 @@
+// §1.6 — malformed escape sequences are rejected by the tokenizer.
+
+fn run() -> u32 {
+	//@expect-error Invalid escape sequence
+	const a = "\q";
+	//@expect-error expected exactly two hexadecimal digits
+	const b = "\x1";
+	//@expect-error expected at least one hexadecimal digit
+	const c = "\u{}";
+	//@expect-error not a valid Unicode scalar value
+	const d = "\u{110000}";
+	return 0;
+}

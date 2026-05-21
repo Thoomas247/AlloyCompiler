@@ -1,0 +1,8 @@
+// §3.3 rule 5 — signed/unsigned is a cross-class conversion, not implicit.
+
+fn run() -> u32 {
+	var s: i32 = 5;
+	//@expect-error Type mismatch in variable declaration 'u'
+	var u: u32 = s;
+	return 0;
+}

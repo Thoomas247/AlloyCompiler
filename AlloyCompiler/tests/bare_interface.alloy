@@ -1,0 +1,10 @@
+// A7 — an interface used as a value type without an indirection is an error.
+
+interface Shape {
+	fn area() -> f32;
+}
+
+//@expect-error cannot be used as a value type
+fn useShape(s: Shape) -> u32 {
+	return 0;
+}

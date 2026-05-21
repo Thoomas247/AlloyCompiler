@@ -1,0 +1,14 @@
+// §2 — a non-function name may not be declared twice.
+
+type Dup = struct {
+	a: u32;
+};
+
+//@expect-error Duplicate definition 'Dup'
+type Dup = struct {
+	b: u32;
+};
+
+fn run() -> u32 {
+	return 0;
+}

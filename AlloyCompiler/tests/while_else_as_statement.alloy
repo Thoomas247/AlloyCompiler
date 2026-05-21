@@ -1,0 +1,10 @@
+// §4.3 — a trailing 'else' on a 'while' used as a statement is an error.
+
+fn run() -> u32 {
+	var i: u32 = 0;
+	//@expect-error 'else' clause on a 'while' loop
+	while (i < 3) {
+		i += 1;
+	} else break 0;
+	return 0;
+}

@@ -1,0 +1,12 @@
+// §3.3 rule 6 — a value whose layout structurally provides every required field
+// is accepted where a looser anonymous-struct layout is expected (extra fields ok).
+
+fn take(p: struct { a: u8; }) -> u32 {
+	return 0;
+}
+
+fn run() -> u32 {
+	const s: struct { a: u8; b: f32; } = { .a = 1, .b = 2.0 };
+	const r = take(s);
+	return 0;
+}

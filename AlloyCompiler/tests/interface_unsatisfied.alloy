@@ -1,0 +1,14 @@
+// §5.2 — a type marked with an interface must provide every interface function.
+
+interface Printable {
+	fn print() -> u32;
+}
+
+//@expect-error does not satisfy interface
+type Widget : Printable = struct {
+	id: u32;
+};
+
+fn run() -> u32 {
+	return 0;
+}

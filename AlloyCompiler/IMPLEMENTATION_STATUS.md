@@ -343,14 +343,28 @@ compiler reports *all* errors. (`Log::info` still prints inline.)
 (clean) / `1` (errors). Loop-2 stages are guarded: a failed `resolve`/`intern` skips the
 dependent stages for that module but other modules still compile.
 
-**F3. Test harness.** Add a real test runner: positive cases (must compile clean) and
-negative cases (must produce a specific diagnostic). Currently testing is manual via
-`examples/`. The diagnostic rework (F1/F2) unblocks this — a batch run no longer aborts
-on the first error and the exit code is meaningful.
+**F3. Test harness — DONE.** The driver ([`AlloyCompiler.cpp`](src/AlloyCompiler.cpp))
+takes a `--test` flag: `AlloyCompiler.exe --test` compiles every `*.alloy` under `./tests`
+**in isolation** (each as a standalone module, no cross-file imports), resetting the
+`DiagnosticEngine` between files, and checks each against `//@expect-error <substring>`
+annotations embedded as comments. A file with no annotations is a positive test (must
+compile clean). A test passes when expected and actual error counts match and every
+expected substring matches a distinct diagnostic. Prints `PASS`/`FAIL` per file and
+`N passed, M failed`; exit `0` iff all pass. Without `--test` the driver compiles
+`./examples` as before. Corpus in `tests/` is **29 cases** (all passing) covering: char
+width, numeric widening/narrowing, cross-sign-class, undefined name, duplicate definition,
+missing field, interface satisfied/unsatisfied/built-in marker, enum match + bad variant +
+payload mismatch, match-capture-on-non-enum, loop/while/match `else` placement, ref/ptr
+assignment forms, mutate-through-immutable, `self`-receiver mutability, struct structural
+compatibility, generic `Number` constraint, string literal, extension call, arrays, escape
+sequences. Add a new `tests/*.alloy` per future feature/fix.
 
-**F4. Escape-sequence validation.** The tokenizer counts but does not validate
-`\xHH` / `\u{...}` contents; the checker decodes char widths but does not validate scalar
-values.
+**F4. Escape-sequence validation — DONE.** `validateEscapeSequence` in
+[`tokenizer.cpp`](src/tokenizer/tokenizer.cpp) validates every escape inside a string/char
+literal (§1.6): simple escapes (`\n \r \t \0 \\ \' \"`); `\xHH` requires exactly two hex
+digits; `\u{…}` requires `{` … `}` with ≥1 hex digit and a valid Unicode scalar value
+(≤ `0x10FFFF`, no surrogates). Anything else → "Invalid escape sequence". Diagnostics carry
+the escape's source span.
 
 ---
 
@@ -375,15 +389,16 @@ These should be clarified with the language designer before the affected code is
 
 ## 8. Verification Methodology
 
-There is no automated test suite. To verify a change:
+To verify a change:
 
 1. Build with `/t:Rebuild` (see gotcha on stale incremental builds).
-2. Place `*.alloy` files under `AlloyCompiler/examples/` and run the binary from the
-   `AlloyCompiler/` directory.
-3. Diagnostics print to `stderr` at the end of the run; the process exits `0` (clean) or
-   `1` (errors). No `__debugbreak()` dance is needed any more (F1/F2 done).
-4. `examples/main.alloy` is the canonical smoke test; it must compile without errors and
-   exit `0`. It exercises A1 (enum construction) and A2/A3 (`for`/`match` as expressions).
+2. **Run the test suite:** `AlloyCompiler.exe --test` from the `AlloyCompiler/` directory.
+   It compiles every `tests/*.alloy` in isolation and checks `//@expect-error` annotations;
+   exit `0` iff all pass. Add a `tests/*.alloy` for each new feature/fix (positive case =
+   no annotations; negative case = one `//@expect-error <substring>` per expected error).
+3. **Smoke test:** run the binary with no arguments to compile `./examples`. Diagnostics
+   print to `stderr`; the process exits `0` (clean) or `1` (errors). `examples/main.alloy`
+   must compile clean and exit `0`.
 
 ---
 
@@ -399,7 +414,8 @@ There is no automated test suite. To verify a change:
 8. ~~**A8** — string literal typing.~~ **DONE.**
 9. ~~**D1/D2** — cross-module visibility + import validation.~~ **DONE.**
 10. ~~**A9/A10** — `self`-receiver indirection context; located error model.~~ **DONE.**
-11. **F3** — test harness. Next highest-leverage item now that F1/F2 unblock it.
-12. **B1–B4** — comptime/macro evaluation.
-13. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
+11. ~~**F3** — test harness (`--test`, `tests/` corpus).~~ **DONE.**
+12. ~~**F4** — escape-sequence validation.~~ **DONE.**
+13. **B1–B4** — comptime/macro evaluation.
+14. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
     correct one.

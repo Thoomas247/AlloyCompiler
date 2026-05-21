@@ -1,0 +1,16 @@
+// §4.5 — an extension function is called via dot notation on its receiver.
+
+type Vec = struct {
+	x: u32;
+	y: u32;
+};
+
+fn getX(self v: &Vec) -> u32 {
+	return v.x;
+}
+
+fn run() -> u32 {
+	const v = Vec { .x = 7, .y = 9 };
+	const r = v.getX();
+	return r;
+}

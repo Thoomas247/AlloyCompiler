@@ -1,0 +1,15 @@
+// A9 — a '&var' self method cannot be invoked on an immutable receiver.
+
+type Box = struct {
+	v: u32;
+};
+
+fn setV(self b: &var Box, nv: u32) -> u32 {
+	return 0;
+}
+
+fn run(ib: &Box) -> u32 {
+	//@expect-error requires a mutable receiver
+	const r = ib.setV(9);
+	return 0;
+}

@@ -392,6 +392,101 @@ static bool tryGetIdentifier(TokenizerState& state)
 	return true;
 }
 
+static uint32_t hexDigitValue(char c)
+{
+	if (c >= '0' && c <= '9') return static_cast<uint32_t>(c - '0');
+	if (c >= 'a' && c <= 'f') return static_cast<uint32_t>(c - 'a' + 10);
+	if (c >= 'A' && c <= 'F') return static_cast<uint32_t>(c - 'A' + 10);
+	return 0;
+}
+
+// F4: validates one escape sequence inside a string/char literal (§1.6). The
+// iterator must be positioned at the leading '\'. Consumes the whole sequence.
+static void validateEscapeSequence(TokenizerState& state)
+{
+	const auto escStart = state.it.currentPosition();
+	state.it.consume('\\');
+
+	if (!state.it.hasNext())
+	{
+		state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+			"Unterminated escape sequence.");
+		return;
+	}
+
+	const char esc = state.it.peek();
+	switch (esc)
+	{
+		// simple escapes
+		case 'n': case 'r': case 't': case '0':
+		case '\\': case '\'': case '"':
+			state.it.consume();
+			return;
+
+		// \xHH — exactly two hex digits
+		case 'x': case 'X':
+		{
+			state.it.consume();
+			int digits = 0;
+			while (digits < 2 && state.it.hasNext()
+				&& isxdigit(static_cast<unsigned char>(state.it.peek())))
+			{
+				state.it.consume();
+				++digits;
+			}
+			if (digits != 2)
+				state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+					"Invalid '\\x' escape: expected exactly two hexadecimal digits.");
+			return;
+		}
+
+		// \u{HHHH} — braced Unicode scalar value
+		case 'u': case 'U':
+		{
+			state.it.consume();
+			if (!state.it.hasNext() || state.it.peek() != '{')
+			{
+				state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+					"Invalid '\\u' escape: expected '{'.");
+				return;
+			}
+			state.it.consume('{');
+
+			uint32_t codepoint = 0;
+			int digits = 0;
+			while (state.it.hasNext() && state.it.peek() != '}'
+				&& isxdigit(static_cast<unsigned char>(state.it.peek())))
+			{
+				codepoint = codepoint * 16 + hexDigitValue(state.it.peek());
+				state.it.consume();
+				++digits;
+			}
+
+			if (!state.it.hasNext() || state.it.peek() != '}')
+			{
+				state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+					"Invalid '\\u' escape: expected '}'.");
+				return;
+			}
+			state.it.consume('}');
+
+			if (digits == 0)
+				state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+					"Invalid '\\u' escape: expected at least one hexadecimal digit.");
+			else if (codepoint > 0x10FFFF || (codepoint >= 0xD800 && codepoint <= 0xDFFF))
+				state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+					"Invalid '\\u' escape: not a valid Unicode scalar value.");
+			return;
+		}
+
+		default:
+			state.logger.logErrorInRange(escStart, state.it.currentPosition(),
+				"Invalid escape sequence '\\{}'.", esc);
+			state.it.consume();
+			return;
+	}
+}
+
 static bool tryGetStringLiteral(TokenizerState& state)
 {
 	if (state.it.peek() != '"')
@@ -415,11 +510,7 @@ static bool tryGetStringLiteral(TokenizerState& state)
 		// handle escape sequences
 		else if (state.it.peek() == '\\')
 		{
-			state.it.consume('\\');
-			if (state.it.hasNext())
-			{
-				state.it.consume();
-			}
+			validateEscapeSequence(state);
 		}
 		else
 		{
@@ -464,11 +555,7 @@ static bool tryGetCharLiteral(TokenizerState& state)
 		// handle escape sequences
 		if (state.it.peek() == '\\')
 		{
-			state.it.consume('\\');
-			if (state.it.hasNext())
-			{
-				state.it.consume();
-			}
+			validateEscapeSequence(state);
 		}
 		else
 		{

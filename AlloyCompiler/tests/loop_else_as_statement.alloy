@@ -1,0 +1,10 @@
+// A2/A3 — a trailing 'else' on a loop used as a statement is an error.
+
+fn run() -> u32 {
+	const arr: [u32; 3] = [ 1, 2, 3 ];
+	//@expect-error 'else' clause on a 'for' loop
+	for (arr) | x | {
+		break x;
+	} else break 0;
+	return 0;
+}

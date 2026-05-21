@@ -1,0 +1,11 @@
+// §4.3 — a pattern capture is valid only on an enum-variant pattern.
+
+fn run() -> u32 {
+	const n: u32 = 5;
+	match (n) {
+		//@expect-error Pattern capture is only valid when matching an enum variant
+		5 |cap| { break 1; }
+		else { break 0; }
+	}
+	return 0;
+}

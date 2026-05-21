@@ -1,0 +1,6 @@
+// §1.6 / A8 — a string literal is typed &[u8]. Positive test.
+
+fn run() -> u32 {
+	const greeting = "hello world";
+	return 0;
+}

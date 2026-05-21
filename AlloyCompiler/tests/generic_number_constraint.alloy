@@ -1,0 +1,11 @@
+// §5.2 — a generic bounded by the built-in 'Number' interface, instantiated
+// with an integer. Positive test.
+
+fn pick<T: Number>(a: T, b: T) -> T {
+	return a;
+}
+
+fn run() -> u32 {
+	const x = pick(1, 2);
+	return 0;
+}

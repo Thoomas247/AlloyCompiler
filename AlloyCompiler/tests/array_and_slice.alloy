@@ -1,0 +1,8 @@
+// §3.2 — fixed arrays, array-fill, and indexing. Positive test.
+
+fn run() -> u32 {
+	const fixed: [u32; 3] = [ 1, 2, 3 ];
+	const filled = [ 0; 5 ];
+	const element = fixed[1];
+	return element;
+}

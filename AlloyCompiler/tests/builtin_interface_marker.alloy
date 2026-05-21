@@ -1,0 +1,10 @@
+// §5.2 — a struct cannot satisfy the built-in 'Number' interface.
+
+//@expect-error does not satisfy its built-in interface marker
+type NotNum : Number = struct {
+	x: u32;
+};
+
+fn run() -> u32 {
+	return 0;
+}

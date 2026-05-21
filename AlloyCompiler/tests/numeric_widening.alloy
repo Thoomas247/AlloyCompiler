@@ -1,0 +1,15 @@
+// §3.3 rule 5 — a numeric primitive widens to a wider primitive of the same
+// sign class. Positive test: must compile clean.
+
+fn run() -> u32 {
+	var small: u8 = 5;
+	var wide: u64 = small;
+
+	var s8: i8 = 1;
+	var s64: i64 = s8;
+
+	var f: f32 = 1.0;
+	var fd: f64 = f;
+
+	return 0;
+}

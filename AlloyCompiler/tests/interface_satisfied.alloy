@@ -1,0 +1,17 @@
+// §5.2 — an interface-marked type with a matching extension verifies clean.
+
+interface Printable {
+	fn print() -> u32;
+}
+
+type Widget : Printable = struct {
+	id: u32;
+};
+
+fn print(self w: &Widget) -> u32 {
+	return w.id;
+}
+
+fn run() -> u32 {
+	return 0;
+}
