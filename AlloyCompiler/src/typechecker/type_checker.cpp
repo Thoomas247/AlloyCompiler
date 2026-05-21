@@ -101,6 +101,90 @@ struct CheckState
 static TypeId checkExpression(CheckState& state, const AST::Expression& expr, ScopedVarMap* scope, TypeId contextType = INVALID_TYPE_ID);
 static void checkStatement(CheckState& state, const AST::Statement& stmt, ScopedVarMap* scope);
 static void checkFunction(CheckState& state, const AST::Function& fn, const std::unordered_map<TypeId, TypeId>& typeParamBindings, ScopedVarMap* parentScope, TypeId expectedReturnType = INVALID_TYPE_ID);
+static void checkComptime(CheckState& state, const AST::ComptimeExpression& comptime, ScopedVarMap* scope);
+
+// --- Char literal byte-width computation (§1.6) ---------------------------
+
+static size_t utf8LeadLength(unsigned char b)
+{
+	if (b < 0x80)          return 1;
+	if ((b & 0xE0) == 0xC0) return 2;
+	if ((b & 0xF0) == 0xE0) return 3;
+	if ((b & 0xF8) == 0xF0) return 4;
+	return 1;
+}
+
+static size_t utf8EncodedLength(uint32_t cp)
+{
+	if (cp <= 0x7F)   return 1;
+	if (cp <= 0x7FF)  return 2;
+	if (cp <= 0xFFFF) return 3;
+	return 4;
+}
+
+// Byte width of a char literal's decoded value. `text` includes the surrounding quotes.
+static size_t charLiteralByteWidth(std::string_view text)
+{
+	if (text.size() >= 2 && text.front() == '\'' && text.back() == '\'')
+		text = text.substr(1, text.size() - 2);
+
+	size_t bytes = 0;
+	for (size_t i = 0; i < text.size(); )
+	{
+		if (text[i] == '\\' && i + 1 < text.size())
+		{
+			const char esc = text[i + 1];
+			if (esc == 'x' || esc == 'X')
+			{
+				bytes += 1;
+				i += 2;
+				for (int k = 0; k < 2 && i < text.size() && isxdigit(static_cast<unsigned char>(text[i])); ++k)
+					++i;
+			}
+			else if (esc == 'u' || esc == 'U')
+			{
+				i += 2;
+				uint32_t cp = 0;
+				if (i < text.size() && text[i] == '{')
+				{
+					++i;
+					while (i < text.size() && text[i] != '}')
+					{
+						const char c = text[i];
+						uint32_t digit = (c >= '0' && c <= '9') ? c - '0'
+							: (c >= 'a' && c <= 'f') ? c - 'a' + 10
+							: (c >= 'A' && c <= 'F') ? c - 'A' + 10 : 0;
+						cp = cp * 16 + digit;
+						++i;
+					}
+					if (i < text.size()) ++i;  // skip '}'
+				}
+				bytes += utf8EncodedLength(cp);
+			}
+			else
+			{
+				bytes += 1;
+				i += 2;
+			}
+		}
+		else
+		{
+			const size_t len = utf8LeadLength(static_cast<unsigned char>(text[i]));
+			bytes += len;
+			i += len;
+		}
+	}
+	return bytes;
+}
+
+// Smallest unsigned primitive that holds a char literal of the given byte width (§1.6).
+static TypeId charLiteralType(size_t byteWidth)
+{
+	if (byteWidth <= 1) return TYPE_U8;
+	if (byteWidth == 2) return TYPE_U16;
+	if (byteWidth <= 4) return TYPE_U32;
+	return TYPE_U64;
+}
 
 static TypeId declStorageType(const ResolvedDeclaration& decl, const InternedTypes& interned)
 {
@@ -190,6 +274,21 @@ static bool isAssignable(TypeId from, TypeId to, const InternedTypes& interned)
 	const TypeInfo& fromInfo = interned.get(from);
 	const TypeInfo& toInfo = interned.get(to);
 
+	// §3.2/§5.2: a concrete type that implements interface I coerces to an
+	// interface object of I. Checked before the Named unwrap because the
+	// 'type T : I' markers are recorded against the named type's TypeId.
+	if (toInfo.kind == TypeInfo::Kind::Interface)
+	{
+		auto it = interned.implementedInterfaces.find(from);
+		if (it != interned.implementedInterfaces.end())
+		{
+			for (TypeId iface : it->second)
+				if (iface == to)
+					return true;
+		}
+		return false;
+	}
+
 	// named: unwrap transitively (named is subtype of its underlying type)
 	if (fromInfo.kind == TypeInfo::Kind::Named)
 	{
@@ -227,20 +326,29 @@ static bool isAssignable(TypeId from, TypeId to, const InternedTypes& interned)
 		return isAssignable(fromInfo.asSlice().elem, toInfo.asSlice().elem, interned);
 	}
 
-	// structural struct equivalence (same member names + order + assignable types)
+	// §3.3 rule 6 — chained nominal-structural struct compatibility.
+	// An anonymous-layout target (Kind::Struct) accepts any value whose internal
+	// shape structurally provides every field the target requires (the source may
+	// carry extra fields). Named struct targets stay nominal and are not handled here.
 	if (fromInfo.kind == TypeInfo::Kind::Struct && toInfo.kind == TypeInfo::Kind::Struct)
 	{
 		const auto& fm = fromInfo.asStruct().members;
 		const auto& tm = toInfo.asStruct().members;
-		if (fm.size() != tm.size())
-		{
-			return false;
-		}
 
-		for (size_t i = 0; i < fm.size(); ++i)
+		for (const auto& target : tm)
 		{
-			if (fm[i].name != tm[i].name) return false;
-			if (!isAssignable(fm[i].type, tm[i].type, interned)) return false;
+			bool found = false;
+			for (const auto& source : fm)
+			{
+				if (source.name != target.name)
+					continue;
+				if (!isAssignable(source.type, target.type, interned))
+					return false;
+				found = true;
+				break;
+			}
+			if (!found)
+				return false;
 		}
 		return true;
 	}
@@ -536,6 +644,24 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				case TokenKind::IntegerLiteral: resultType = TYPE_UNTYPED_INT;   break;
 				case TokenKind::FloatLiteral:   resultType = TYPE_UNTYPED_FLOAT; break;
 				case TokenKind::StringLiteral:  resultType = TYPE_U8;  break;  // *[u8], simplified
+				case TokenKind::True:
+				case TokenKind::False:          resultType = TYPE_BOOL; break;
+				case TokenKind::CharLiteral:
+				{
+					// Char literal width scales with its byte representation (§1.6).
+					const size_t width = charLiteralByteWidth(state.getStringView(lit.value().value));
+					if (width == 0 || width > 8)
+					{
+						state.logger.logErrorInRange(lit.value().value, lit.value().value,
+							"Char literal must be between 1 and 8 bytes.");
+						resultType = TYPE_U8;
+					}
+					else
+					{
+						resultType = charLiteralType(width);
+					}
+					break;
+				}
 				default: break;
 			}
 		},
@@ -661,6 +787,85 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				isMemberCall = true;
 				selfType = checkExpression(state, memberReq->value().object.value(), scope);
 				auto methodName = state.getStringView(memberReq->value().memberName);
+				// Built-in methods (5.1): reinterpret<T>, convert<T>, length.
+				{
+					TypeId selfValue = selfType;
+					while (selfValue != INVALID_TYPE_ID && selfValue < static_cast<TypeId>(state.interned.table.size())
+						&& state.interned.get(selfValue).kind == TypeInfo::Kind::Named)
+						selfValue = state.interned.get(selfValue).asNamed().underlying;
+
+					const bool selfIsIterable = selfValue != INVALID_TYPE_ID
+						&& selfValue < static_cast<TypeId>(state.interned.table.size())
+						&& (state.interned.get(selfValue).kind == TypeInfo::Kind::Array
+							|| state.interned.get(selfValue).kind == TypeInfo::Kind::Slice);
+
+					bool builtinHandled = false;
+					for (const auto& bf : s_BuiltinFunctions)
+					{
+						if (bf.name != methodName)
+							continue;
+
+						if (methodName == "length")
+						{
+							// length is the Iterable query; if the receiver is not
+							// iterable, fall through so a user method can still match.
+							if (!selfIsIterable)
+								break;
+							resultType = TYPE_U64;
+							builtinHandled = true;
+						}
+						else
+						{
+							// reinterpret<T> / convert<T> result is the type argument T
+							TypeId taType = INVALID_TYPE_ID;
+							if (call.value().typeArguments.hasValue())
+							{
+								const AST::Type& firstTa = call.value().typeArguments.value().item.value();
+								auto taIt = state.interned.astTypes.find(&firstTa);
+								if (taIt != state.interned.astTypes.end())
+									taType = stripIndirection(taIt->second, state.interned);
+							}
+							resultType = taType;
+							builtinHandled = true;
+						}
+						break;
+					}
+					if (builtinHandled)
+						return;
+				}
+
+				// Dispatch through an interface object: handle.method() where handle: &I.
+				{
+					TypeId sv = selfType;
+					while (sv != INVALID_TYPE_ID && sv < static_cast<TypeId>(state.interned.table.size())
+						&& state.interned.get(sv).kind == TypeInfo::Kind::Named)
+						sv = state.interned.get(sv).asNamed().underlying;
+
+					if (sv != INVALID_TYPE_ID && sv < static_cast<TypeId>(state.interned.table.size())
+						&& state.interned.get(sv).kind == TypeInfo::Kind::Interface)
+					{
+						const AST::InterfaceDefinition* ifaceDecl = state.interned.get(sv).asInterface().decl;
+						bool methodFound = false;
+						if (ifaceDecl)
+						{
+							ifaceDecl->functions.forEach([&](const Required<AST::InterfaceFunction>& f)
+							{
+								if (methodFound) return;
+								if (state.getStringView(f.value().name) != methodName) return;
+								methodFound = true;
+								if (f.value().returnType.hasValue())
+								{
+									auto rIt = state.interned.astTypes.find(&f.value().returnType.value());
+									if (rIt != state.interned.astTypes.end())
+										resultType = stripIndirection(rIt->second, state.interned);
+								}
+							});
+						}
+						if (methodFound)
+							return;
+					}
+				}
+
 				auto overloads = state.moduleSymbols.get(methodName);
 
 				for (const auto* decl : overloads)
@@ -745,6 +950,23 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				if (allMatch) exactMatches.push_back(decl);
 			}
 
+			// Override (5.2): a type-specific extension wins over an interface default.
+			if (isMemberCall && exactMatches.size() > 1)
+			{
+				std::vector<const ResolvedDeclaration*> specific;
+				for (const auto* decl : exactMatches)
+				{
+					const AST::Function* fn = getDeclFunction(*decl);
+					if (!fn || !fn->parameters.ptr()) continue;
+					auto pit = state.interned.astTypes.find(&fn->parameters.ptr()->item.value().type.value());
+					if (pit == state.interned.astTypes.end()) continue;
+					if (stripIndirection(pit->second, state.interned) == selfType)
+						specific.push_back(decl);
+				}
+				if (specific.size() == 1)
+					exactMatches = specific;
+			}
+
 			if (exactMatches.size() >= 1)
 			{
 				selected = exactMatches[0];
@@ -757,6 +979,16 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					auto it = state.interned.astTypes.find(&fn->returnType.value());
 					if (it != state.interned.astTypes.end())
 						selectedRetId = stripIndirection(it->second, state.interned);
+				}
+				else if (auto* ext = std::get_if<Required<AST::ExternDefinition>>(&selected->definition))
+				{
+					// extern declarations carry their return type directly (5.3)
+					if (ext->value().returnType.hasValue())
+					{
+						auto it = state.interned.astTypes.find(&ext->value().returnType.value());
+						if (it != state.interned.astTypes.end())
+							selectedRetId = stripIndirection(it->second, state.interned);
+					}
 				}
 			}
 
@@ -1136,23 +1368,47 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 
 			match.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
 			{
-				if (arm.value().capture.hasValue() && enumTypeId != INVALID_TYPE_ID)
+				// Identify the variant name when the pattern is an identifier path.
+				std::string_view variantName;
+				bool patternIsIdent = false;
+				if (arm.value().pattern.hasValue())
 				{
-					// Find variant payload type — use last path segment (e.g. "Result::Ok" → "Ok")
-					std::string_view variantName;
-					const AST::ListNode<const Token*>* node = arm.value().variant.value().path.ptr();
-					while (node && node->next.hasValue())
-						node = node->next.ptr();
-					if (node) variantName = state.getStringView(*node->item.value());
-
-					TypeId captureType = INVALID_TYPE_ID;
-					const TypeInfo& enumInfo = state.interned.get(enumTypeId);
-					for (const auto& variant : enumInfo.asEnum().variants)
+					const AST::Expression& pat = arm.value().pattern.value();
+					if (auto* identReq = std::get_if<Required<AST::IdentifierExpression>>(&pat))
 					{
-						if (variant.name == variantName && variant.payloadType.has_value())
+						patternIsIdent = true;
+						const AST::ListNode<const Token*>* node = identReq->value().path.ptr();
+						while (node && node->next.hasValue())
+							node = node->next.ptr();
+						if (node) variantName = state.getStringView(*node->item.value());
+					}
+					checkExpression(state, pat, scope, subjectType);
+				}
+
+				if (arm.value().capture.hasValue())
+				{
+					// §4.3: a pattern capture is valid only on an enum-variant pattern.
+					// Only flag it when the subject is typed and is definitively not an
+					// enum — an untyped subject cannot be judged here.
+					TypeId captureType = INVALID_TYPE_ID;
+
+					if (subjectType != INVALID_TYPE_ID && enumTypeId == INVALID_TYPE_ID)
+					{
+						const Token& capTok = arm.value().capture.value().variableName;
+						state.logger.logErrorInRange(capTok, capTok,
+							"Pattern capture is only valid when matching an enum variant.");
+					}
+					else if (enumTypeId != INVALID_TYPE_ID && patternIsIdent)
+					{
+						const TypeInfo& enumInfo = state.interned.get(enumTypeId);
+						for (const auto& variant : enumInfo.asEnum().variants)
 						{
-							captureType = *variant.payloadType;
-							break;
+							if (variant.name == variantName)
+							{
+								if (variant.payloadType.has_value())
+									captureType = *variant.payloadType;
+								break;
+							}
 						}
 					}
 
@@ -1166,8 +1422,25 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				}
 			});
 
-			if (match.value().elseArm.hasValue())
-				checkStatement(state, match.value().elseArm.value(), scope);
+			if (match.value().externalElse.hasValue())
+				checkStatement(state, match.value().externalElse.value(), scope);
+		},
+
+		// --- Macro call (front-end only) ---
+		[&](const Required<AST::MacroCallExpression>& call)
+		{
+			call.value().arguments.forEach([&](const Required<AST::Expression>& arg)
+			{
+				checkExpression(state, arg.value(), scope);
+			});
+			// macro return-type inference is deferred (6) -> no value type
+		},
+
+		// --- Comptime expression (front-end only) ---
+		[&](const Required<AST::ComptimeExpression>& comptime)
+		{
+			checkComptime(state, comptime.value(), scope);
+			// comptime evaluation is deferred (6) -> no value type
 		},
 
 		}, expr);
@@ -1338,6 +1611,177 @@ static void checkFunction(CheckState& state, const AST::Function& fn,
 }
 
 // ---------------------------------------------------------------------------
+// Comptime checking (front-end only)
+// ---------------------------------------------------------------------------
+
+static void checkComptime(CheckState& state, const AST::ComptimeExpression& comptime, ScopedVarMap* scope)
+{
+	std::visit(Overloaded
+		{
+			[&](const Required<AST::IfExpression>& e)    { checkExpression(state, AST::Expression(e), scope); },
+			[&](const Required<AST::WhileExpression>& e) { checkExpression(state, AST::Expression(e), scope); },
+			[&](const Required<AST::MatchExpression>& e) { checkExpression(state, AST::Expression(e), scope); },
+			[&](const Required<AST::StatementBlock>& e)  { checkStatement(state, AST::Statement(e), scope); },
+			[&](const Required<AST::MacroCallExpression>& e)
+			{
+				e.value().arguments.forEach([&](const Required<AST::Expression>& arg)
+					{
+						checkExpression(state, arg.value(), scope);
+					});
+			},
+		}, comptime.construct);
+}
+
+// ---------------------------------------------------------------------------
+// Interface verification pass (§5.2)
+// ---------------------------------------------------------------------------
+
+static TypeId astTypeId(const CheckState& state, const AST::Type& type)
+{
+	auto it = state.interned.astTypes.find(&type);
+	return it != state.interned.astTypes.end() ? it->second : INVALID_TYPE_ID;
+}
+
+// Does `decl` name an extension function satisfying interface function `ifFn` for type `namedTypeId`?
+// `namedTypeId` is the implementing type T; `interfaceTypeId` is the interface I itself
+// (a self receiver of I marks a default implementation, §5.2).
+static bool extensionSatisfiesInterfaceFn(const CheckState& state, const ResolvedDeclaration& decl,
+	const AST::InterfaceFunction& ifFn, TypeId namedTypeId, TypeId interfaceTypeId)
+{
+	const AST::Function* fn = getDeclFunction(decl);
+	if (!fn)
+		return false;
+
+	const auto* paramList = fn->parameters.ptr();
+	if (!paramList)
+		return false;  // an extension function needs at least the 'self' receiver
+
+	const auto& firstParam = paramList->item.value();
+	if (!firstParam.isSelf)
+		return false;
+
+	// the receiver's value type must be the implementing type T (a type-specific
+	// extension) or the interface I itself (a shared default implementation)
+	TypeId selfValue = stripIndirection(astTypeId(state, firstParam.type.value()), state.interned);
+	if (selfValue != namedTypeId && selfValue != interfaceTypeId)
+		return false;
+
+	// extension parameters following 'self' must match the interface signature exactly
+	std::vector<TypeId> extParams;
+	for (const AST::ListNode<AST::FunctionParameter>* node = paramList->next.ptr(); node; node = node->next.ptr())
+		extParams.push_back(astTypeId(state, node->item.value().type.value()));
+
+	std::vector<TypeId> ifParams;
+	ifFn.parameters.forEach([&](const Required<AST::FunctionParameter>& p)
+		{
+			ifParams.push_back(astTypeId(state, p.value().type.value()));
+		});
+
+	if (extParams.size() != ifParams.size())
+		return false;
+	for (size_t i = 0; i < extParams.size(); ++i)
+		if (extParams[i] != ifParams[i])
+			return false;
+
+	TypeId extRet = fn->returnType.hasValue() ? astTypeId(state, fn->returnType.value()) : INVALID_TYPE_ID;
+	TypeId ifRet = ifFn.returnType.hasValue() ? astTypeId(state, ifFn.returnType.value()) : INVALID_TYPE_ID;
+	return extRet == ifRet;
+}
+
+static void verifyInterfaces(CheckState& state, const AST::Module& module)
+{
+	module.definitions.forEach([&](const Required<AST::Definition>& def)
+		{
+			auto* typeDefReq = std::get_if<Required<AST::TypeDefinition>>(&def.value().definition);
+			if (!typeDefReq)
+				return;
+
+			const AST::TypeDefinition& typeDef = typeDefReq->value();
+			if (!typeDef.interfaces.hasValue())
+				return;
+
+			auto namedIt = state.interned.namedTypeIds.find(&typeDef.name);
+			if (namedIt == state.interned.namedTypeIds.end())
+				return;
+			const TypeId namedTypeId = namedIt->second;
+
+			typeDef.interfaces.forEach([&](const Required<const Token*>& markerReq)
+				{
+					const Token* marker = markerReq.value();
+					auto riIt = state.resolved.resolvedInterfaces.find(marker);
+					if (riIt == state.resolved.resolvedInterfaces.end())
+						return;  // unresolved — resolver already reported it
+
+					std::visit(Overloaded
+						{
+							[&](BuiltinInterface bi)
+							{
+								// structural check on the named type's underlying layout
+								TypeId cur = namedTypeId;
+								while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size())
+									&& state.interned.get(cur).kind == TypeInfo::Kind::Named)
+									cur = state.interned.get(cur).asNamed().underlying;
+
+								if (cur == INVALID_TYPE_ID || cur >= static_cast<TypeId>(state.interned.table.size()))
+									return;
+
+								const TypeInfo& info = state.interned.get(cur);
+								bool ok = false;
+								if (bi == BuiltinInterface::Number)
+								{
+									auto memIt = s_BuiltinInterfaceMembers.find(BuiltinInterface::Number);
+									ok = info.kind == TypeInfo::Kind::Primitive && memIt != s_BuiltinInterfaceMembers.end()
+										&& memIt->second.count(info.asPrimitive().name) != 0;
+								}
+								else if (bi == BuiltinInterface::Iterable)
+								{
+									ok = info.kind == TypeInfo::Kind::Array || info.kind == TypeInfo::Kind::Slice;
+								}
+
+								if (!ok)
+									state.logger.logErrorInRange(typeDef.name, typeDef.name,
+										"Type '{}' does not satisfy its built-in interface marker.",
+										state.getStringView(typeDef.name));
+							},
+							[&](const ResolvedDeclaration* ifaceDecl)
+							{
+								auto* ifaceReq = std::get_if<Required<AST::InterfaceDefinition>>(&ifaceDecl->definition);
+								if (!ifaceReq)
+									return;
+
+								// the interface's own TypeId — a self receiver of this type
+								// marks a default implementation (§5.2).
+								TypeId interfaceTypeId = INVALID_TYPE_ID;
+								auto ifaceIdIt = state.interned.interfaceIds.find(&ifaceReq->value());
+								if (ifaceIdIt != state.interned.interfaceIds.end())
+									interfaceTypeId = ifaceIdIt->second;
+
+								ifaceReq->value().functions.forEach([&](const Required<AST::InterfaceFunction>& ifFn)
+									{
+										auto fnName = state.getStringView(ifFn.value().name);
+
+										bool found = false;
+										for (const auto* candidate : state.moduleSymbols.get(fnName))
+										{
+											if (extensionSatisfiesInterfaceFn(state, *candidate, ifFn.value(), namedTypeId, interfaceTypeId))
+											{
+												found = true;
+												break;
+											}
+										}
+
+										if (!found)
+											state.logger.logErrorInRange(typeDef.name, typeDef.name,
+												"Type '{}' does not satisfy interface: no matching extension function '{}'.",
+												state.getStringView(typeDef.name), fnName);
+									});
+							},
+						}, riIt->second);
+				});
+		});
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1373,8 +1817,13 @@ Result<TypedModule> typeCheck(
 					checkFunction(state, fn, {}, nullptr, retTypeId);
 				},
 				[&](const Required<AST::ExternDefinition>&) {},
+				[&](const Required<AST::InterfaceDefinition>&) {},
+				[&](const Required<AST::MacroDefinition>&) {},
 				}, def.value().definition);
 		});
+
+	// 5.2: every interface-marked type must provide the required extension functions.
+	verifyInterfaces(state, module);
 
 	Status status = state.logger.hasError() ? Error : Ok;
 	return { status, std::move(state.result) };

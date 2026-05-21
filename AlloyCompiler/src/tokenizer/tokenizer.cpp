@@ -5,6 +5,7 @@
 
 #include "../util/logger.hpp"
 #include "../source/source.hpp"
+#include "unicode_xid.hpp"
 
 class SourceIterator
 {
@@ -38,6 +39,50 @@ public:
 	{
 		ASSERT(hasNext(offset));
 		return m_Source.data[m_CurrentPosition.index + offset];
+	}
+
+	struct CodePoint
+	{
+		uint32_t value;
+		size_t length;   // UTF-8 byte length; 0 = no code point available
+	};
+
+	// Decodes a UTF-8 code point at the current position (+ byteOffset).
+	// An invalid encoding is reported as a single-byte code point.
+	CodePoint peekCodePoint(size_t byteOffset = 0) const
+	{
+		const size_t i = m_CurrentPosition.index + byteOffset;
+		if (i >= m_Source.data.size())
+			return { 0, 0 };
+
+		const auto b0 = static_cast<unsigned char>(m_Source.data[i]);
+
+		size_t length;
+		uint32_t value;
+		if (b0 < 0x80)              return { b0, 1 };
+		else if ((b0 & 0xE0) == 0xC0) { length = 2; value = b0 & 0x1Fu; }
+		else if ((b0 & 0xF0) == 0xE0) { length = 3; value = b0 & 0x0Fu; }
+		else if ((b0 & 0xF8) == 0xF0) { length = 4; value = b0 & 0x07u; }
+		else                        return { b0, 1 };
+
+		if (i + length > m_Source.data.size())
+			return { b0, 1 };
+
+		for (size_t k = 1; k < length; ++k)
+		{
+			const auto bc = static_cast<unsigned char>(m_Source.data[i + k]);
+			if ((bc & 0xC0) != 0x80)
+				return { b0, 1 };
+			value = (value << 6) | (bc & 0x3Fu);
+		}
+		return { value, length };
+	}
+
+	// Advances past a previously-peeked code point (counts as one column).
+	void advanceCodePoint(const CodePoint& cp)
+	{
+		m_CurrentPosition.index += cp.length;
+		m_CurrentPosition.col++;
 	}
 
 	TokenPosition currentPosition() const
@@ -98,6 +143,13 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 	{"move", Move},
 	{"self", Self},
 
+	{"pub", Pub},
+	{"exp", Exp},
+	{"true", True},
+	{"false", False},
+	{"interface", Interface},
+	{"macro", Macro},
+
 	{"(", LParen},		{")", RParen},
 	{"{", LBrace},		{"}", RBrace},
 	{"[", LBracket},	{"]", RBracket},
@@ -121,7 +173,9 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 	{".", Dot },		{"...", Ellipsis},
 	{":", Colon},		{"::", DoubleColon},
 	{",", Comma},
-	{";", Semicolon}
+	{";", Semicolon},
+
+	{"#", Hash}
 };
 
 static const std::unordered_map<char, std::array<std::string_view, 3>> s_OperatorCombinations =
@@ -199,18 +253,23 @@ static bool tryGetComment(TokenizerState& state)
 	}
 	else
 	{
-		// multi-line comment
-		bool endFound = false;
-
+		// multi-line comment — block comments nest arbitrarily (§1.2)
 		state.it.consume('*');
-		while (state.it.hasNext())
+
+		size_t depth = 1;
+		while (depth > 0 && state.it.hasNext())
 		{
-			if (state.it.peek() == '*' && state.it.hasNext(1) && state.it.peek(1) == '/')
+			if (state.it.peek() == '/' && state.it.hasNext(1) && state.it.peek(1) == '*')
+			{
+				state.it.consume('/');
+				state.it.consume('*');
+				++depth;
+			}
+			else if (state.it.peek() == '*' && state.it.hasNext(1) && state.it.peek(1) == '/')
 			{
 				state.it.consume('*');
 				state.it.consume('/');
-				endFound = true;
-				break;
+				--depth;
 			}
 			else
 			{
@@ -218,7 +277,7 @@ static bool tryGetComment(TokenizerState& state)
 			}
 		}
 
-		if (!endFound)
+		if (depth > 0)
 		{
 			state.logger.logErrorInRange(startPos, state.it.currentPosition(), "Unterminated multi-line comment.");
 		}
@@ -293,19 +352,27 @@ static bool tryGetDelimiter(TokenizerState& state)
 	return true;
 }
 
-static bool tryGetKeyword(TokenizerState& state)
+static bool tryGetIdentifier(TokenizerState& state)
 {
-	if (!(isalpha(state.it.peek()) || state.it.peek() == '_'))
+	// Identifiers follow UAX #31 (§1.3): the first code point must be XID_Start
+	// (or '_'); subsequent code points must be XID_Continue.
+	auto cp = state.it.peekCodePoint();
+	if (cp.length == 0 || !unicode::isXidStart(cp.value))
 	{
 		return false;
 	}
 
 	const auto startPos = state.it.currentPosition();
+	state.it.advanceCodePoint(cp);
 
-	state.it.consume();
-	while (state.it.hasNext() && (isalnum(state.it.peek()) || state.it.peek() == '_'))
+	while (state.it.hasNext())
 	{
-		state.it.consume();
+		auto next = state.it.peekCodePoint();
+		if (next.length == 0 || !unicode::isXidContinue(next.value))
+		{
+			break;
+		}
+		state.it.advanceCodePoint(next);
 	}
 
 	const auto endPos = state.it.currentPosition();
@@ -323,7 +390,6 @@ static bool tryGetKeyword(TokenizerState& state)
 	}
 
 	return true;
-
 }
 
 static bool tryGetStringLiteral(TokenizerState& state)
@@ -383,9 +449,18 @@ static bool tryGetCharLiteral(TokenizerState& state)
 
 	state.it.consume('\'');
 
+	// A char literal holds one or more chars / escape sequences, up to 8 bytes (§1.6).
 	bool endFound = false;
-	if (state.it.hasNext())
+	size_t elementCount = 0;
+	while (state.it.hasNext())
 	{
+		if (state.it.peek() == '\'')
+		{
+			state.it.consume('\'');
+			endFound = true;
+			break;
+		}
+
 		// handle escape sequences
 		if (state.it.peek() == '\\')
 		{
@@ -399,17 +474,17 @@ static bool tryGetCharLiteral(TokenizerState& state)
 		{
 			state.it.consume();
 		}
-		if (state.it.hasNext() && state.it.peek() == '\'')
-		{
-			state.it.consume('\'');
-			endFound = true;
-		}
+		++elementCount;
 	}
 
 	const auto endPos = state.it.currentPosition();
 	if (!endFound)
 	{
 		state.logger.logErrorInRange(startPos, endPos, "Unterminated char literal.");
+	}
+	else if (elementCount == 0)
+	{
+		state.logger.logErrorInRange(startPos, endPos, "Empty char literal.");
 	}
 
 	state.tokens.emplace_back(CharLiteral, startPos, endPos);
@@ -424,6 +499,42 @@ static bool tryGetNumberLiteral(TokenizerState& state)
 	}
 
 	const auto startPos = state.it.currentPosition();
+
+	// Radix-prefixed integer literals: 0x.. (hex), 0b.. (binary), 0o.. (octal) (§1.6).
+	if (state.it.peek() == '0' && state.it.hasNext(1))
+	{
+		const char radix = state.it.peek(1);
+		if (radix == 'x' || radix == 'b' || radix == 'o')
+		{
+			state.it.consume('0');
+			state.it.consume(radix);
+
+			const auto isRadixDigit = [radix](char c) -> bool
+			{
+				const auto uc = static_cast<unsigned char>(c);
+				if (radix == 'x') return isxdigit(uc) != 0;
+				if (radix == 'b') return c == '0' || c == '1';
+				return c >= '0' && c <= '7';
+			};
+
+			bool anyDigit = false;
+			while (state.it.hasNext() && isRadixDigit(state.it.peek()))
+			{
+				state.it.consume();
+				anyDigit = true;
+			}
+
+			const auto radixEndPos = state.it.currentPosition();
+			if (!anyDigit)
+			{
+				state.logger.logErrorInRange(startPos, radixEndPos,
+					"Integer literal has no digits after radix prefix.");
+			}
+
+			state.tokens.emplace_back(IntegerLiteral, startPos, radixEndPos);
+			return true;
+		}
+	}
 
 	bool isFloat = false;
 
@@ -460,7 +571,7 @@ Result<std::vector<Token>> tokenize(const Source& source)
 		if (tryGetComment(state)) continue;
 		if (tryGetOperator(state)) continue;
 		if (tryGetDelimiter(state)) continue;
-		if (tryGetKeyword(state)) continue;
+		if (tryGetIdentifier(state)) continue;
 		if (tryGetStringLiteral(state)) continue;
 		if (tryGetCharLiteral(state)) continue;
 		if (tryGetNumberLiteral(state)) continue;

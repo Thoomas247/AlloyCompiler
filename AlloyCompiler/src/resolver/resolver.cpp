@@ -63,6 +63,28 @@ Result<SymbolTable> declare(const Source& moduleSource, const AST::Module& modul
 						}
 						return Ok;
 					},
+					[&](const Required<AST::InterfaceDefinition>& ifaceDef) -> Status
+					{
+						auto name = state.getStringView(ifaceDef.value().name);
+						if (symbolTable.add(name, visibility, ifaceDef) == Error)
+						{
+							state.logger.logErrorInRange(ifaceDef.value().name, ifaceDef.value().name,
+								"Duplicate definition '{}'.", name);
+							return Error;
+						}
+						return Ok;
+					},
+					[&](const Required<AST::MacroDefinition>& macroDef) -> Status
+					{
+						auto name = state.getStringView(macroDef.value().name);
+						if (symbolTable.add(name, visibility, macroDef) == Error)
+						{
+							state.logger.logErrorInRange(macroDef.value().name, macroDef.value().name,
+								"Duplicate definition '{}'.", name);
+							return Error;
+						}
+						return Ok;
+					},
 				}, def.value().definition);
 
 			status &= s;
@@ -163,6 +185,33 @@ static void resolveBaseType(ResolveState& state, const AST::BaseType& baseType, 
 static void resolveExpression(ResolveState& state, const AST::Expression& expr, ScopedSymbolTable* scope);
 static void resolveStatement(ResolveState& state, const AST::Statement& stmt, ScopedSymbolTable* scope);
 static void resolveFunction(ResolveState& state, const AST::Function& fn, ScopedSymbolTable* parentScope);
+static void resolveMacroCall(ResolveState& state, const AST::MacroCallExpression& call, ScopedSymbolTable* scope);
+static void resolveComptime(ResolveState& state, const AST::ComptimeExpression& comptime, ScopedSymbolTable* scope);
+
+// Resolves an interface-name token (a generic constraint or a type_def marker) to a
+// built-in interface or a user-defined InterfaceDefinition, recording it in the result.
+static void resolveInterfaceToken(ResolveState& state, const Token* ifToken)
+{
+	auto name = state.getStringView(*ifToken);
+
+	auto builtinIt = s_BuiltinInterfaces.find(name);
+	if (builtinIt != s_BuiltinInterfaces.end())
+	{
+		state.result.resolvedInterfaces[ifToken] = builtinIt->second;
+		return;
+	}
+
+	for (const auto* decl : state.moduleScope.get(name))
+	{
+		if (std::holds_alternative<Required<AST::InterfaceDefinition>>(decl->definition))
+		{
+			state.result.resolvedInterfaces[ifToken] = decl;
+			return;
+		}
+	}
+
+	state.logger.logErrorInRange(*ifToken, *ifToken, "'{}' is not a known interface.", name);
+}
 
 static const std::unordered_set<std::string_view> s_BuiltinTypeNames = {
 	"u8", "u16", "u32", "u64",
@@ -297,6 +346,10 @@ static void resolveBaseType(ResolveState& state, const AST::BaseType& baseType, 
 					resolveType(state, functionType.value().returnType.value(), scope);
 				}
 			},
+			[&](const Required<AST::ComptimeExpression>& comptime)
+			{
+				resolveComptime(state, comptime.value(), const_cast<ScopedSymbolTable*>(scope));
+			},
 		}, baseType);
 }
 
@@ -430,7 +483,12 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 				resolveExpression(state, match.value().subject.value(), scope);
 				match.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
 					{
-						resolveIdentifier(state, arm.value().variant.value(), scope);
+						// pattern resolves in the outer scope (capture is not yet bound)
+						if (arm.value().pattern.hasValue())
+						{
+							resolveExpression(state, arm.value().pattern.value(), scope);
+						}
+
 						ScopedSymbolTable armScope(scope);
 						if (arm.value().capture.hasValue())
 						{
@@ -440,13 +498,46 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 						}
 						resolveStatement(state, arm.value().body.value(), &armScope);
 					});
-				if (match.value().elseArm.hasValue())
+				if (match.value().externalElse.hasValue())
 				{
 					ScopedSymbolTable elseScope(scope);
-					resolveStatement(state, match.value().elseArm.value(), &elseScope);
+					resolveStatement(state, match.value().externalElse.value(), &elseScope);
 				}
 			},
+			[&](const Required<AST::MacroCallExpression>& call)
+			{
+				resolveMacroCall(state, call.value(), scope);
+			},
+			[&](const Required<AST::ComptimeExpression>& comptime)
+			{
+				resolveComptime(state, comptime.value(), scope);
+			},
 		}, expr);
+}
+
+static void resolveMacroCall(ResolveState& state, const AST::MacroCallExpression& call, ScopedSymbolTable* scope)
+{
+	resolveIdentifier(state, call.macro.value(), scope);
+	call.typeArguments.forEach([&](const Required<AST::Type>& ta)
+		{
+			resolveType(state, ta.value(), scope);
+		});
+	call.arguments.forEach([&](const Required<AST::Expression>& arg)
+		{
+			resolveExpression(state, arg.value(), scope);
+		});
+}
+
+static void resolveComptime(ResolveState& state, const AST::ComptimeExpression& comptime, ScopedSymbolTable* scope)
+{
+	std::visit(Overloaded
+		{
+			[&](const Required<AST::IfExpression>& e)    { resolveExpression(state, AST::Expression(e), scope); },
+			[&](const Required<AST::WhileExpression>& e) { resolveExpression(state, AST::Expression(e), scope); },
+			[&](const Required<AST::MatchExpression>& e) { resolveExpression(state, AST::Expression(e), scope); },
+			[&](const Required<AST::StatementBlock>& e)  { resolveStatement(state, AST::Statement(e), scope); },
+			[&](const Required<AST::MacroCallExpression>& e) { resolveMacroCall(state, e.value(), scope); },
+		}, comptime.construct);
 }
 
 static void resolveStatement(ResolveState& state, const AST::Statement& stmt, ScopedSymbolTable* scope)
@@ -565,34 +656,21 @@ Result<ResolvedModule> resolve(
 				{
 					[&](const Required<AST::TypeDefinition>& typeDef)
 					{
+						// Resolve ': I1, I2' interface markers.
+						typeDef.value().interfaces.forEach([&](const Required<const Token*>& ifaceTok)
+							{
+								resolveInterfaceToken(state, ifaceTok.value());
+							});
+
 						resolveBaseType(state, typeDef.value().baseType.value(), nullptr);
 					},
 					[&](const Required<AST::FunctionDefinition>& fnDef)
 					{
-					// Validate and resolve type parameter interface constraints.
+					// Resolve type-parameter interface constraints (built-in or user-defined).
 					fnDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
 						{
-							if (!tp.value().interface.hasValue())
-								return;
-
-							const Token* ifToken = tp.value().interface.ptr();
-							auto ifName = state.getStringView(*ifToken);
-
-							// Step 1: check built-in interfaces.
-							auto builtinIt = s_BuiltinInterfaces.find(ifName);
-							if (builtinIt != s_BuiltinInterfaces.end())
-							{
-								state.result.resolvedInterfaces[ifToken] = builtinIt->second;
-								return;
-							}
-
-							// Step 2 (future): check user-defined interface declarations in moduleScope.
-							// auto candidates = state.moduleScope.get(ifName);
-							// if (!candidates.empty() && holds_alternative<InterfaceDefinition>)
-							// { state.result.resolvedInterfaces[ifToken] = candidates[0]; return; }
-
-							state.logger.logErrorInRange(*ifToken, *ifToken,
-								"'{}' is not a known interface.", ifName);
+							if (tp.value().interface.hasValue())
+								resolveInterfaceToken(state, tp.value().interface.ptr());
 						});
 
 					// Inject type parameters into a scope so resolveType can find 'T', 'U', etc.
@@ -611,6 +689,35 @@ Result<ResolvedModule> resolve(
 						{
 							resolveType(state, param.value().type.value(), nullptr);
 						});
+					if (externDef.value().returnType.hasValue())
+					{
+						resolveType(state, externDef.value().returnType.value(), nullptr);
+					}
+				},
+				[&](const Required<AST::InterfaceDefinition>& ifaceDef)
+				{
+					ifaceDef.value().functions.forEach([&](const Required<AST::InterfaceFunction>& fn)
+						{
+							fn.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+								{
+									resolveType(state, param.value().type.value(), nullptr);
+								});
+							if (fn.value().returnType.hasValue())
+							{
+								resolveType(state, fn.value().returnType.value(), nullptr);
+							}
+						});
+				},
+				[&](const Required<AST::MacroDefinition>& macroDef)
+				{
+					ScopedSymbolTable macroScope(nullptr);
+					macroDef.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+						{
+							resolveType(state, param.value().type.value(), &macroScope);
+							auto name = state.getStringView(param.value().name);
+							macroScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, param));
+						});
+					resolveStatement(state, AST::Statement(macroDef.value().body), &macroScope);
 				},
 				}, def.value().definition);
 		});

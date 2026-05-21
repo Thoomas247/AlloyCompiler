@@ -12,14 +12,14 @@
 enum class BuiltinInterface
 {
 	Number,   // u8 u16 u32 u64 i8 i16 i32 i64 f32 f64
-	//Iterable, // array types
+	Iterable, // fixed arrays, slices &[T], dynamic heap arrays *[T]
 };
 
 // map interface name (as it appears in source) to enum value
 const std::unordered_map<std::string_view, BuiltinInterface> s_BuiltinInterfaces =
 {
 	{"Number", BuiltinInterface::Number},
-	//{"Iterable", BuiltinInterface::Iterable},
+	{"Iterable", BuiltinInterface::Iterable},
 };
 
 // map interface to the set of built-in type names it covers
@@ -37,7 +37,7 @@ struct BuiltinFunction
 
 const std::vector<BuiltinFunction> s_BuiltinFunctions =
 {
-	{"reinterpret", true, std::nullopt},              // reinterpret<T>(self s: &T)
-	{"convert",     true, BuiltinInterface::Number},  // convert<T: Number>(self s: &T)
-	//{"length", true, BuiltinInterface::Iterable},  // length<T: Iterable>(self s: &T)
+	{"reinterpret", true, std::nullopt},                // reinterpret<T>(self s: &T)
+	{"convert",     true, BuiltinInterface::Number},    // convert<T: Number>(self s: &T)
+	{"length",      true, BuiltinInterface::Iterable},  // length(self s: &Iterable) -> u64
 };

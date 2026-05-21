@@ -12,6 +12,8 @@ using Declaration = std::variant<
 	Required<AST::TypeDefinition>,
 	Required<AST::FunctionDefinition>,
 	Required<AST::ExternDefinition>,
+	Required<AST::InterfaceDefinition>,
+	Required<AST::MacroDefinition>,
 	Required<AST::FunctionParameter>,
 	Required<AST::VariableDefinitionStatement>,
 	Required<AST::Capture>,
@@ -96,9 +98,11 @@ struct ResolvedModule
 	// Token-keyed resolutions for lambda captures (always single, variables can't overload).
 	std::unordered_map<const Token*, const ResolvedDeclaration*> tokenNames;
 
-	// Maps each TypeParameter interface token → its resolved interface.
+	// Maps each interface-name token → its resolved interface. Covers both
+	// generic type-parameter constraints (fn foo<T: I>) and type_def interface
+	// markers (type T : I1, I2 = ...).
 	// Built-in interfaces → BuiltinInterface enum.
-	// User-defined interfaces (future) → ResolvedDeclaration* of the InterfaceDefinition.
+	// User-defined interfaces → ResolvedDeclaration* of the InterfaceDefinition.
 	std::unordered_map<const Token*, ResolvedInterface> resolvedInterfaces;
 
 	// Stable storage for function-scope declarations (parameters, local variables, captures,

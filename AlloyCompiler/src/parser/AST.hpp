@@ -72,6 +72,8 @@ namespace AST
 	struct LambdaExpression;
 	struct BinaryExpression;
 	struct UnaryExpression;
+	struct MacroCallExpression;
+	struct ComptimeExpression;
 
 	struct VariableDefinitionStatement;
 	struct AssignmentStatement;
@@ -95,7 +97,9 @@ namespace AST
 		Required<StructInitializerExpression>,
 		Required<LambdaExpression>,
 		Required<BinaryExpression>,
-		Required<UnaryExpression>
+		Required<UnaryExpression>,
+		Required<MacroCallExpression>,
+		Required<ComptimeExpression>
 	>;
 
 	using Statement = std::variant<
@@ -118,7 +122,8 @@ namespace AST
 		Required<StructType>,
 		Required<EnumType>,
 		Required<ArrayType>,
-		Required<FunctionType>
+		Required<FunctionType>,
+		Required<ComptimeExpression>
 	>;
 
 	struct Type
@@ -244,7 +249,7 @@ namespace AST
 
 	struct MatchArm
 	{
-		Required<IdentifierExpression> variant;
+		Optional<Expression> pattern;   // nullopt = catch-all 'else' arm
 		Optional<Capture> capture;
 		Required<Statement> body;
 	};
@@ -253,7 +258,7 @@ namespace AST
 	{
 		Required<Expression> subject;
 		Optional<ListNode<MatchArm>> arms;
-		Optional<Statement> elseArm;
+		Optional<Statement> externalElse;   // trailing 'else' after the closing '}'
 	};
 
 	struct FunctionCallExpression
@@ -317,6 +322,26 @@ namespace AST
 		Required<Expression> right;
 	};
 
+	// macro_call = ident [ "<" type { "," type } ">" ] "(" [ expr { "," expr } ] ")"
+	struct MacroCallExpression
+	{
+		Required<IdentifierExpression> macro;
+		Optional<ListNode<Type>> typeArguments;
+		Optional<ListNode<Expression>> arguments;
+	};
+
+	// comptime_expr = "#" ( if_expr | while_expr | match_expr | stmt_block | macro_call )
+	struct ComptimeExpression
+	{
+		std::variant<
+			Required<IfExpression>,
+			Required<WhileExpression>,
+			Required<MatchExpression>,
+			Required<StatementBlock>,
+			Required<MacroCallExpression>
+		> construct;
+	};
+
 #pragma endregion
 
 #pragma region Statement Nodes
@@ -363,6 +388,7 @@ namespace AST
 	struct TypeDefinition
 	{
 		const Token& name;
+		Optional<ListNode<const Token*>> interfaces;   // ': I1, I2' interface markers
 		Required<BaseType> baseType;
 	};
 
@@ -377,7 +403,29 @@ namespace AST
 	{
 		const Token& name;
 		Optional<ListNode<FunctionParameter>> parameters;
+		Optional<Type> returnType;
 		bool isVariadic;
+	};
+
+	// interface_fn = "fn" ident "(" [ param { "," param } ] ")" [ "->" type ] ";"
+	struct InterfaceFunction
+	{
+		const Token& name;
+		Optional<ListNode<FunctionParameter>> parameters;
+		Optional<Type> returnType;
+	};
+
+	struct InterfaceDefinition
+	{
+		const Token& name;
+		Optional<ListNode<InterfaceFunction>> functions;
+	};
+
+	struct MacroDefinition
+	{
+		const Token& name;
+		Optional<ListNode<FunctionParameter>> parameters;
+		Required<StatementBlock> body;
 	};
 
 	struct Definition
@@ -390,7 +438,13 @@ namespace AST
 		};
 
 		Visibility visiblity;
-		std::variant<Required<TypeDefinition>, Required<FunctionDefinition>, Required<ExternDefinition>> definition;
+		std::variant<
+			Required<TypeDefinition>,
+			Required<FunctionDefinition>,
+			Required<ExternDefinition>,
+			Required<InterfaceDefinition>,
+			Required<MacroDefinition>
+		> definition;
 	};
 
 #pragma endregion

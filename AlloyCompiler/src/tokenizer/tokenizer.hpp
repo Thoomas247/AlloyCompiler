@@ -47,6 +47,13 @@ enum class TokenKind
 	Move,
 	Self,
 
+	Pub,
+	Exp,
+	True,
+	False,
+	Interface,
+	Macro,
+
 	LParen, RParen,
 	LBrace, RBrace,
 	LBracket, RBracket,
@@ -71,6 +78,8 @@ enum class TokenKind
 	Colon, DoubleColon,
 	Comma,
 	Semicolon,
+
+	Hash,
 
 	EndOfFile,
 };

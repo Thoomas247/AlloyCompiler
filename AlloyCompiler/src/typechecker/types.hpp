@@ -49,6 +49,7 @@ struct TypeInfo
 		Function,    // (T...) -> R
 		Named,       // user-defined alias: name + underlying TypeId
 		TypeParam,   // generic type variable (T, U, ...)
+		Interface,   // interface used as a type (dynamic-dispatch object)
 	};
 
 	Kind kind = Kind::Primitive;
@@ -117,6 +118,12 @@ struct TypeInfo
 		std::optional<BuiltinInterface> constraint;
 	};
 
+	struct InterfaceData
+	{
+		std::string_view name;
+		const AST::InterfaceDefinition* decl = nullptr;
+	};
+
 	std::variant<
 		PrimitiveData,
 		IndirectionData,
@@ -126,7 +133,8 @@ struct TypeInfo
 		EnumData,
 		FunctionData,
 		NamedData,
-		TypeParamData
+		TypeParamData,
+		InterfaceData
 	> data;
 
 	const PrimitiveData& asPrimitive()  const { return std::get<PrimitiveData>(data); }
@@ -138,6 +146,7 @@ struct TypeInfo
 	const FunctionData& asFunction()   const { return std::get<FunctionData>(data); }
 	const NamedData& asNamed()      const { return std::get<NamedData>(data); }
 	const TypeParamData& asTypeParam()  const { return std::get<TypeParamData>(data); }
+	const InterfaceData& asInterface()  const { return std::get<InterfaceData>(data); }
 
 	bool isIndirection() const
 	{
@@ -169,6 +178,12 @@ struct InternedTypes
 
 	// TypeParameter name token to TypeParam TypeId
 	std::unordered_map<const Token*, TypeId> typeParamIds;
+
+	// InterfaceDefinition to its Interface TypeId
+	std::unordered_map<const AST::InterfaceDefinition*, TypeId> interfaceIds;
+
+	// concrete Named TypeId to the Interface TypeIds it implements ('type T : I' markers)
+	std::unordered_map<TypeId, std::vector<TypeId>> implementedInterfaces;
 
 	const TypeInfo& get(TypeId id) const { return table[id]; }
 

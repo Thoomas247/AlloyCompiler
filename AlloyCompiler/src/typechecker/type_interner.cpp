@@ -67,9 +67,10 @@ static bool typeInfoEqual(const TypeInfo& a, const TypeInfo& b)
             return fa.params == fb.params && fa.ret == fb.ret;
         }
 
-        // Named and TypeParam are never deduplicated — each declaration is unique.
+        // Named, TypeParam and Interface are never deduplicated — each declaration is unique.
         case TypeInfo::Kind::Named:
         case TypeInfo::Kind::TypeParam:
+        case TypeInfo::Kind::Interface:
             return false;
     }
     return false;
@@ -126,6 +127,7 @@ static size_t hashTypeInfo(const TypeInfo& info)
 
         case TypeInfo::Kind::Named:
         case TypeInfo::Kind::TypeParam:
+        case TypeInfo::Kind::Interface:
             // Never hashed for dedup — should not reach here.
             return seed;
     }
@@ -188,6 +190,25 @@ static TypeId internASTType(InternState& state, const AST::Type& type, const Res
 static TypeId internBaseType(InternState& state, const AST::BaseType& base, const ResolvedModule& resolved);
 
 // ---------------------------------------------------------------------------
+// Intern an interface used as a type (dynamic-dispatch object). Cached per decl.
+// ---------------------------------------------------------------------------
+
+static TypeId internInterfaceType(InternState& state, const AST::InterfaceDefinition& ifaceDef)
+{
+    auto it = state.result.interfaceIds.find(&ifaceDef);
+    if (it != state.result.interfaceIds.end())
+        return it->second;
+
+    TypeInfo info;
+    info.kind = TypeInfo::Kind::Interface;
+    info.data = TypeInfo::InterfaceData{ state.getStringView(ifaceDef.name), &ifaceDef };
+
+    TypeId id = state.internUnique(std::move(info));
+    state.result.interfaceIds[&ifaceDef] = id;
+    return id;
+}
+
+// ---------------------------------------------------------------------------
 // Intern a named type from a TypeDefinition (may recurse for chains).
 // ---------------------------------------------------------------------------
 
@@ -213,6 +234,23 @@ static TypeId internNamedType(InternState& state, const AST::TypeDefinition& typ
     state.result.table[placeholderId] = std::move(info);
 
     state.result.namedTypeIds[&typeDef.name] = placeholderId;
+
+    // Record which user-defined interfaces this type implements ('type T : I1, I2').
+    typeDef.interfaces.forEach([&](const Required<const Token*>& markerReq)
+    {
+        auto riIt = resolved.resolvedInterfaces.find(markerReq.value());
+        if (riIt == resolved.resolvedInterfaces.end())
+            return;
+        if (auto* declPtr = std::get_if<const ResolvedDeclaration*>(&riIt->second))
+        {
+            if (auto* ifReq = std::get_if<Required<AST::InterfaceDefinition>>(&(*declPtr)->definition))
+            {
+                TypeId ifId = internInterfaceType(state, ifReq->value());
+                state.result.implementedInterfaces[placeholderId].push_back(ifId);
+            }
+        }
+    });
+
     return placeholderId;
 }
 
@@ -254,11 +292,11 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
             }
 
             const ResolvedDeclaration* decl = resolvedIt->second[0];
-            if (!std::holds_alternative<Required<AST::TypeDefinition>>(decl->definition))
-                return INVALID_TYPE_ID;
-
-            const auto& typeDef = std::get<Required<AST::TypeDefinition>>(decl->definition).value();
-            return internNamedType(state, typeDef, resolved);
+            if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
+                return internNamedType(state, td->value(), resolved);
+            if (auto* ifd = std::get_if<Required<AST::InterfaceDefinition>>(&decl->definition))
+                return internInterfaceType(state, ifd->value());  // interface used as a type
+            return INVALID_TYPE_ID;
         },
 
         [&](const Required<AST::StructType>& structType) -> TypeId
@@ -327,6 +365,13 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
             info.data = std::move(data);
             return state.internStructural(std::move(info));
         },
+
+        [&](const Required<AST::ComptimeExpression>&) -> TypeId
+        {
+            // Front-end only (§6): comptime type expressions are parsed but not
+            // evaluated, so they cannot yet be interned to a concrete TypeId.
+            return INVALID_TYPE_ID;
+        },
     }, base);
 }
 
@@ -384,6 +429,8 @@ static TypeId internASTType(InternState& state, const AST::Type& type, const Res
 static void internFunction(InternState& state, const AST::Function& fn, const ResolvedModule& resolved);
 static void internStatement(InternState& state, const AST::Statement& stmt, const ResolvedModule& resolved);
 static void internExpression(InternState& state, const AST::Expression& expr, const ResolvedModule& resolved);
+static void internMacroCall(InternState& state, const AST::MacroCallExpression& call, const ResolvedModule& resolved);
+static void internComptime(InternState& state, const AST::ComptimeExpression& comptime, const ResolvedModule& resolved);
 
 static void internFunction(InternState& state, const AST::Function& fn, const ResolvedModule& resolved)
 {
@@ -500,10 +547,22 @@ static void internExpression(InternState& state, const AST::Expression& expr, co
             internExpression(state, match.value().subject.value(), resolved);
             match.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
             {
+                if (arm.value().pattern.hasValue())
+                    internExpression(state, arm.value().pattern.value(), resolved);
                 internStatement(state, arm.value().body.value(), resolved);
             });
-            if (match.value().elseArm.hasValue())
-                internStatement(state, match.value().elseArm.value(), resolved);
+            if (match.value().externalElse.hasValue())
+                internStatement(state, match.value().externalElse.value(), resolved);
+        },
+
+        [&](const Required<AST::MacroCallExpression>& call)
+        {
+            internMacroCall(state, call.value(), resolved);
+        },
+
+        [&](const Required<AST::ComptimeExpression>& comptime)
+        {
+            internComptime(state, comptime.value(), resolved);
         },
     }, expr);
 }
@@ -570,6 +629,30 @@ static void internStatement(InternState& state, const AST::Statement& stmt, cons
             internExpression(state, AST::Expression(matchExpr), resolved);
         },
     }, stmt);
+}
+
+static void internMacroCall(InternState& state, const AST::MacroCallExpression& call, const ResolvedModule& resolved)
+{
+    call.typeArguments.forEach([&](const Required<AST::Type>& ta)
+    {
+        internASTType(state, ta.value(), resolved);
+    });
+    call.arguments.forEach([&](const Required<AST::Expression>& arg)
+    {
+        internExpression(state, arg.value(), resolved);
+    });
+}
+
+static void internComptime(InternState& state, const AST::ComptimeExpression& comptime, const ResolvedModule& resolved)
+{
+    std::visit(Overloaded
+    {
+        [&](const Required<AST::IfExpression>& e)        { internExpression(state, AST::Expression(e), resolved); },
+        [&](const Required<AST::WhileExpression>& e)     { internExpression(state, AST::Expression(e), resolved); },
+        [&](const Required<AST::MatchExpression>& e)     { internExpression(state, AST::Expression(e), resolved); },
+        [&](const Required<AST::StatementBlock>& e)      { internStatement(state, AST::Statement(e), resolved); },
+        [&](const Required<AST::MacroCallExpression>& e) { internMacroCall(state, e.value(), resolved); },
+    }, comptime.construct);
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +735,35 @@ Result<InternedTypes> intern(
                 {
                     internASTType(state, param.value().type.value(), resolved);
                 });
+                if (externDef.value().returnType.hasValue())
+                    internASTType(state, externDef.value().returnType.value(), resolved);
+            },
+
+            [&](const Required<AST::InterfaceDefinition>& ifaceDef)
+            {
+                // Give every interface a TypeId (it may be used as a dispatch type).
+                internInterfaceType(state, ifaceDef.value());
+
+                // Intern interface-function signature types so the §5.2
+                // verification pass can compare them against extension functions.
+                ifaceDef.value().functions.forEach([&](const Required<AST::InterfaceFunction>& fn)
+                {
+                    fn.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+                    {
+                        internASTType(state, param.value().type.value(), resolved);
+                    });
+                    if (fn.value().returnType.hasValue())
+                        internASTType(state, fn.value().returnType.value(), resolved);
+                });
+            },
+
+            [&](const Required<AST::MacroDefinition>& macroDef)
+            {
+                macroDef.value().parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+                {
+                    internASTType(state, param.value().type.value(), resolved);
+                });
+                internStatement(state, AST::Statement(macroDef.value().body), resolved);
             },
         }, def.value().definition);
     });
