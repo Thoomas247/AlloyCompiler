@@ -15,6 +15,8 @@ struct ScopedVarMap
 	ScopedVarMap* parent = nullptr;
 	std::unordered_map<const AST::VariableDefinitionStatement*, TypeId> locals;
 	std::unordered_map<const AST::FunctionParameter*, TypeId> params;
+	std::unordered_map<const AST::Capture*, TypeId> captures;          // B1
+	std::unordered_map<const AST::VariableDefinitionStatement*, bool> mutability; // D3
 
 	TypeId lookupVar(const AST::VariableDefinitionStatement* var) const
 	{
@@ -29,6 +31,20 @@ struct ScopedVarMap
 		if (it != params.end()) return it->second;
 		return parent ? parent->lookupParam(param) : INVALID_TYPE_ID;
 	}
+
+	TypeId lookupCapture(const AST::Capture* cap) const  // B1
+	{
+		auto it = captures.find(cap);
+		if (it != captures.end()) return it->second;
+		return parent ? parent->lookupCapture(cap) : INVALID_TYPE_ID;
+	}
+
+	bool lookupMutability(const AST::VariableDefinitionStatement* var) const  // D3
+	{
+		auto it = mutability.find(var);
+		if (it != mutability.end()) return it->second;
+		return parent ? parent->lookupMutability(var) : true;  // default: mutable (safe fallback)
+	}
 };
 
 struct CheckState
@@ -42,6 +58,9 @@ struct CheckState
 	// active type parameter bindings for the current generic call instantiation
 	// maps TypeParam TypeId to concrete TypeId
 	std::unordered_map<TypeId, TypeId> typeParamBindings;
+
+	// D2: expected return type of the current function being checked (INVALID = void/unknown)
+	TypeId currentReturnType = INVALID_TYPE_ID;
 
 	explicit CheckState(const Source& source,
 		const ResolvedModule& resolved,
@@ -81,7 +100,7 @@ struct CheckState
 // Pass INVALID_TYPE_ID when no context is known.
 static TypeId checkExpression(CheckState& state, const AST::Expression& expr, ScopedVarMap* scope, TypeId contextType = INVALID_TYPE_ID);
 static void checkStatement(CheckState& state, const AST::Statement& stmt, ScopedVarMap* scope);
-static void checkFunction(CheckState& state, const AST::Function& fn, const std::unordered_map<TypeId, TypeId>& typeParamBindings, ScopedVarMap* parentScope);
+static void checkFunction(CheckState& state, const AST::Function& fn, const std::unordered_map<TypeId, TypeId>& typeParamBindings, ScopedVarMap* parentScope, TypeId expectedReturnType = INVALID_TYPE_ID);
 
 static TypeId declStorageType(const ResolvedDeclaration& decl, const InternedTypes& interned)
 {
@@ -133,18 +152,22 @@ static TypeId resolveUntypedLiteral(TypeId id)
 // Walk Named chain on `to` to reach its underlying primitive (for untyped coercion).
 static bool untypedIntAssignableTo(TypeId to, const InternedTypes& interned)
 {
+	// A1: guard against sentinel TypeIds that are not in the table
+	if (to == INVALID_TYPE_ID || to == TYPE_UNTYPED_INT || to == TYPE_UNTYPED_FLOAT) return false;
 	TypeId cur = to;
 	while (cur != INVALID_TYPE_ID)
 	{
 		const TypeInfo& info = interned.get(cur);
 		if (info.kind == TypeInfo::Kind::Named) { cur = info.asNamed().underlying; continue; }
-		return info.kind == TypeInfo::Kind::Primitive && !info.asPrimitive().isFloat;
+		return info.kind == TypeInfo::Kind::Primitive;  // any primitive (int or float) from integer literal
 	}
 	return false;
 }
 
 static bool untypedFloatAssignableTo(TypeId to, const InternedTypes& interned)
 {
+	// A1: guard against sentinel TypeIds that are not in the table
+	if (to == INVALID_TYPE_ID || to == TYPE_UNTYPED_INT || to == TYPE_UNTYPED_FLOAT) return false;
 	TypeId cur = to;
 	while (cur != INVALID_TYPE_ID)
 	{
@@ -367,7 +390,8 @@ static TypeId tryGenericOverload(const ResolvedDeclaration& decl, const std::vec
 		return INVALID_TYPE_ID;
 	}
 
-	std::unordered_map<TypeId, TypeId> bindings;
+	// D1: start with any pre-seeded bindings (explicit type args) passed in via outBindings
+	std::unordered_map<TypeId, TypeId> bindings = outBindings;
 	for (size_t i = 0; i < paramTypes.size(); ++i)
 	{
 		// Normalize untyped literals to concrete defaults before generic unification
@@ -467,10 +491,40 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 						TypeId inferred = scope->lookupVar(&varDef->value());
 						if (inferred != INVALID_TYPE_ID)
 						{
-							 resultType = inferred;
-							 return;
+							resultType = inferred;
+							return;
 						}
 					}
+				}
+
+				// B2: capture variable — type populated by for/if/match/lambda handlers
+				if (auto* cap = std::get_if<Required<AST::Capture>>(&decl->definition))
+				{
+					if (scope) resultType = scope->lookupCapture(&cap->value());
+					return;
+				}
+
+				// C4: function reference (identifier used as a value, not a call)
+				if (auto* fnDef = std::get_if<Required<AST::FunctionDefinition>>(&decl->definition))
+				{
+					const AST::Function& fn = fnDef->value().function.value();
+					TypeInfo::FunctionData data;
+					fn.parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+					{
+						auto it = state.interned.astTypes.find(&param.value().type.value());
+						data.params.push_back(it != state.interned.astTypes.end() ? it->second : INVALID_TYPE_ID);
+					});
+					if (fn.returnType.hasValue())
+					{
+						auto it = state.interned.astTypes.find(&fn.returnType.value());
+						if (it != state.interned.astTypes.end())
+							data.ret = it->second;
+					}
+					TypeInfo fnInfo;
+					fnInfo.kind = TypeInfo::Kind::Function;
+					fnInfo.data = std::move(data);
+					resultType = state.internType(std::move(fnInfo));
+					return;
 				}
 			},
 
@@ -709,10 +763,42 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			// --- Generic fallback ---
 			if (!selected)
 			{
+				// D1: if explicit type arguments are present, pre-bind type params before inference
+				std::unordered_map<TypeId, TypeId> explicitBindings;
+				if (call.value().typeArguments.hasValue())
+				{
+					// We need a candidate to match against — try all generics, pre-binding explicit args
+					// The explicit args are matched positionally against the first generic candidate's TypeParams.
+					// (All candidates in the generic set have the same type-param positions by convention.)
+					for (const auto* decl : generic)
+					{
+						const auto* tpList = getDeclTypeParams(*decl);
+						if (!tpList) continue;
+						size_t argIdx = 0;
+						call.value().typeArguments.value().forEach([&](const Required<AST::Type>& ta)
+						{
+							auto taIt = state.interned.astTypes.find(&ta.value());
+							if (taIt == state.interned.astTypes.end()) { ++argIdx; return; }
+							TypeId taId = taIt->second;
+							// Walk to the argIdx-th TypeParameter
+							size_t idx = 0;
+							tpList->forEach([&](const Required<AST::TypeParameter>& tp)
+							{
+								if (idx++ != argIdx) return;
+								auto tpIt = state.interned.typeParamIds.find(&tp.value().name);
+								if (tpIt != state.interned.typeParamIds.end())
+									explicitBindings[tpIt->second] = taId;
+							});
+							++argIdx;
+						});
+						break;  // one candidate suffices for positional binding
+					}
+				}
+
 				std::vector<std::pair<const ResolvedDeclaration*, std::unordered_map<TypeId, TypeId>>> genericMatches;
 				for (const auto* decl : generic)
 				{
-					std::unordered_map<TypeId, TypeId> bindings;
+					std::unordered_map<TypeId, TypeId> bindings = explicitBindings;  // seed with explicit args
 					TypeId retId = tryGenericOverload(*decl, argTypes, bindings, state.interned);
 					if (retId != INVALID_TYPE_ID)
 						genericMatches.push_back({ decl, std::move(bindings) });
@@ -846,11 +932,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 		// --- Struct initializer ---
 		[&](const Required<AST::StructInitializerExpression>& init)
 		{
-			init.value().initializers.forEach([&](const Required<AST::StructInitializerExpression::MemberInitializer>& mi)
-			{
-				checkExpression(state, mi.value().value.value(), scope);
-			});
-
+			// C2: if named type known, extract member types for contextual typing
+			TypeId namedTypeId = INVALID_TYPE_ID;
+			const TypeInfo::StructData* structData = nullptr;
 			if (init.value().type.hasValue())
 			{
 				const auto& nameIdent = init.value().type.value().name.value();
@@ -861,27 +945,129 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					{
 						auto namedIt = state.interned.namedTypeIds.find(&td->value().name);
 						if (namedIt != state.interned.namedTypeIds.end())
-							resultType = namedIt->second;
+						{
+							namedTypeId = namedIt->second;
+							// Unwrap Named → Struct to get member types
+							TypeId cur = namedTypeId;
+							while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size()))
+							{
+								const TypeInfo& info = state.interned.get(cur);
+								if (info.kind == TypeInfo::Kind::Named) { cur = info.asNamed().underlying; continue; }
+								if (info.kind == TypeInfo::Kind::Struct) structData = &info.asStruct();
+								break;
+							}
+						}
 					}
 				}
 			}
-			// Anonymous struct: leave resultType as INVALID for now (no annotation to match against).
+
+			// Check each member initializer, using its declared member type as context (C2)
+			// and collect inferred types for anonymous struct (C1)
+			TypeInfo::StructData inferredStruct;
+			init.value().initializers.forEach([&](const Required<AST::StructInitializerExpression::MemberInitializer>& mi)
+			{
+				auto memberName = state.getStringView(mi.value().name);
+
+				TypeId memberCtx = INVALID_TYPE_ID;
+				if (structData)
+				{
+					for (const auto& m : structData->members)
+						if (m.name == memberName) { memberCtx = m.type; break; }
+				}
+
+				TypeId memberType = checkExpression(state, mi.value().value.value(), scope, memberCtx);
+
+				// Resolve untyped literals if context provided
+				if ((memberType == TYPE_UNTYPED_INT || memberType == TYPE_UNTYPED_FLOAT) && memberCtx != INVALID_TYPE_ID)
+					memberType = memberCtx;
+				else if (memberType == TYPE_UNTYPED_INT)   memberType = TYPE_I32;
+				else if (memberType == TYPE_UNTYPED_FLOAT) memberType = TYPE_F32;
+
+				inferredStruct.members.push_back({ memberName, memberType });
+			});
+
+			if (namedTypeId != INVALID_TYPE_ID)
+			{
+				resultType = namedTypeId;  // named struct initializer → Named TypeId
+			}
+			else
+			{
+				// C1: anonymous struct — intern a Struct TypeId from inferred member types
+				TypeInfo structInfo;
+				structInfo.kind = TypeInfo::Kind::Struct;
+				structInfo.data = std::move(inferredStruct);
+				resultType = state.internType(std::move(structInfo));
+			}
 		},
 
 		// --- Lambda ---
 		[&](const Required<AST::LambdaExpression>& lambda)
 		{
-			checkFunction(state, lambda.value().function.value(), {}, scope);
-			resultType = INVALID_TYPE_ID;  // lambda types inferred in future pass
+			// B6: resolve capture types from the outer scope via resolved.tokenNames
+			// We pass a pre-built captures map into checkFunction via a wrapper scope.
+			ScopedVarMap lambdaCaptureScope{ scope };
+			if (lambda.value().captures.hasValue())
+			{
+				lambda.value().captures.value().forEach([&](const Required<AST::Capture>& cap)
+				{
+					// tokenNames maps the capture's variable token → declaration in outer scope
+					auto it = state.resolved.tokenNames.find(&cap.value().variableName);
+					if (it == state.resolved.tokenNames.end()) return;
+					const ResolvedDeclaration* outerDecl = it->second;
+
+					TypeId capturedType = INVALID_TYPE_ID;
+					TypeId storageId = declStorageType(*outerDecl, state.interned);
+					if (storageId != INVALID_TYPE_ID)
+						capturedType = stripIndirection(storageId, state.interned);
+					else if (auto* vd = std::get_if<Required<AST::VariableDefinitionStatement>>(&outerDecl->definition))
+						capturedType = scope ? scope->lookupVar(&vd->value()) : INVALID_TYPE_ID;
+
+					lambdaCaptureScope.captures[&cap.value()] = capturedType;
+				});
+			}
+
+			checkFunction(state, lambda.value().function.value(), {}, &lambdaCaptureScope);
+
+			// C3: intern a Function TypeId for the lambda
+			const AST::Function& fn = lambda.value().function.value();
+			TypeInfo::FunctionData data;
+			fn.parameters.forEach([&](const Required<AST::FunctionParameter>& param)
+			{
+				auto it = state.interned.astTypes.find(&param.value().type.value());
+				data.params.push_back(it != state.interned.astTypes.end() ? it->second : INVALID_TYPE_ID);
+			});
+			if (fn.returnType.hasValue())
+			{
+				auto it = state.interned.astTypes.find(&fn.returnType.value());
+				if (it != state.interned.astTypes.end())
+					data.ret = it->second;
+			}
+			TypeInfo fnInfo;
+			fnInfo.kind = TypeInfo::Kind::Function;
+			fnInfo.data = std::move(data);
+			resultType = state.internType(std::move(fnInfo));
 		},
 
 		// --- If expression ---
 		[&](const Required<AST::IfExpression>& ifExpr)
 		{
-			checkExpression(state, ifExpr.value().condition.value(), scope);
-			checkStatement(state, ifExpr.value().thenBranch.value(), scope);
-			if (ifExpr.value().elseBranch.hasValue())
-				checkStatement(state, ifExpr.value().elseBranch.value(), scope);
+			TypeId condType = checkExpression(state, ifExpr.value().condition.value(), scope);
+
+			// B4: if a capture is present, bind it to the condition's value type
+			if (ifExpr.value().capture.hasValue())
+			{
+				ScopedVarMap ifScope{ scope };
+				ifScope.captures[&ifExpr.value().capture.value()] = condType;
+				checkStatement(state, ifExpr.value().thenBranch.value(), &ifScope);
+				if (ifExpr.value().elseBranch.hasValue())
+					checkStatement(state, ifExpr.value().elseBranch.value(), scope);
+			}
+			else
+			{
+				checkStatement(state, ifExpr.value().thenBranch.value(), scope);
+				if (ifExpr.value().elseBranch.hasValue())
+					checkStatement(state, ifExpr.value().elseBranch.value(), scope);
+			}
 		},
 
 		// --- While expression ---
@@ -896,23 +1082,90 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 		// --- For expression ---
 		[&](const Required<AST::ForExpression>& forExpr)
 		{
+			// B3: collect iterable element types in order
+			std::vector<TypeId> elemTypes;
 			forExpr.value().iterables.value().forEach([&](const Required<AST::Expression>& it)
 			{
-				checkExpression(state, it.value(), scope);
+				TypeId iterType = checkExpression(state, it.value(), scope);
+				TypeId elemT = INVALID_TYPE_ID;
+				if (iterType != INVALID_TYPE_ID && iterType < static_cast<TypeId>(state.interned.table.size()))
+				{
+					const TypeInfo& info = state.interned.get(iterType);
+					if (info.kind == TypeInfo::Kind::Array)      elemT = info.asArray().elem;
+					else if (info.kind == TypeInfo::Kind::Slice) elemT = info.asSlice().elem;
+				}
+				elemTypes.push_back(elemT);
 			});
-			checkStatement(state, forExpr.value().body.value(), scope);
+
+			// Build a child scope and populate captures paired with their element types
+			ScopedVarMap forScope{ scope };
+			size_t capIdx = 0;
+			if (forExpr.value().iterators.hasValue())
+			{
+				forExpr.value().iterators.value().forEach([&](const Required<AST::Capture>& cap)
+				{
+					TypeId elemT = capIdx < elemTypes.size() ? elemTypes[capIdx] : INVALID_TYPE_ID;
+					forScope.captures[&cap.value()] = elemT;
+					++capIdx;
+				});
+			}
+
+			checkStatement(state, forExpr.value().body.value(), &forScope);
 			if (forExpr.value().elseBody.hasValue())
-				checkStatement(state, forExpr.value().elseBody.value(), scope);
+				checkStatement(state, forExpr.value().elseBody.value(), &forScope);
 		},
 
 		// --- Match expression ---
 		[&](const Required<AST::MatchExpression>& match)
 		{
-			checkExpression(state, match.value().subject.value(), scope);
+			TypeId subjectType = checkExpression(state, match.value().subject.value(), scope);
+
+			// B5: resolve the enum type to get variant payload types
+			TypeId enumTypeId = INVALID_TYPE_ID;
+			if (subjectType != INVALID_TYPE_ID && subjectType < static_cast<TypeId>(state.interned.table.size()))
+			{
+				TypeId cur = subjectType;
+				while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size()))
+				{
+					const TypeInfo& info = state.interned.get(cur);
+					if (info.kind == TypeInfo::Kind::Named) { cur = info.asNamed().underlying; continue; }
+					if (info.kind == TypeInfo::Kind::Enum)  { enumTypeId = cur; }
+					break;
+				}
+			}
+
 			match.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
 			{
-				checkStatement(state, arm.value().body.value(), scope);
+				if (arm.value().capture.hasValue() && enumTypeId != INVALID_TYPE_ID)
+				{
+					// Find variant payload type — use last path segment (e.g. "Result::Ok" → "Ok")
+					std::string_view variantName;
+					const AST::ListNode<const Token*>* node = arm.value().variant.value().path.ptr();
+					while (node && node->next.hasValue())
+						node = node->next.ptr();
+					if (node) variantName = state.getStringView(*node->item.value());
+
+					TypeId captureType = INVALID_TYPE_ID;
+					const TypeInfo& enumInfo = state.interned.get(enumTypeId);
+					for (const auto& variant : enumInfo.asEnum().variants)
+					{
+						if (variant.name == variantName && variant.payloadType.has_value())
+						{
+							captureType = *variant.payloadType;
+							break;
+						}
+					}
+
+					ScopedVarMap armScope{ scope };
+					armScope.captures[&arm.value().capture.value()] = captureType;
+					checkStatement(state, arm.value().body.value(), &armScope);
+				}
+				else
+				{
+					checkStatement(state, arm.value().body.value(), scope);
+				}
 			});
+
 			if (match.value().elseArm.hasValue())
 				checkStatement(state, match.value().elseArm.value(), scope);
 		},
@@ -957,23 +1210,41 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 				}
 
 				if (scope)
+				{
 					scope->locals[&varDef.value()] = valueT;
+					scope->mutability[&varDef.value()] = varDef.value().isMutable;  // D3
+				}
 			},
 
 			[&](const Required<AST::AssignmentStatement>& assign)
 			{
 				TypeId targetType = checkExpression(state, assign.value().target.value(), scope);
-				TypeId valueT = checkExpression(state, assign.value().value.value(), scope);
+				TypeId valueT = checkExpression(state, assign.value().value.value(), scope, targetType);
 
-				// Mutability of the LHS is enforced only when the target expression's storage
-				// type is known to be immutable (&T, *T). For now we check value type compatibility.
+				// D3: flag assignment to immutable const binding
+				if (auto* identReq = std::get_if<Required<AST::IdentifierExpression>>(&assign.value().target.value()))
+				{
+					auto resolvedIt = state.resolved.names.find(&identReq->value());
+					if (resolvedIt != state.resolved.names.end() && !resolvedIt->second.empty())
+					{
+						if (auto* vd = std::get_if<Required<AST::VariableDefinitionStatement>>(&resolvedIt->second[0]->definition))
+						{
+							if (scope && !scope->lookupMutability(&vd->value()))
+							{
+								state.logger.logErrorInRange(vd->value().name, vd->value().name,
+									"Cannot assign to immutable binding '{}'.",
+									state.getStringView(vd->value().name));
+							}
+						}
+					}
+				}
+
+				// D4 + type check: for all assignment operators (= and compound),
+				// RHS value type must be assignable to LHS value type.
 				if (targetType != INVALID_TYPE_ID && valueT != INVALID_TYPE_ID)
 				{
 					if (!isAssignable(valueT, targetType, state.interned))
-					{
 						Log::error("Type mismatch in assignment.");
-						state.logger.logInfo("Type mismatch in assignment.");
-					}
 				}
 			},
 
@@ -999,8 +1270,20 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 
 			[&](const Required<AST::ReturnStatement>& ret)
 			{
+				// D2: check return value type against function's declared return type
 				if (ret.value().value.hasValue())
-					checkExpression(state, ret.value().value.value(), scope);
+				{
+					TypeId retCtx = state.currentReturnType != INVALID_TYPE_ID
+						? stripIndirection(state.currentReturnType, state.interned)
+						: INVALID_TYPE_ID;
+					TypeId retType = checkExpression(state, ret.value().value.value(), scope, retCtx);
+					if (state.currentReturnType != INVALID_TYPE_ID && retType != INVALID_TYPE_ID)
+					{
+						TypeId expectedVal = stripIndirection(state.currentReturnType, state.interned);
+						if (!isAssignable(retType, expectedVal, state.interned))
+							Log::error("Return type mismatch.");
+					}
+				}
 			},
 
 			[&](const Required<AST::IfExpression>& ifExpr)
@@ -1028,10 +1311,13 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 
 static void checkFunction(CheckState& state, const AST::Function& fn,
 	const std::unordered_map<TypeId, TypeId>& typeParamBindings,
-	ScopedVarMap* parentScope)
+	ScopedVarMap* parentScope,
+	TypeId expectedReturnType)
 {
 	auto prevBindings = state.typeParamBindings;
+	auto prevReturnType = state.currentReturnType;
 	state.typeParamBindings = typeParamBindings;
+	state.currentReturnType = expectedReturnType;
 
 	ScopedVarMap fnScope{ parentScope };
 	fn.parameters.forEach([&](const Required<AST::FunctionParameter>& param)
@@ -1048,6 +1334,7 @@ static void checkFunction(CheckState& state, const AST::Function& fn,
 	checkStatement(state, AST::Statement(fn.body), &fnScope);
 
 	state.typeParamBindings = prevBindings;
+	state.currentReturnType = prevReturnType;
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,6 +1348,10 @@ Result<TypedModule> typeCheck(
 	InternedTypes& interned,
 	const SymbolTable& moduleSymbols)
 {
+	// A2: reserve headroom so internType() pushes don't reallocate the vector
+	// and invalidate any live const TypeInfo& references held during expression checking.
+	interned.table.reserve(interned.table.size() + 4096);
+
 	CheckState state(source, resolved, interned, moduleSymbols);
 
 	module.definitions.forEach([&](const Required<AST::Definition>& def)
@@ -1071,7 +1362,15 @@ Result<TypedModule> typeCheck(
 					[&](const Required<AST::FunctionDefinition>& fnDef)
 					{
 					// Parametric: check body with unbound type params (identity bindings).
-					checkFunction(state, fnDef.value().function.value(), {}, nullptr);
+					const AST::Function& fn = fnDef.value().function.value();
+					TypeId retTypeId = INVALID_TYPE_ID;
+					if (fn.returnType.hasValue())
+					{
+						auto it = state.interned.astTypes.find(&fn.returnType.value());
+						if (it != state.interned.astTypes.end())
+							retTypeId = it->second;
+					}
+					checkFunction(state, fn, {}, nullptr, retTypeId);
 				},
 				[&](const Required<AST::ExternDefinition>&) {},
 				}, def.value().definition);
