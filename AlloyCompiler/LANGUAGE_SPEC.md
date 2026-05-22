@@ -169,7 +169,7 @@ statement       = var_def
 
 var_def         = ( "var" | "const" ) ident [ ":" type ] "=" expression [ ";" ] ;
 stmt_block      = "{" { statement } "}" ;
-break_stmt      = "break" [ expression ] ";" ;
+break_stmt      = "break" [ expression ] ( ";" | <block-like operand> ) ;
 return_stmt     = "return" [ expression ] ";" ;
 expr_stmt       = expression ( assign_op expression ";" | ";" ) ;
 
@@ -228,10 +228,18 @@ match_expr  = "match" "(" expression ")" "{"
               { ( expression | "else" ) [ "|" capture "|" ] statement }
               "}" [ "else" statement ] ;
 
-comptime_expr   = "#" ( if_expr | while_expr | match_expr | stmt_block | macro_call ) ;
-macro_call      = ident [ "<" type { "," type } ">" ] "(" [ expression { "," expression } ] ")" ;
+comptime_expr   = "#" postfix_expr ;
 
 ```
+
+**Comptime prefix.** The `#` token marks any value-yielding expression for
+compile-time evaluation (§6). It binds as a postfix expression: `#f(x)` is
+`#(f(x))`, but `#a + b` is `(#a) + b` — parenthesise to mark a whole expression
+(`#(a + b)`).
+
+**`break` operand termination.** When a `break`'s operand is a block-like
+expression (`if` / `while` / `for` / `match`), that operand is self-terminating
+and the trailing `;` is omitted: `break if (c) break a; else break b;`.
 
 ### 2.2 Operator Precedence & Associativity
 
@@ -304,11 +312,37 @@ An **interface used as a type** (only behind an indirection — `&I`, `&var I`, 
 
 ### 3.4 Compile-Time Special Types (`#Type`)
 
-The `#Type` keyword identifies a dedicated system representation primitive available **exclusively during compile-time evaluation**.
+`#Type` is a dedicated system representation primitive available **exclusively during compile-time evaluation**. A `#Type` value is a first-class, mutable description of a type — a struct or enum layout, a primitive, or an interface — that compile-time code may inspect and reconstruct.
 
 * `#Type` maps directly to abstract structures, built-in primitives, or structural layouts.
-* It exposes programmable compile-time methods enabling standard reflection and modification properties (e.g., adding/extracting members, modifying properties).
-* Any attempt to retain or use `#Type` inside standard runtime declarations or variable states triggers an immediate compile-time error.
+* It exposes programmable compile-time methods enabling reflection and mutation (see below).
+* Any attempt to retain or use `#Type` inside a standard runtime declaration or variable state triggers an immediate compile-time error.
+
+#### Obtaining a `#Type`
+
+* **`#T`** — prefixing a type name with the comptime token `#` yields the `#Type` reflecting `T` (e.g. `#u32`, `#Packet`). `#T.member_names()` reflects on `T` directly.
+* **`#type_of(expr)`** — a built-in macro returning the `#Type` of the value `expr`'s type.
+* **`#struct_type()` / `#enum_type()`** — built-in macros returning a fresh, empty struct / enum `#Type`, for synthesising a type from scratch.
+
+#### `#Type` methods
+
+All are evaluated at compile time and called with dot syntax on a `#Type` value.
+
+| Method | Signature | Semantics |
+| --- | --- | --- |
+| `is_struct` | `() -> bool` | True iff the type is a struct. |
+| `is_enum` | `() -> bool` | True iff the type is an enum. |
+| `is_primitive` | `() -> bool` | True iff the type is a built-in primitive. |
+| `is_interface` | `() -> bool` | True iff the type is an interface. |
+| `implements_interface` | `(other: #Type) -> bool` | True iff this type declares `other` (an interface) among its interface markers. |
+| `name` | `() -> &[u8]` | The type's declared name. |
+| `equals` | `(other: #Type) -> bool` | True iff the two `#Type`s denote the same type. |
+| `add_member` | `(name: &[u8], type: #Type)` | Appends a member (struct field or enum variant) of the given name and type. |
+| `remove_member` | `(name: &[u8])` | Removes the member with the given name. |
+| `member_names` | `() -> &[&[u8]]` | Member names, in declaration order. |
+| `member_types` | `() -> &[#Type]` | Member types, parallel to `member_names()`. |
+
+A `#Type` is a **value**: `add_member` / `remove_member` mutate the `#Type` value in hand, not the original type it was reflected from. The final `#Type` value, assigned through `type T = <#Type-valued comptime expression>`, becomes the synthesised type `T`.
 
 ---
 
@@ -354,7 +388,16 @@ var arr: *[u32] = new [0; 120]; // Allocates 120 elements of u32 initialized to 
 Immediately exits the enclosing function, yielding `value` as its result.
 
 **`break [value]`**
-Exits the innermost loop or match block. When a value is provided, the loop or match expression evaluates directly to that value.
+Exits the **innermost** value-yielding construct — a `for` loop, a `while` loop, a `match`, or an `if`. When a value is provided, that construct evaluates directly to the value.
+
+#### `if` as a Value-Yielding Construct
+
+An `if` is itself a value-yielding construct: a `break value;` in either branch makes the `if` evaluate to that value, consistent with `for` / `while` / `match`. Because `break` always targets the *innermost* such construct, a `break` placed inside an `if` body yields from that `if` and can never exit an enclosing loop directly. To break an enclosing loop from conditional logic, the condition is written as the loop-break's operand:
+
+```alloy
+// breaks the 'while', yielding 'a' or 'b'
+break if (cond) break a; else break b;
+```
 
 #### Loop Semantics (`for` and `while`)
 
@@ -507,14 +550,16 @@ extern variadicFunc(...) -> *var u8;
 
 ### 6.1 The Comptime Modifier (`#`)
 
-Any value-yielding construct prefixed by the token `#` (e.g., `#if`, `#while` or `#match`) is intercepted by the compiler and executed at compile time via an internal interpreter.
+Any **value-yielding expression** prefixed by the token `#` — an `#if`, `#while`, `#match`, an arbitrary function call (`#compute(x)`), an identifier, or a parenthesised expression — is intercepted by the compiler and executed at compile time via an internal interpreter. A `#`-marked construct must produce a value; a bare statement block (`{ … }`) is not a value and cannot be marked.
 
 #### Value-Substitution Model
 
-Comptime blocks operate on a pure value-substitution model. Once a compile-time block completes execution, its entire syntax node tree is completely stripped from the final runtime code layout and replaced with its final calculated literal value, struct initialization block, or nominal type signature.
+Comptime expressions operate on a pure value-substitution model. Once a compile-time expression completes execution, its entire syntax node tree is stripped from the final runtime code layout and replaced with its final calculated literal value, struct initialization block, or nominal type signature.
+
+A value-yielding construct yields its value via `break` (§4.3), so an `#if` selecting between two values is written:
 
 ```alloy
-var a = #if (#isDevelopment()) 50 else 100; 
+const a = #if (cond) break 50; else break 100;
 
 ```
 
@@ -546,11 +591,21 @@ macro readTypeFromJson(path: &[u8]) {
 * **Type Synthesis Examples:**
 ```alloy
 type T = #readTypeFromJson("types/T.json");
-type P = #if (#isDevelopment()) struct { id: u32; } else #readTypeFromJson("types/P.json");
+type P = #if (DEVELOPMENT) break struct { id: u32; }; else break #readTypeFromJson("types/P.json");
 
 ```
 
+### 6.4 Built-in Macros
 
+The compiler provides a small set of built-in macros. Like all macros they are invoked with a leading `#`.
+
+| Macro | Signature | Semantics |
+| --- | --- | --- |
+| `type_of` | `(value) -> #Type` | The `#Type` of the argument expression's type (§3.4). |
+| `struct_type` | `() -> #Type` | A fresh, empty struct `#Type`, for synthesising a type. |
+| `enum_type` | `() -> #Type` | A fresh, empty enum `#Type`. |
+
+A type may also be reflected directly by prefixing its name with `#` (`#u32`, `#Packet`) — see §3.4.
 
 ---
 

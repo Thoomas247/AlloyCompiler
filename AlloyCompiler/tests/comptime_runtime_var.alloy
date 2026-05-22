@@ -1,0 +1,8 @@
+// §6.1 — a comptime expression cannot read a runtime 'var'. Negative test.
+
+fn run() -> u32 {
+	var counter = 5;
+	//@expect-error not a compile-time constant
+	const a = #(counter + 1);
+	return a;
+}

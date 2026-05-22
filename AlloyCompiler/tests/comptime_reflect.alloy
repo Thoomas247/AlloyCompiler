@@ -1,0 +1,19 @@
+// §3.4 — reflect declared struct and enum types with '#Type' methods.
+// Positive test.
+
+type Packet = struct {
+	id: u32;
+	size: u32;
+};
+
+type Code = enum {
+	Ok;
+	Fail;
+};
+
+fn run() -> u32 {
+	const fieldCount = #Packet.member_names().length();
+	const packetIsStruct = #Packet.is_struct();
+	const codeIsEnum = #Code.is_enum();
+	return fieldCount;
+}

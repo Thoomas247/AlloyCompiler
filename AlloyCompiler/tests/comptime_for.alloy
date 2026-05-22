@@ -1,0 +1,15 @@
+// §6.1 — a compile-time 'for' iterates an array value, accumulating into a
+// local. Positive test.
+
+fn sum() -> u32 {
+	var total = 0;
+	for ([ 1, 2, 3, 4 ]) |x| {
+		total += x;
+	}
+	return total;
+}
+
+fn run() -> u32 {
+	const s = #sum();
+	return s;
+}

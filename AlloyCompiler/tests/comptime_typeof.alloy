@@ -1,0 +1,22 @@
+// §3.4/§6.4 — #type_of reflects a value's type; #Type equality and interface
+// queries. Positive test.
+
+interface Drawable {
+	fn draw() -> u32;
+}
+
+type Sprite : Drawable = struct {
+	w: u32;
+};
+
+fn draw(self s: &Sprite) -> u32 {
+	return s.w;
+}
+
+fn run() -> u32 {
+	var n: u32 = 7;
+	const nIsPrimitive = #type_of(n).is_primitive();
+	const spriteImpls = #Sprite.implements_interface(#Drawable);
+	const sameType = #u32.equals(#u32);
+	return 0;
+}

@@ -1,0 +1,10 @@
+// §4.3 — 'break' targets the innermost loop / match / if. An 'if' is itself a
+// value-yielding construct, so to break an outer loop from conditional logic the
+// `break if (...) ...` form is used. Positive test.
+
+fn run() -> i32 {
+	const r = while (true) {
+		break if (true) break 7; else break 9;
+	};
+	return r;
+}

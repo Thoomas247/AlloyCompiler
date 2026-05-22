@@ -110,7 +110,6 @@ struct CheckState
 static TypeId checkExpression(CheckState& state, const AST::Expression& expr, ScopedVarMap* scope, TypeId contextType = INVALID_TYPE_ID);
 static void checkStatement(CheckState& state, const AST::Statement& stmt, ScopedVarMap* scope);
 static void checkFunction(CheckState& state, const AST::Function& fn, const std::unordered_map<TypeId, TypeId>& typeParamBindings, ScopedVarMap* parentScope, TypeId expectedReturnType = INVALID_TYPE_ID);
-static void checkComptime(CheckState& state, const AST::ComptimeExpression& comptime, ScopedVarMap* scope);
 
 // --- Char literal byte-width computation (§1.6) ---------------------------
 
@@ -281,6 +280,19 @@ static bool isAssignable(TypeId from, TypeId to, const InternedTypes& interned)
 	// Untyped literals coerce to any matching primitive class (incl. through Named chain).
 	if (from == TYPE_UNTYPED_INT)   return untypedIntAssignableTo(to, interned);
 	if (from == TYPE_UNTYPED_FLOAT) return untypedFloatAssignableTo(to, interned);
+
+	// An untyped literal as the *target* — its type is not yet pinned (e.g. a
+	// binding inferred from an untyped literal, `var total = 0;`). It accepts any
+	// untyped or primitive value. Handled before the get() calls below because
+	// the untyped sentinels are not entries in the interned-type table.
+	if (to == TYPE_UNTYPED_INT || to == TYPE_UNTYPED_FLOAT)
+	{
+		if (from == TYPE_UNTYPED_INT || from == TYPE_UNTYPED_FLOAT)
+			return true;
+		if (from < static_cast<TypeId>(interned.table.size()))
+			return interned.get(from).kind == TypeInfo::Kind::Primitive;
+		return false;
+	}
 
 	const TypeInfo& fromInfo = interned.get(from);
 	const TypeInfo& toInfo = interned.get(to);
@@ -1662,6 +1674,13 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 		{
 			TypeId condType = checkExpression(state, ifExpr.value().condition.value(), scope);
 
+			// An 'if' is a value-yielding construct: a `break value;` in either
+			// branch makes the 'if' evaluate to that value. 'break' targets the
+			// innermost loop / match / if, so install a fresh collector here.
+			std::vector<TypeId> breaks;
+			std::vector<TypeId>* prevCollector = state.breakCollector;
+			state.breakCollector = &breaks;
+
 			// B4: if a capture is present, bind it to the condition's value type
 			if (ifExpr.value().capture.hasValue())
 			{
@@ -1677,6 +1696,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				if (ifExpr.value().elseBranch.hasValue())
 					checkStatement(state, ifExpr.value().elseBranch.value(), scope);
 			}
+
+			state.breakCollector = prevCollector;
+			resultType = unifyBreakTypes(breaks, state.interned);
 		},
 
 		// --- While expression ---
@@ -1859,21 +1881,47 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				Log::error("A 'match' expression with an external 'else' block must yield a value via 'break'.");
 		},
 
-		// --- Macro call (front-end only) ---
-		[&](const Required<AST::MacroCallExpression>& call)
-		{
-			call.value().arguments.forEach([&](const Required<AST::Expression>& arg)
-			{
-				checkExpression(state, arg.value(), scope);
-			});
-			// macro return-type inference is deferred (6) -> no value type
-		},
-
-		// --- Comptime expression (front-end only) ---
+		// --- Comptime expression ---
+		// A ComptimeExpression surviving to the checker was not replaced by the
+		// comptime-evaluation pass (evaluation failed, or it is a deferred macro
+		// call). Check the inner expression leniently; the pass already reported
+		// any evaluation error. It yields no value type.
 		[&](const Required<AST::ComptimeExpression>& comptime)
 		{
-			checkComptime(state, comptime.value(), scope);
-			// comptime evaluation is deferred (6) -> no value type
+			checkExpression(state, comptime.value().inner.value(), scope);
+		},
+
+		// --- Comptime result (§6.1) ---
+		// A compile-time value substituted in by the comptime-evaluation pass.
+		[&](const Required<AST::ComptimeResultExpression>& result)
+		{
+			using RK = AST::ComptimeResultExpression::ResultKind;
+			switch (result.value().kind)
+			{
+				case RK::Integer: resultType = TYPE_UNTYPED_INT;   break;
+				case RK::Float:   resultType = TYPE_UNTYPED_FLOAT; break;
+				case RK::Bool:    resultType = TYPE_BOOL;          break;
+				case RK::Char:
+				{
+					const uint32_t w = result.value().charWidth;
+					resultType = (w >= 1 && w <= 8) ? charLiteralType(w) : TYPE_U8;
+					break;
+				}
+				case RK::String:
+				{
+					// §1.6/§4.3 — a string value is typed &[u8].
+					TypeInfo sliceInfo;
+					sliceInfo.kind = TypeInfo::Kind::Slice;
+					sliceInfo.data = TypeInfo::SliceData{ TYPE_U8 };
+					TypeId sliceId = state.internType(std::move(sliceInfo));
+					TypeInfo refInfo;
+					refInfo.kind = TypeInfo::Kind::Reference;
+					refInfo.data = TypeInfo::IndirectionData{ sliceId };
+					resultType = state.internType(std::move(refInfo));
+					break;
+				}
+				case RK::Invalid: resultType = INVALID_TYPE_ID; break;
+			}
 		},
 
 		}, expr);
@@ -2139,28 +2187,6 @@ static void checkFunction(CheckState& state, const AST::Function& fn,
 
 	state.typeParamBindings = prevBindings;
 	state.currentReturnType = prevReturnType;
-}
-
-// ---------------------------------------------------------------------------
-// Comptime checking (front-end only)
-// ---------------------------------------------------------------------------
-
-static void checkComptime(CheckState& state, const AST::ComptimeExpression& comptime, ScopedVarMap* scope)
-{
-	std::visit(Overloaded
-		{
-			[&](const Required<AST::IfExpression>& e)    { checkExpression(state, AST::Expression(e), scope); },
-			[&](const Required<AST::WhileExpression>& e) { checkExpression(state, AST::Expression(e), scope); },
-			[&](const Required<AST::MatchExpression>& e) { checkExpression(state, AST::Expression(e), scope); },
-			[&](const Required<AST::StatementBlock>& e)  { checkStatement(state, AST::Statement(e), scope); },
-			[&](const Required<AST::MacroCallExpression>& e)
-			{
-				e.value().arguments.forEach([&](const Required<AST::Expression>& arg)
-					{
-						checkExpression(state, arg.value(), scope);
-					});
-			},
-		}, comptime.construct);
 }
 
 // ---------------------------------------------------------------------------

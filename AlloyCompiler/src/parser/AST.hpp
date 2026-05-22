@@ -72,8 +72,8 @@ namespace AST
 	struct LambdaExpression;
 	struct BinaryExpression;
 	struct UnaryExpression;
-	struct MacroCallExpression;
 	struct ComptimeExpression;
+	struct ComptimeResultExpression;
 
 	struct VariableDefinitionStatement;
 	struct AssignmentStatement;
@@ -98,8 +98,8 @@ namespace AST
 		Required<LambdaExpression>,
 		Required<BinaryExpression>,
 		Required<UnaryExpression>,
-		Required<MacroCallExpression>,
-		Required<ComptimeExpression>
+		Required<ComptimeExpression>,
+		Required<ComptimeResultExpression>
 	>;
 
 	using Statement = std::variant<
@@ -322,24 +322,27 @@ namespace AST
 		Required<Expression> right;
 	};
 
-	// macro_call = ident [ "<" type { "," type } ">" ] "(" [ expr { "," expr } ] ")"
-	struct MacroCallExpression
-	{
-		Required<IdentifierExpression> macro;
-		Optional<ListNode<Type>> typeArguments;
-		Optional<ListNode<Expression>> arguments;
-	};
-
-	// comptime_expr = "#" ( if_expr | while_expr | match_expr | stmt_block | macro_call )
+	// comptime_expr = "#" postfix_expr
+	// '#' marks any value-yielding expression for compile-time evaluation (§6.1).
+	// A macro call is just a '#'-prefixed call whose callee resolves to a macro.
 	struct ComptimeExpression
 	{
-		std::variant<
-			Required<IfExpression>,
-			Required<WhileExpression>,
-			Required<MatchExpression>,
-			Required<StatementBlock>,
-			Required<MacroCallExpression>
-		> construct;
+		Required<Expression> inner;
+		const Token& hash;   // the '#' token, for diagnostics
+	};
+
+	// The node a successfully-evaluated ComptimeExpression is rewritten to by the
+	// comptime-evaluation pass (§6.1 value-substitution). Carries the computed
+	// value plus enough information to type it.
+	struct ComptimeResultExpression
+	{
+		enum class ResultKind { Integer, Float, Bool, String, Char, Invalid };
+
+		ResultKind kind;
+		const Token& origin;   // the '#' token, for diagnostics
+		uint32_t charWidth;    // byte width 1..8 when kind == Char; else 0
+		int64_t intValue;      // Integer value, Char codepoint, or Bool (0|1)
+		double floatValue;     // Float value
 	};
 
 #pragma endregion

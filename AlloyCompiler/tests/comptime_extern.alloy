@@ -1,0 +1,9 @@
+// §6.2 — compile-time code may not call 'extern' functions. Negative test.
+
+extern clock() -> u32;
+
+fn run() -> u32 {
+	//@expect-error may not call 'extern'
+	const a = #clock();
+	return a;
+}

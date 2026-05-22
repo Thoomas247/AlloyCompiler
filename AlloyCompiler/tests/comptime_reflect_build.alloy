@@ -1,0 +1,16 @@
+// §3.4/§6.4 — synthesise a '#Type' with #struct_type, mutate it with
+// add_member / remove_member, reflect the result. Positive test.
+
+fn build() -> u32 {
+	var t = #struct_type();
+	t.add_member("a", #u32);
+	t.add_member("b", #u32);
+	t.add_member("c", #u32);
+	t.remove_member("b");
+	return t.member_names().length();
+}
+
+fn run() -> u32 {
+	const n = #build();
+	return n;
+}

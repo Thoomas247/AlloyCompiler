@@ -1,0 +1,11 @@
+// §6.1 — a comptime expression that yields a struct is substituted back into
+// the AST as a struct initializer. Positive test.
+
+fn makePair() -> struct { a: u32; b: u32; } {
+	return { .a = 1, .b = 2 };
+}
+
+fn run() -> u32 {
+	const p: struct { a: u32; b: u32; } = #makePair();
+	return p.a;
+}

@@ -1,0 +1,8 @@
+// §6.1 — a non-terminating compile-time loop is caught by the step budget.
+// Negative test.
+
+fn run() -> u32 {
+	//@expect-error step budget
+	const a = #while (true) { }
+	return 0;
+}

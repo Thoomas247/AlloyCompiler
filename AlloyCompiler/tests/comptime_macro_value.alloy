@@ -1,0 +1,11 @@
+// §6.3 — a user-defined macro evaluated at compile time as a value. Positive
+// test.
+
+macro double(n: u32) {
+	return n + n;
+}
+
+fn run() -> u32 {
+	const r = #double(21);
+	return r;
+}

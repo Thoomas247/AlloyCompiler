@@ -1,0 +1,10 @@
+// §3.4 — calling an unknown '#Type' reflection method is a compile-time error.
+// Negative test.
+
+type Packet = struct { id: u32; };
+
+fn run() -> u32 {
+	//@expect-error Unknown #Type method
+	const x = #Packet.bogus();
+	return 0;
+}

@@ -159,6 +159,9 @@ struct InternState
     // Set while interning a FunctionDefinition with type parameters.
     std::unordered_map<std::string_view, TypeId> typeParamScope;
 
+    // B3-5: types synthesised by type-position comptime expressions (§3.4).
+    const SynthTypeMap* synthTypes = nullptr;
+
     explicit InternState(const Source& source) : logger(source) {}
 
     std::string_view getStringView(const Token& tok) const
@@ -252,6 +255,65 @@ static TypeId internNamedType(InternState& state, const AST::TypeDefinition& typ
     });
 
     return placeholderId;
+}
+
+// ---------------------------------------------------------------------------
+// B3-5: intern a type synthesised by a type-position comptime expression.
+// ---------------------------------------------------------------------------
+
+static TypeId primitiveTypeId(std::string_view name)
+{
+    if (name == "u8")   return TYPE_U8;
+    if (name == "u16")  return TYPE_U16;
+    if (name == "u32")  return TYPE_U32;
+    if (name == "u64")  return TYPE_U64;
+    if (name == "i8")   return TYPE_I8;
+    if (name == "i16")  return TYPE_I16;
+    if (name == "i32")  return TYPE_I32;
+    if (name == "i64")  return TYPE_I64;
+    if (name == "f32")  return TYPE_F32;
+    if (name == "f64")  return TYPE_F64;
+    if (name == "bool") return TYPE_BOOL;
+    return INVALID_TYPE_ID;
+}
+
+static TypeId internSynthType(InternState& state, const SynthType& st)
+{
+    if (st.isEnum)
+    {
+        TypeInfo::EnumData data;
+        for (const SynthType::Member& m : st.members)
+        {
+            std::optional<TypeId> payload;
+            if (m.typeName != "void")
+            {
+                TypeId t = primitiveTypeId(m.typeName);
+                if (t == INVALID_TYPE_ID)
+                    Log::error("Synthesised enum variant '{}' has a non-primitive payload type "
+                        "'{}' (B3-5 supports primitive member types only).", m.name, m.typeName);
+                payload = t;
+            }
+            data.variants.push_back({ std::string_view(m.name), payload });
+        }
+        TypeInfo info;
+        info.kind = TypeInfo::Kind::Enum;
+        info.data = std::move(data);
+        return state.internStructural(std::move(info));
+    }
+
+    TypeInfo::StructData data;
+    for (const SynthType::Member& m : st.members)
+    {
+        TypeId t = primitiveTypeId(m.typeName);
+        if (t == INVALID_TYPE_ID)
+            Log::error("Synthesised struct member '{}' has a non-primitive type "
+                "'{}' (B3-5 supports primitive member types only).", m.name, m.typeName);
+        data.members.push_back({ std::string_view(m.name), t });
+    }
+    TypeInfo info;
+    info.kind = TypeInfo::Kind::Struct;
+    info.data = std::move(data);
+    return state.internStructural(std::move(info));
 }
 
 // ---------------------------------------------------------------------------
@@ -366,10 +428,17 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
             return state.internStructural(std::move(info));
         },
 
-        [&](const Required<AST::ComptimeExpression>&) -> TypeId
+        [&](const Required<AST::ComptimeExpression>& comptime) -> TypeId
         {
-            // Front-end only (§6): comptime type expressions are parsed but not
-            // evaluated, so they cannot yet be interned to a concrete TypeId.
+            // B3-5 (§3.4): a type-position comptime expression — intern the type
+            // the comptime-evaluation pass synthesised for it.
+            if (state.synthTypes)
+            {
+                auto it = state.synthTypes->find(&comptime.value());
+                if (it != state.synthTypes->end())
+                    return internSynthType(state, it->second);
+            }
+            // Not evaluated (evaluation failed) — no concrete TypeId.
             return INVALID_TYPE_ID;
         },
     }, base);
@@ -461,7 +530,6 @@ static TypeId internASTType(InternState& state, const AST::Type& type, const Res
 static void internFunction(InternState& state, const AST::Function& fn, const ResolvedModule& resolved);
 static void internStatement(InternState& state, const AST::Statement& stmt, const ResolvedModule& resolved);
 static void internExpression(InternState& state, const AST::Expression& expr, const ResolvedModule& resolved);
-static void internMacroCall(InternState& state, const AST::MacroCallExpression& call, const ResolvedModule& resolved);
 static void internComptime(InternState& state, const AST::ComptimeExpression& comptime, const ResolvedModule& resolved);
 
 static void internFunction(InternState& state, const AST::Function& fn, const ResolvedModule& resolved)
@@ -587,14 +655,15 @@ static void internExpression(InternState& state, const AST::Expression& expr, co
                 internStatement(state, match.value().externalElse.value(), resolved);
         },
 
-        [&](const Required<AST::MacroCallExpression>& call)
-        {
-            internMacroCall(state, call.value(), resolved);
-        },
-
         [&](const Required<AST::ComptimeExpression>& comptime)
         {
             internComptime(state, comptime.value(), resolved);
+        },
+
+        [&](const Required<AST::ComptimeResultExpression>&)
+        {
+            // A substituted comptime result carries no nested AST types to intern;
+            // its value type is assigned by the type checker.
         },
     }, expr);
 }
@@ -663,28 +732,12 @@ static void internStatement(InternState& state, const AST::Statement& stmt, cons
     }, stmt);
 }
 
-static void internMacroCall(InternState& state, const AST::MacroCallExpression& call, const ResolvedModule& resolved)
-{
-    call.typeArguments.forEach([&](const Required<AST::Type>& ta)
-    {
-        internASTType(state, ta.value(), resolved);
-    });
-    call.arguments.forEach([&](const Required<AST::Expression>& arg)
-    {
-        internExpression(state, arg.value(), resolved);
-    });
-}
-
 static void internComptime(InternState& state, const AST::ComptimeExpression& comptime, const ResolvedModule& resolved)
 {
-    std::visit(Overloaded
-    {
-        [&](const Required<AST::IfExpression>& e)        { internExpression(state, AST::Expression(e), resolved); },
-        [&](const Required<AST::WhileExpression>& e)     { internExpression(state, AST::Expression(e), resolved); },
-        [&](const Required<AST::MatchExpression>& e)     { internExpression(state, AST::Expression(e), resolved); },
-        [&](const Required<AST::StatementBlock>& e)      { internStatement(state, AST::Statement(e), resolved); },
-        [&](const Required<AST::MacroCallExpression>& e) { internMacroCall(state, e.value(), resolved); },
-    }, comptime.construct);
+    // A ComptimeExpression surviving to the interner was not evaluated (eval
+    // failed or it is a deferred macro call); intern its inner expression so any
+    // nested type annotations are still seen.
+    internExpression(state, comptime.inner.value(), resolved);
 }
 
 // ---------------------------------------------------------------------------
@@ -694,9 +747,11 @@ static void internComptime(InternState& state, const AST::ComptimeExpression& co
 Result<InternedTypes> intern(
     const Source& source,
     const AST::Module& module,
-    const ResolvedModule& resolved)
+    const ResolvedModule& resolved,
+    const SynthTypeMap& synthTypes)
 {
     InternState state(source);
+    state.synthTypes = &synthTypes;
 
     // Pre-allocate the 11 primitive TypeIds (0..10).
     // Ordered to match TYPE_U8 ... TYPE_BOOL constants.

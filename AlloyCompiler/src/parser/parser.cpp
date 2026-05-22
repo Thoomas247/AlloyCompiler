@@ -1137,70 +1137,19 @@ static Result<Required<AST::Expression>> parseExpression(ParserState& state, int
 	return { Ok, left };
 }
 
-static Result<Required<AST::MacroCallExpression>> parseMacroCall(ParserState& state)
-{
-	auto [identStatus, macroIdent] = parseIdentifierExpression(state);
-	ERROR_IF_ERROR(identStatus);
-
-	Optional<AST::ListNode<AST::Type>> typeArguments;
-	if (state.it.peek().kind == Less)
-	{
-		state.it.consume<Less>();
-		auto [taStatus, taList] = commaSeparatedList<Greater, AST::Type>(
-			state, [](ParserState& s) -> Result<Required<AST::Type>> { return parseType(s); });
-		ERROR_IF_ERROR(taStatus);
-		typeArguments = taList;
-	}
-
-	ERROR_IF_FALSE(state.it.consume<LParen>("'(' after macro name"));
-	auto [argStatus, arguments] = commaSeparatedList<RParen, AST::Expression>(
-		state, [](ParserState& s) { return parseExpression(s, 0); });
-	ERROR_IF_ERROR(argStatus);
-
-	return { Ok, state.allocator.allocate<AST::MacroCallExpression>(macroIdent, typeArguments, arguments) };
-}
-
+// comptime_expr = "#" postfix_expr
+// '#' marks any value-yielding expression (a call, identifier, if/while/match,
+// parenthesised expression, ...) for compile-time evaluation (§6.1). It binds as
+// a postfix expression, so `#a + b` is `(#a) + b`; use `#(a + b)` for the whole.
 static Result<Required<AST::ComptimeExpression>> parseComptimeExpression(ParserState& state)
 {
+	const Token& hashToken = state.it.peek();
 	ASSERT(state.it.consume<Hash>());
 
-	switch (state.it.peek().kind)
-	{
-	case If:
-	{
-		auto [status, expr] = parseIfExpression(state);
-		ERROR_IF_ERROR(status);
-		return { Ok, state.allocator.allocate<AST::ComptimeExpression>(expr) };
-	}
-	case While:
-	{
-		auto [status, expr] = parseWhileExpression(state);
-		ERROR_IF_ERROR(status);
-		return { Ok, state.allocator.allocate<AST::ComptimeExpression>(expr) };
-	}
-	case Match:
-	{
-		auto [status, expr] = parseMatchExpression(state);
-		ERROR_IF_ERROR(status);
-		return { Ok, state.allocator.allocate<AST::ComptimeExpression>(expr) };
-	}
-	case LBrace:
-	{
-		auto [status, block] = parseStatementBlock(state);
-		ERROR_IF_ERROR(status);
-		return { Ok, state.allocator.allocate<AST::ComptimeExpression>(block) };
-	}
-	case Identifier:
-	{
-		auto [status, call] = parseMacroCall(state);
-		ERROR_IF_ERROR(status);
-		return { Ok, state.allocator.allocate<AST::ComptimeExpression>(call) };
-	}
-	default:
-		state.logger.logErrorUnexpected(state.it.peek(), state.it.peek(),
-			"'if', 'while', 'match', '{' or a macro call after '#'", state.it.peek());
-		return { Error };
-	}
+	auto [status, inner] = parsePostfixExpression(state);
+	ERROR_IF_ERROR(status);
+
+	return { Ok, state.allocator.allocate<AST::ComptimeExpression>(inner, hashToken) };
 }
 
 #pragma endregion
@@ -1253,20 +1202,41 @@ static Result<Required<AST::StatementBlock>> parseStatementBlock(ParserState& st
 	return { Ok, state.allocator.allocate<AST::StatementBlock>(statements) };
 }
 
+// A block-like expression (if/while/for/match) is self-terminating.
+static bool isBlockLikeExpression(const AST::Expression& expr)
+{
+	return std::holds_alternative<Required<AST::IfExpression>>(expr)
+		|| std::holds_alternative<Required<AST::WhileExpression>>(expr)
+		|| std::holds_alternative<Required<AST::ForExpression>>(expr)
+		|| std::holds_alternative<Required<AST::MatchExpression>>(expr);
+}
+
 static Result<Required<AST::BreakStatement>> parseBreakStatement(ParserState& state)
 {
 	ASSERT(state.it.consume<Break>());
 
 	Optional<AST::Expression> breakValue;
+	bool blockLike = false;
 	if (state.it.peek().kind != Semicolon)
 	{
 		auto [status, value] = parseExpression(state);
 		ERROR_IF_ERROR(status);
 
-		breakValue = value.ptr();;
+		breakValue = value.ptr();
+		blockLike = isBlockLikeExpression(value.value());
 	}
 
-	ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after break statement"));
+	// When break's operand is a block-like expression it is self-terminating, so
+	// the trailing ';' is optional: `break if (c) break a; else break b;`.
+	if (blockLike)
+	{
+		if (state.it.peek().kind == Semicolon)
+			state.it.consume();
+	}
+	else
+	{
+		ERROR_IF_FALSE(state.it.consume<Semicolon>("';' after break statement"));
+	}
 
 	return { Ok, state.allocator.allocate<AST::BreakStatement>(breakValue) };
 }

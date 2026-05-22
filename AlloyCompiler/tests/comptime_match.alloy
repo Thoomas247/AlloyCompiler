@@ -1,0 +1,10 @@
+// §6.1 — a compile-time '#match' selects a value. Positive test.
+
+fn run() -> u32 {
+	const a = #match (2) {
+		1 { break 10; }
+		2 { break 20; }
+		else { break 30; }
+	};
+	return a;
+}

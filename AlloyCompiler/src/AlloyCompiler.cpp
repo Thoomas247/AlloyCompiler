@@ -8,6 +8,7 @@
 #include "tokenizer/tokenizer.hpp"
 #include "parser/parser.hpp"
 #include "resolver/resolver.hpp"
+#include "comptime/comptime.hpp"
 #include "typechecker/type_interner.hpp"
 #include "typechecker/type_checker.hpp"
 
@@ -51,7 +52,7 @@ static int compileExamples()
 		symbolsByPath[m.source->moduleName] = &m.symbols;
 	}
 
-	for (const auto& m : modules)
+	for (auto& m : modules)
 	{
 		// build importedSymbols in import-declaration order
 		std::vector<const SymbolTable*> importedSymbols;
@@ -75,7 +76,14 @@ static int compileExamples()
 		if (resolveStatus != Status::Ok)
 			continue;
 
-		auto [internStatus, internedTypes] = intern(*m.source, m.moduleNode.value(), resolvedModule);
+		// B1/B3 (§6): evaluate '#' comptime constructs — substitute values into
+		// the AST and record synthesised types — before interning. Comptime
+		// errors are reported to the DiagnosticEngine; the pipeline keeps going.
+		// synthTypes must outlive intern + typeCheck (its strings back type names).
+		SynthTypeMap synthTypes;
+		comptimeEval(*m.source, m.moduleNode.value(), resolvedModule, m.allocator, synthTypes);
+
+		auto [internStatus, internedTypes] = intern(*m.source, m.moduleNode.value(), resolvedModule, synthTypes);
 		if (internStatus != Status::Ok)
 			continue;
 
@@ -122,7 +130,10 @@ static void compileSource(const Source& source)
 	if (resolveStatus != Status::Ok)
 		return;
 
-	auto [internStatus, interned] = intern(source, moduleNode.value(), resolved);
+	SynthTypeMap synthTypes;
+	comptimeEval(source, moduleNode.value(), resolved, allocator, synthTypes);
+
+	auto [internStatus, interned] = intern(source, moduleNode.value(), resolved, synthTypes);
 	if (internStatus != Status::Ok)
 		return;
 

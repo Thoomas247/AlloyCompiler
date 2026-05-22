@@ -185,7 +185,6 @@ static void resolveBaseType(ResolveState& state, const AST::BaseType& baseType, 
 static void resolveExpression(ResolveState& state, const AST::Expression& expr, ScopedSymbolTable* scope);
 static void resolveStatement(ResolveState& state, const AST::Statement& stmt, ScopedSymbolTable* scope);
 static void resolveFunction(ResolveState& state, const AST::Function& fn, ScopedSymbolTable* parentScope);
-static void resolveMacroCall(ResolveState& state, const AST::MacroCallExpression& call, ScopedSymbolTable* scope);
 static void resolveComptime(ResolveState& state, const AST::ComptimeExpression& comptime, ScopedSymbolTable* scope);
 
 // Resolves an interface-name token (a generic constraint or a type_def marker) to a
@@ -220,6 +219,12 @@ static const std::unordered_set<std::string_view> s_BuiltinTypeNames = {
 	"bool"
 };
 
+// Built-in comptime macros (§6.4) — recognised names so a '#'-call to one is
+// not flagged as an undefined identifier. The comptime evaluator handles them.
+static const std::unordered_set<std::string_view> s_BuiltinMacroNames = {
+	"type_of", "struct_type", "enum_type"
+};
+
 static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpression& ident, const ScopedSymbolTable* scope)
 {
 	const auto& firstNode = ident.path.value();
@@ -231,6 +236,12 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 
 		// check if built-in type
 		if (s_BuiltinTypeNames.contains(name))
+		{
+			return;
+		}
+
+		// a built-in comptime macro — resolved by the comptime evaluator
+		if (s_BuiltinMacroNames.contains(name))
 		{
 			return;
 		}
@@ -519,40 +530,22 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 					resolveStatement(state, match.value().externalElse.value(), &elseScope);
 				}
 			},
-			[&](const Required<AST::MacroCallExpression>& call)
-			{
-				resolveMacroCall(state, call.value(), scope);
-			},
 			[&](const Required<AST::ComptimeExpression>& comptime)
 			{
 				resolveComptime(state, comptime.value(), scope);
 			},
+			[&](const Required<AST::ComptimeResultExpression>&)
+			{
+				// Produced only by the comptime pass, which runs after resolution.
+			},
 		}, expr);
-}
-
-static void resolveMacroCall(ResolveState& state, const AST::MacroCallExpression& call, ScopedSymbolTable* scope)
-{
-	resolveIdentifier(state, call.macro.value(), scope);
-	call.typeArguments.forEach([&](const Required<AST::Type>& ta)
-		{
-			resolveType(state, ta.value(), scope);
-		});
-	call.arguments.forEach([&](const Required<AST::Expression>& arg)
-		{
-			resolveExpression(state, arg.value(), scope);
-		});
 }
 
 static void resolveComptime(ResolveState& state, const AST::ComptimeExpression& comptime, ScopedSymbolTable* scope)
 {
-	std::visit(Overloaded
-		{
-			[&](const Required<AST::IfExpression>& e)    { resolveExpression(state, AST::Expression(e), scope); },
-			[&](const Required<AST::WhileExpression>& e) { resolveExpression(state, AST::Expression(e), scope); },
-			[&](const Required<AST::MatchExpression>& e) { resolveExpression(state, AST::Expression(e), scope); },
-			[&](const Required<AST::StatementBlock>& e)  { resolveStatement(state, AST::Statement(e), scope); },
-			[&](const Required<AST::MacroCallExpression>& e) { resolveMacroCall(state, e.value(), scope); },
-		}, comptime.construct);
+	// '#' wraps an ordinary expression; resolve it normally. Whether the callee
+	// of a '#'-call is a function or a macro is determined here by name lookup.
+	resolveExpression(state, comptime.inner.value(), scope);
 }
 
 static void resolveStatement(ResolveState& state, const AST::Statement& stmt, ScopedSymbolTable* scope)

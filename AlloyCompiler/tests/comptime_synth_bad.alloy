@@ -1,0 +1,13 @@
+// §3.4 — a type-position comptime expression that does not yield a #Type is a
+// compile-time error. Negative test.
+
+fn notAType() -> u32 {
+	return 5;
+}
+
+//@expect-error must evaluate to a #Type
+type Bad = #notAType();
+
+fn run() -> u32 {
+	return 0;
+}

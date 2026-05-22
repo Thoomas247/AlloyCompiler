@@ -1,0 +1,7 @@
+// §6.1 — comptime struct values and member access. Positive test.
+
+fn run() -> u32 {
+	const p = { .x = 8, .y = 4 };
+	const a = #(p.x);
+	return a;
+}

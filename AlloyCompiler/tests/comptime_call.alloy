@@ -1,0 +1,10 @@
+// §6.1/§6.3 — any function call may be marked comptime with '#'. Positive test.
+
+fn square(x: u32) -> u32 {
+	return x * x;
+}
+
+fn run() -> u32 {
+	const a = #square(7);
+	return a;
+}

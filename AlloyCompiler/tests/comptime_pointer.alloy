@@ -1,0 +1,9 @@
+// §6.2 — the pointer barrier: a comptime expression may not take a reference.
+// Negative test.
+
+fn run() -> u32 {
+	const x = 5;
+	//@expect-error may not take a reference
+	const r = #(&x);
+	return 0;
+}

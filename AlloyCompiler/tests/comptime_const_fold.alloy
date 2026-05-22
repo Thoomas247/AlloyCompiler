@@ -1,0 +1,8 @@
+// §6.1 — a comptime expression may reference 'const' bindings whose initializer
+// is itself compile-time constant. Positive test.
+
+fn run() -> u32 {
+	const BASE = 10;
+	const a = #(BASE * BASE + 5);
+	return a;
+}

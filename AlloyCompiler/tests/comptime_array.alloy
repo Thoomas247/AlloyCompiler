@@ -1,0 +1,9 @@
+// §6.1 — comptime array values: literal, indexing, and built-in '.length()'.
+// Positive test.
+
+fn run() -> u32 {
+	const data = [ 3, 7, 11 ];
+	const element = #(data[1]);
+	const count = #(data.length());
+	return element + count;
+}

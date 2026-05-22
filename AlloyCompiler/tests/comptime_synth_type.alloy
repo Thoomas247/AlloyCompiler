@@ -1,0 +1,16 @@
+// §3.4/§6.1 — a type synthesised by a type-position comptime expression: a
+// macro builds a '#Type', and `type T = #macro()` installs it. Positive test.
+
+macro makePoint() {
+	var t = #struct_type();
+	t.add_member("x", #u32);
+	t.add_member("y", #u32);
+	return t;
+}
+
+type Point = #makePoint();
+
+fn run() -> u32 {
+	const p = Point{ .x = 10, .y = 20 };
+	return p.x;
+}

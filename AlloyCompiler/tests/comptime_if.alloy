@@ -1,0 +1,6 @@
+// §6.1 — a compile-time '#if' selects and substitutes a value. Positive test.
+
+fn run() -> u32 {
+	const a = #if (true) break 50; else break 100;
+	return a;
+}

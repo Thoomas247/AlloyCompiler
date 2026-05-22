@@ -50,7 +50,8 @@ cd AlloyCompiler
 ## 2. Architecture — Pipeline & Files
 
 The driver runs two loops. Loop 1 (per file): `tokenize → parse → declare`. Loop 2
-(per module): `resolve → intern → typeCheck`. Modules are matched to imports by path.
+(per module): `resolve → comptimeEval → intern → typeCheck`. Modules are matched to
+imports by path.
 
 | Stage | Files | Responsibility |
 | --- | --- | --- |
@@ -63,6 +64,7 @@ The driver runs two loops. Loop 1 (per file): `tokenize → parse → declare`. 
 | Token iterator | [`src/parser/token_iterator.hpp`](src/parser/token_iterator.hpp), [`token_iterator.cpp`](src/parser/token_iterator.cpp) | Token cursor used by the parser. |
 | Resolver | [`src/resolver/resolver.hpp`](src/resolver/resolver.hpp), [`resolver.cpp`](src/resolver/resolver.cpp) | `declare()` builds the module `SymbolTable`; `resolve()` binds every name reference, resolves interface markers/constraints. |
 | Builtins | [`src/builtins/builtins.hpp`](src/builtins/builtins.hpp) | Built-in interfaces (`Number`, `Iterable`) and functions (`reinterpret`, `convert`, `length`). |
+| Comptime | [`src/comptime/comptime.hpp`](src/comptime/comptime.hpp), [`comptime.cpp`](src/comptime/comptime.cpp) | B1 (§6.1): a tree-walking interpreter that evaluates expression-position `#` constructs and rewrites each into a value (value-substitution). |
 | Types | [`src/typechecker/types.hpp`](src/typechecker/types.hpp) | `TypeInfo`, `TypeId`, `InternedTypes`. |
 | Type interner | [`src/typechecker/type_interner.hpp`](src/typechecker/type_interner.hpp), [`type_interner.cpp`](src/typechecker/type_interner.cpp) | Pass 1: assigns a canonical `TypeId` to every type; deduplicates structural types. |
 | Type checker | [`src/typechecker/type_checker.hpp`](src/typechecker/type_checker.hpp), [`type_checker.cpp`](src/typechecker/type_checker.cpp) | Pass 2: expression type inference, assignment/call checks, overload resolution, generic inference, §5.2 interface verification. |
@@ -117,10 +119,14 @@ The front-end has been refactored to conform to the spec. Completed work:
   - §5.2 verification pass: every interface-marked type must provide each interface
     function via a type-specific extension **or** a default.
 
-### Out-of-scope-but-parsed (front-end only)
-Comptime/macro constructs (§6) are **parsed into the AST and name-resolved**, but **not
-evaluated**: comptime type expressions intern to `INVALID_TYPE_ID`, macro calls yield no
-value type, macro bodies are not type-checked.
+### Compile-time evaluation (§6) — B1, B2, B3, B4 done
+Both expression-position and type-position `#` comptime constructs are **evaluated** by a
+tree-walking interpreter ([`src/comptime/`](src/comptime/comptime.cpp)). Expression
+results are substituted into the AST (value-substitution); type-position results
+(`type T = #...`) are synthesised into real interned types. Scalars, arrays, structs,
+`#Type` reflection values, user-defined macros, and the pointer/`extern` sandbox (B4) are
+all supported. Remaining comptime gaps are minor (see §6.B limitations); the major
+remaining work is the back-end (§6.C).
 
 ---
 
@@ -160,9 +166,15 @@ Read this section before touching the code — these cost real debugging time.
    (`interned.table.reserve(... + 4096)`) because live `const TypeInfo&` references are held
    across `internType()` pushes. If you intern many new types during checking, revisit this.
 9. **Source files use TAB indentation.**
-10. **No test harness exists.** Verification is manual: drop `*.alloy` files in `examples/`
-    and run. A batch now compiles every module even when one has errors (see gotcha 1),
-    so multiple positive/negative cases can coexist in `examples/`.
+10. **Use the `--test` harness (F3).** `AlloyCompiler.exe --test` runs every `tests/*.alloy`
+    in isolation against `//@expect-error` annotations. Add a test per feature/fix.
+11. **The comptime pass mutates the AST in place.** `comptimeEval`
+    ([`src/comptime/comptime.cpp`](src/comptime/comptime.cpp)) runs between `resolve` and
+    `intern` and reassigns `Expression` variant slots, replacing evaluated
+    `ComptimeExpression` nodes with `ComptimeResultExpression`. The driver's module loop
+    therefore iterates by non-const reference. `ComptimeResultExpression` is never produced
+    by the parser — only by this pass — so a parser/resolver change need not handle it, but
+    the interner and checker must.
 
 ---
 
@@ -267,25 +279,59 @@ when one is recoverable (the callee token, or the target/return expression's roo
 identifier); they fall back to location-less `Log::error` only for token-less expressions
 (e.g. `return 5;`).
 
-### B. Compile-time evaluation & macros (§6) — currently front-end only
+### B. Compile-time evaluation & macros (§6)
 
-**B1. Comptime interpreter.** Evaluate `#if/#while/#match/#{}` at compile time over a
-value-substitution model (§6.1): execute the construct, replace the AST node with the
-resulting literal/struct/type. New subsystem; consumes the `ComptimeExpression` AST nodes
-already produced by the parser.
+**Grammar/AST changes (done).** `#` now prefixes *any* value-yielding postfix
+expression (`comptime_expr = "#" postfix_expr`) — `#fn(args)`, `#if`, `#(expr)` — not a
+fixed set; `#{}` was removed (a block is not a value). `ComptimeExpression` is now a thin
+`{ Required<Expression> inner; }` wrapper; the separate `MacroCallExpression` node was
+deleted (a macro call is just a `#`-call whose callee resolves to a `macro`). A new
+`ComptimeResultExpression` carries a substituted compile-time value. `if` is now a
+value-yielding construct: `break` targets the innermost `for`/`while`/`match`/`if`, and
+`break`'s trailing `;` is optional after a block-like operand.
 
-**B2. Macro expansion.** Execute `macro` bodies; replace `#macroCall(...)` sites with the
-generated AST / type node. Macro return types are inferred from the generated node (§6.3).
+**B1. Comptime interpreter — DONE.** [`src/comptime/comptime.cpp`](src/comptime/comptime.cpp)
+is a tree-walking interpreter run as the `comptimeEval` pass (after `resolve`, before
+`intern`). It evaluates expression-position `#if`/`#while`/`#match`/`#for`/`#fn(...)` and
+rewrites each into a value (value-substitution, §6.1). It supports scalar values
+(integer/float/bool/char/string), arrays and structs, `const`-binding folding,
+user-function-body execution with a call frame, member access / array indexing / the
+built-in `.length()`, loop/branch control flow, and a step budget guarding
+non-terminating loops. A scalar result is substituted as a `ComptimeResultExpression`; an
+array or struct result is substituted as a synthesised `ArrayLiteralExpression` /
+`StructInitializerExpression`. **Limitations:** a comptime field/element cannot be mutated
+through a member/index assignment target; an empty-array result is rejected (no inferable
+element type).
 
-**B3. `#Type` reflection.** (§3.4) The compile-time-only `#Type` representation with
-reflection/mutation methods (`@members`, etc.). Needed for `type T = #readTypeFromJson(...)`.
+**B4. Comptime sandboxing — DONE (the parts checkable now).** The pointer barrier (`&`,
+`new`, `move` are rejected inside a comptime expression; §6.2) and the `extern`-call
+prohibition are enforced by the interpreter. The filesystem sandbox is inert until B2
+introduces comptime file I/O — there is currently no way to perform I/O at comptime.
 
-**B4. Comptime sandboxing.** (§6.2) Pointer barrier (no `&`/`*` may escape comptime into
-runtime), filesystem sandbox to the project root, prohibition on calling `extern` from
-comptime.
+**B2. User-defined macros — DONE.** The comptime interpreter executes a `macro`
+body exactly like a function body — `evalCall` accepts a `MacroDefinition` (bind
+params, run the body, consume `return`). A `#`-call to a macro yields whatever
+the body returns: a value (used as a value) or a `#Type` (used to synthesise a
+type, B3-5). Macros have no declared return type — the result kind is whatever
+the body produced.
 
-Until B1–B4 exist, keep the current behaviour: comptime types ⇒ `INVALID_TYPE_ID`, macro
-calls ⇒ no value type.
+**B3. `#Type` reflection + type synthesis — DONE.** (§3.4)
+*Reflection (1-4):* a `#Type` is a comptime value kind. `#T` reflects a declared
+type or primitive; `#type_of(x)` reflects a value's type; `#struct_type()` /
+`#enum_type()` create fresh empty types. All eleven `#Type` methods are
+implemented — `is_struct`/`is_enum`/`is_primitive`/`is_interface`,
+`implements_interface`, `name`, `equals`, `add_member`, `remove_member`,
+`member_names`, `member_types`. Member reflection is recursive with a
+self-reference guard (a back-edge yields a shallow `#Type`).
+*Type synthesis (5-6):* `type T = <#Type expression>` works. The `comptimeEval`
+pass also walks `TypeDefinition`s; a type-position `#` is evaluated and the
+resulting `#Type` recorded as a `SynthType` ([`comptime.hpp`](src/comptime/comptime.hpp))
+in a map threaded into `intern()`. `internBaseType` turns a `SynthType` into a
+real `Struct`/`Enum` `TypeInfo`. **Limitations:** a synthesised type's member
+types must be primitives (a named/nested member type is reported and interns to
+`INVALID_TYPE_ID`); the strict §3.4 runtime-barrier diagnostic is partial — a
+`#Type` reaching genuine runtime value position is left unsubstituted rather
+than always diagnosed.
 
 ### C. Back-end / code generation — entirely absent (largest effort)
 
@@ -351,13 +397,19 @@ annotations embedded as comments. A file with no annotations is a positive test 
 compile clean). A test passes when expected and actual error counts match and every
 expected substring matches a distinct diagnostic. Prints `PASS`/`FAIL` per file and
 `N passed, M failed`; exit `0` iff all pass. Without `--test` the driver compiles
-`./examples` as before. Corpus in `tests/` is **29 cases** (all passing) covering: char
+`./examples` as before. Corpus in `tests/` is **51 cases** (all passing) covering: char
 width, numeric widening/narrowing, cross-sign-class, undefined name, duplicate definition,
 missing field, interface satisfied/unsatisfied/built-in marker, enum match + bad variant +
 payload mismatch, match-capture-on-non-enum, loop/while/match `else` placement, ref/ptr
 assignment forms, mutate-through-immutable, `self`-receiver mutability, struct structural
 compatibility, generic `Number` constraint, string literal, extension call, arrays, escape
-sequences. Add a new `tests/*.alloy` per future feature/fix.
+sequences, comptime `#if`/`#while`/`#match`/`#for`/`#fn()` evaluation, comptime `const`
+folding, comptime arrays/structs/`.length()`/array+struct results, the `break if (…)`
+loop-break form, and the comptime sandbox rules (runtime-var read, `extern` call, pointer
+barrier, loop step budget), `#Type` reflection (reflect a declared struct/enum,
+`#struct_type` + `add_member`/`remove_member`, `#type_of`, unknown-method error), type
+synthesis (`type T = #macro()`, non-`#Type` type-position error) and user-defined macros.
+Add a new `tests/*.alloy` per future feature/fix.
 
 **F4. Escape-sequence validation — DONE.** `validateEscapeSequence` in
 [`tokenizer.cpp`](src/tokenizer/tokenizer.cpp) validates every escape inside a string/char
@@ -372,11 +424,11 @@ the escape's source span.
 
 These should be clarified with the language designer before the affected code is finalised:
 
-1. **`if`/`while`/`for` branch grammar.** §2.1 EBNF makes the branch a `statement`, but the
-   §6 examples (`var a = #if (#isDevelopment()) 50 else 100;`) use a bare expression with no
-   `;`. Either the grammar needs an "expression branch" form, or the examples are wrong. The
-   parser currently follows the EBNF (branch = `statement`), so `#if (c) 50 else 100` does
-   not parse — only block/`;`-terminated branches do.
+1. ~~**`if`/`while`/`for` branch grammar.**~~ **Resolved (designer decision).** The strict
+   EBNF is kept — branches stay `statement`s. An `if` is a value-yielding construct that
+   yields via `break` (like `for`/`while`/`match`), so `#if (c) break 50; else break 100;`
+   is the correct form; the old §6 bare-expression examples were corrected. There are no
+   built-in comptime macros — `#isDevelopment()` was illustrative only.
 2. **`extern` return type.** §5.3 prose says extern declarations "mandate concrete arrow
    return types", but the EBNF and the `examples/main.alloy` `extern printf(...);` make it
    optional. The parser follows the EBNF (optional).
@@ -416,6 +468,9 @@ To verify a change:
 10. ~~**A9/A10** — `self`-receiver indirection context; located error model.~~ **DONE.**
 11. ~~**F3** — test harness (`--test`, `tests/` corpus).~~ **DONE.**
 12. ~~**F4** — escape-sequence validation.~~ **DONE.**
-13. **B1–B4** — comptime/macro evaluation.
-14. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
-    correct one.
+13. ~~**B1 + B4** — comptime interpreter + sandboxing.~~ **DONE.**
+14. ~~**B3 reflection** — the `#Type` reflection API (§3.4).~~ **DONE.**
+15. ~~**B3 type synthesis (5-6) + B2** — type-position comptime + user-defined macros.~~ **DONE.**
+16. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
+    correct one. With B complete, the front-end (lex → parse → resolve → comptime → intern →
+    type-check) is feature-complete against the spec; C is the remaining major work.

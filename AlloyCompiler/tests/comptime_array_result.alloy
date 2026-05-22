@@ -1,0 +1,11 @@
+// §6.1 — a comptime expression that yields an array is substituted back into
+// the AST as an array literal. Positive test.
+
+fn buildArr() -> [u32; 3] {
+	return [ 10, 20, 30 ];
+}
+
+fn run() -> u32 {
+	const arr: [u32; 3] = #buildArr();
+	return arr[1];
+}

@@ -2,6 +2,7 @@
 
 #include "types.hpp"
 #include "../resolver/resolver.hpp"
+#include "../comptime/comptime.hpp"
 #include "../source/source.hpp"
 #include "../util/result.hpp"
 
@@ -19,5 +20,6 @@
 Result<InternedTypes> intern(
     const Source& source,
     const AST::Module& module,
-    const ResolvedModule& resolved
+    const ResolvedModule& resolved,
+    const SynthTypeMap& synthTypes
 );
