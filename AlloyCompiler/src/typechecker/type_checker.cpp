@@ -349,6 +349,24 @@ static bool isAssignable(TypeId from, TypeId to, const InternedTypes& interned)
 		return isAssignable(fromInfo.asSlice().elem, toInfo.asSlice().elem, interned);
 	}
 
+	// Function-type structural compatibility — needed because the interner does
+	// not deduplicate Function TypeInfos, so two `(i32) -> i32` types from
+	// different sources (a lambda value vs. a param annotation) get distinct ids.
+	if (fromInfo.kind == TypeInfo::Kind::Function && toInfo.kind == TypeInfo::Kind::Function)
+	{
+		const auto& fF = fromInfo.asFunction();
+		const auto& tF = toInfo.asFunction();
+		if (fF.params.size() != tF.params.size()) return false;
+		for (size_t i = 0; i < fF.params.size(); ++i)
+			if (!isAssignable(fF.params[i], tF.params[i], interned)
+				&& !isAssignable(tF.params[i], fF.params[i], interned))
+				return false;
+		if (fF.ret.has_value() != tF.ret.has_value()) return false;
+		if (fF.ret.has_value() && !isAssignable(*fF.ret, *tF.ret, interned)
+			&& !isAssignable(*tF.ret, *fF.ret, interned)) return false;
+		return true;
+	}
+
 	// §3.3 rule 6 — chained nominal-structural struct compatibility.
 	// An anonymous-layout target (Kind::Struct) accepts any value whose internal
 	// shape structurally provides every field the target requires (the source may
@@ -557,8 +575,27 @@ static bool unifyParam(TypeId paramId, TypeId argId, std::unordered_map<TypeId, 
 	{
 		auto it = bindings.find(paramId);
 		if (it != bindings.end())
-			return it->second == argId || isAssignable(argId, it->second, interned);
-		bindings[paramId] = argId;
+		{
+			TypeId bound = it->second;
+			// An untyped integer / float literal arg defers to its primitive class
+			// rather than to its concrete default — so 'add<u64>(10, 20)' binds the
+			// literals to u64 even though the default would have been i32.
+			auto reachesPrimitive = [&](bool wantFloat)
+				{
+					TypeId c = bound;
+					while (c < (TypeId)interned.table.size()
+						&& interned.get(c).kind == TypeInfo::Kind::Named)
+						c = interned.get(c).asNamed().underlying;
+					return c < (TypeId)interned.table.size()
+						&& interned.get(c).kind == TypeInfo::Kind::Primitive
+						&& interned.get(c).asPrimitive().isFloat == wantFloat;
+				};
+			if (argId == TYPE_UNTYPED_INT   && reachesPrimitive(false)) return true;
+			if (argId == TYPE_UNTYPED_FLOAT && reachesPrimitive(true))  return true;
+			return bound == argId || isAssignable(argId, bound, interned);
+		}
+		// Bind on first sighting. Resolve untyped literals to their concrete defaults.
+		bindings[paramId] = resolveUntypedLiteral(argId);
 		return true;
 	}
 
@@ -678,6 +715,11 @@ static bool satisfiesConstraint(TypeId id, BuiltinInterface iface, const Interne
 			cur = info.asNamed().underlying;
 			continue;
 		}
+		// Nested-generic case: a generic body may bind one TypeParam to another
+		// (a caller's). Defer the constraint check to the eventual concrete
+		// instantiation by accepting any TypeParam optimistically here.
+		if (info.kind == TypeInfo::Kind::TypeParam)
+			return true;
 		// A4: Iterable has no primitive member set — it is satisfied structurally
 		// by fixed arrays and slices (and, transparently, dynamic heap arrays).
 		if (iface == BuiltinInterface::Iterable)
@@ -732,10 +774,10 @@ static TypeId tryGenericOverload(const ResolvedDeclaration& decl, const std::vec
 	std::unordered_map<TypeId, TypeId> bindings = outBindings;
 	for (size_t i = 0; i < paramTypes.size(); ++i)
 	{
-		// Normalize untyped literals to concrete defaults before generic unification
-		// so constraint checks (e.g. T: Number) work on real primitive TypeIds.
-		TypeId argId = resolveUntypedLiteral(argTypes[i]);
-		if (!unifyParam(paramTypes[i], argId, bindings, interned))
+		// Pass the raw arg TypeId — unifyParam now defers untyped-literal resolution
+		// until after consulting any pre-seeded bindings, so 'add<u64>(10, 20)' binds
+		// the literals to the explicit primitive class instead of the i32 default.
+		if (!unifyParam(paramTypes[i], argTypes[i], bindings, interned))
 		{
 			return INVALID_TYPE_ID;
 		}
@@ -1851,6 +1893,15 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 							{
 								if (variant.payloadType.has_value())
 									captureType = *variant.payloadType;
+								else
+								{
+									// §7.3: a payload-less variant has no value to capture.
+									const Token& capTok =
+										arm.value().capture.value().variableName;
+									state.logger.logErrorInRange(capTok, capTok,
+										"Pattern capture not allowed on payload-less "
+										"variant '{}'.", variant.name);
+								}
 								break;
 							}
 						}
@@ -2016,6 +2067,59 @@ static void checkStatement(CheckState& state, const AST::Statement& stmt, Scoped
 						std::holds_alternative<Required<AST::ArrayAccessExpression>>(tgt);
 					if (throughAccess)
 					{
+						// A6 extension: walk every '.field' along the chain (skipping
+						// the outermost step — that's the target slot itself, not a
+						// step we mutate THROUGH). At each intermediate MemberAccess
+						// look up the field's declared storage type and reject when
+						// it is an immutable reference / pointer.
+						{
+							const AST::Expression* cur =
+								std::holds_alternative<Required<AST::MemberAccessExpression>>(tgt)
+								? &std::get<Required<AST::MemberAccessExpression>>(tgt).value().object.value()
+								: &std::get<Required<AST::ArrayAccessExpression>>(tgt).value().object.value();
+							while (true)
+							{
+								if (auto* m = std::get_if<Required<AST::MemberAccessExpression>>(cur))
+								{
+									TypeId objTy = checkExpression(state, m->value().object.value(), scope);
+									while (objTy != INVALID_TYPE_ID
+										&& objTy < static_cast<TypeId>(state.interned.table.size())
+										&& state.interned.get(objTy).kind == TypeInfo::Kind::Named)
+										objTy = state.interned.get(objTy).asNamed().underlying;
+									if (objTy != INVALID_TYPE_ID
+										&& objTy < static_cast<TypeId>(state.interned.table.size())
+										&& state.interned.get(objTy).kind == TypeInfo::Kind::Struct)
+									{
+										auto memberName = state.getStringView(m->value().memberName);
+										for (const auto& fld : state.interned.get(objTy).asStruct().members)
+										{
+											if (fld.name != memberName) continue;
+											TypeId ft = fld.type;
+											if (ft != INVALID_TYPE_ID
+												&& ft < static_cast<TypeId>(state.interned.table.size()))
+											{
+												TypeInfo::Kind k = state.interned.get(ft).kind;
+												if (k == TypeInfo::Kind::Reference
+													|| k == TypeInfo::Kind::Pointer)
+													state.logger.logErrorInRange(
+														m->value().memberName, m->value().memberName,
+														"Cannot mutate through immutable reference / "
+														"pointer field '{}'; declare it as '&var' or '*var'.",
+														memberName);
+											}
+											break;
+										}
+									}
+									cur = &m->value().object.value();
+								}
+								else if (auto* a = std::get_if<Required<AST::ArrayAccessExpression>>(cur))
+								{
+									cur = &a->value().object.value();
+								}
+								else break;
+							}
+						}
+
 						if (const AST::IdentifierExpression* root = rootIdentifier(tgt))
 						{
 							auto rIt = state.resolved.names.find(root);

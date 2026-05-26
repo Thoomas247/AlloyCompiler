@@ -1,4 +1,7 @@
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -11,6 +14,7 @@
 #include "comptime/comptime.hpp"
 #include "typechecker/type_interner.hpp"
 #include "typechecker/type_checker.hpp"
+#include "codegen/codegen.hpp"
 
 namespace fs = std::filesystem;
 
@@ -243,10 +247,97 @@ static int runTests()
 	return failed == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// Back-end driver (§6.C) — compiles a single .alloy file end to end: front-end
+// pipeline, LLVM code generation, then links the emitted object into a native
+// executable with clang. Output lands in ./build.
+// ---------------------------------------------------------------------------
+
+static int buildFile(const std::string& path)
+{
+	fs::path file(path);
+	if (!fs::exists(file))
+	{
+		std::fprintf(stderr, "ERROR: source file '%s' not found.\n", path.c_str());
+		return 1;
+	}
+
+	std::ifstream stream(file);
+	std::stringstream buffer;
+	buffer << stream.rdbuf();
+
+	Source source{ file.stem().string(), buffer.str() };
+
+	auto [tokenStatus, tokens] = tokenize(source);
+	auto [parseStatus, parseResult] = parse(source, tokens);
+	auto& [moduleNode, allocator] = parseResult;
+	auto [declareStatus, symbols] = declare(source, moduleNode.value());
+
+	std::vector<const SymbolTable*> noImports;
+	auto [resolveStatus, resolved] = resolve(source, moduleNode.value(), symbols, noImports);
+
+	auto failOut = [&]() -> int
+	{
+		auto& diags = DiagnosticEngine::instance();
+		diags.printAll();
+		std::fprintf(stderr, "Compilation failed with %zu error(s).\n", diags.getErrorCount());
+		return 1;
+	};
+
+	if (resolveStatus != Status::Ok)
+		return failOut();
+
+	SynthTypeMap synthTypes;
+	comptimeEval(source, moduleNode.value(), resolved, allocator, synthTypes);
+
+	auto [internStatus, interned] = intern(source, moduleNode.value(), resolved, synthTypes);
+	if (internStatus != Status::Ok)
+		return failOut();
+
+	auto [checkStatus, typed] = typeCheck(source, moduleNode.value(), resolved, interned, symbols);
+	if (DiagnosticEngine::instance().hasError())
+		return failOut();
+
+	fs::create_directories("build");
+	const std::string base = "build/" + source.moduleName;
+
+	Status cgStatus = codegen(source, moduleNode.value(), resolved, interned, typed, symbols, base);
+
+	DiagnosticEngine::instance().printAll();
+	if (cgStatus != Status::Ok || DiagnosticEngine::instance().hasError())
+	{
+		std::fprintf(stderr, "Code generation failed.\n");
+		return 1;
+	}
+
+	std::println("Emitted {}.ll and {}.obj", base, base);
+
+	// Link the object into an executable with clang (which knows the MSVC toolchain).
+	// C:\LLVM is an LLVM 21 dev-libs build without clang/lld; bak18 keeps the old
+	// clang for linking — object format is forward-compatible.
+	const std::string clang = "C:\\LLVM.bak18\\bin\\clang.exe";
+	const std::string exePath = "build/" + source.moduleName + ".exe";
+	const std::string command =
+		"\"\"" + clang + "\" \"" + base + ".obj\" -o \"" + exePath + "\"\"";
+
+	int rc = std::system(command.c_str());
+	if (rc != 0)
+	{
+		std::fprintf(stderr, "Linking failed (clang exit code %d).\n", rc);
+		return 1;
+	}
+
+	std::println("Linked executable: {}", exePath);
+	return 0;
+}
+
 int main(int argc, char** argv)
 {
 	if (argc > 1 && std::string_view(argv[1]) == "--test")
 		return runTests();
+
+	if (argc > 2 && std::string_view(argv[1]) == "--build")
+		return buildFile(argv[2]);
 
 	return compileExamples();
 }

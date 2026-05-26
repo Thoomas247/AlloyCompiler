@@ -1,0 +1,20 @@
+// Nested generic mono — `double<U>` body calls `id<U>` with a TypeParam binding.
+// Each outer instantiation must spawn a matching inner mono (id<i32>, id<f32>).
+
+extern printf(...);
+
+fn id<T: Number>(x: T) -> T {
+	return x;
+}
+
+fn twice<U: Number>(x: U) -> U {
+	return id<U>(x) + id<U>(x);
+}
+
+fn main() -> u32 {
+	const a = twice<i32>(21);     // expects 42
+	const b = twice<f32>(1.5);    // expects 3.0
+	printf("twice<i32>(21) = %d\n", a);
+	printf("twice<f32>(1.5) = %.1f\n", b);
+	return 0;
+}

@@ -1,0 +1,15 @@
+// Generic monomorphisation demo — one `add<T>` definition, three concrete instances.
+
+extern printf(...);
+
+fn add<T: Number>(a: &T, b: &T) -> T {
+	return a + b;
+}
+
+fn main() -> u32 {
+	const i = add(10, 20);              // T = i32 (untyped-int default)
+	const u = add<u64>(100, 200);       // T = u64 (explicit, cross-sign-class OK now)
+	const f = add<f32>(1.5, 2.5);       // T = f32 (explicit)
+	printf("i32=%d u64=%llu f32=%.1f\n", i, u, f);
+	return 0;
+}

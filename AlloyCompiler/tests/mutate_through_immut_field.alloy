@@ -1,0 +1,8 @@
+// A6 mid-chain: mutating x through an immutable '&' field is rejected.
+
+type Inner = struct { x: i32; };
+type Outer = struct { r: &Inner; };
+
+fn touch(o: &var Outer) {
+	o.r.x = 99;     //@expect-error Cannot mutate through immutable reference / pointer field 'r'
+}

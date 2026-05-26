@@ -1,0 +1,19 @@
+// Synthesized type — a macro builds a `#struct_type` and `type T = #macro()`
+// installs it. End-to-end through codegen.
+
+extern printf(...);
+
+macro makePoint() {
+	var t = #struct_type();
+	t.add_member("x", #i32);
+	t.add_member("y", #i32);
+	return t;
+}
+
+type Point = #makePoint();
+
+fn main() -> u32 {
+	const p = Point { .x = 3, .y = 4 };
+	printf("(%d, %d)\n", p.x, p.y);
+	return 0;
+}

@@ -1,0 +1,68 @@
+// Back-end demonstration program — exercises the core lowering path:
+// structs, extension functions, enums + match, loops, arrays, FFI.
+
+extern printf(...);
+
+type Vec3 = struct {
+	x: i32;
+	y: i32;
+	z: i32;
+};
+
+fn add(self a: &Vec3, b: &Vec3) -> Vec3 {
+	return Vec3 { .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
+}
+
+type Color = enum {
+	Red;
+	Green;
+	Blue;
+};
+
+fn classify(c: &Color) -> i32 {
+	match (c) {
+		Color::Red   { return 1; }
+		Color::Green { return 2; }
+		Color::Blue  { return 3; }
+		else { return 0; }
+	}
+	return 0;
+}
+
+fn sum_to(n: i32) -> i32 {
+	var total: i32 = 0;
+	var i: i32 = 0;
+	while (i < n) {
+		total += i;
+		i += 1;
+	}
+	return total;
+}
+
+fn main() -> u32 {
+	const a = Vec3 { .x = 1, .y = 2, .z = 3 };
+	const b = Vec3 { .x = 10, .y = 20, .z = 30 };
+	const c = a.add(b);
+	printf("vec sum: %d %d %d\n", c.x, c.y, c.z);
+
+	const s = sum_to(10);
+	printf("sum 0..9 = %d\n", s);
+
+	const arr: [i32; 5] = [ 2, 4, 6, 8, 10 ];
+	var acc: i32 = 0;
+	for (arr) | v | {
+		acc += v;
+	}
+	printf("array sum = %d\n", acc);
+
+	const col = Color::Green;
+	printf("classify(Green) = %d\n", classify(col));
+
+	if (s > 40) {
+		printf("s is big\n");
+	} else {
+		printf("s is small\n");
+	}
+
+	return 0;
+}

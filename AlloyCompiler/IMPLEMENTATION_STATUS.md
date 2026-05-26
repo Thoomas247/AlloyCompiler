@@ -13,10 +13,24 @@ to fully match the language specification.
 [`AlloyCompiler/LANGUAGE_SPEC.md`](LANGUAGE_SPEC.md) — read it first; everything below assumes
 familiarity with it.
 
-The compiler is a C++ project. It currently implements a **front-end only**: source →
-tokens → AST → resolved names → interned types → type-checked module. **There is no
-back-end** — no IR, no codegen, no executable output. The pipeline stops at a
-`TypedModule` value.
+The compiler is a C++ project. The pipeline is: source → tokens → AST → resolved names →
+comptime evaluation → interned types → type-checked module → **LLVM IR → object file →
+executable**. The front-end is feature-complete against the spec; the back-end
+([`src/codegen/`](src/codegen/codegen.cpp)) does core lowering to LLVM (see §6.C for
+exactly what is and is not lowered).
+
+The back-end links the LLVM **21.1.0** C++ API. The LLVM static libraries are expected at
+`C:\LLVM` (headers under `C:\LLVM\include`, libs under `C:\LLVM\lib`) — built from source
+out of `C:\src\llvm-project` with `-DCMAKE_BUILD_TYPE=Debug -DLLVM_TARGETS_TO_BUILD=X86
+-DLLVM_OPTIMIZED_TABLEGEN=ON` against the debug CRT, so the Debug configuration keeps
+`/MDd` + `_DEBUG`; only the X86 target is linked. Clang/lld were not built — the
+`--build` driver invokes `C:\LLVM.bak18\bin\clang.exe` (a preserved LLVM 18 clang) for
+the final link step, which works because the object format is forward-compatible.
+
+LLVM 19+ API change handled in `codegen.cpp`: `Module::setTargetTriple` now takes
+`llvm::Triple` (wrap a `Triple(triple)`). LLVM 21 split several modules out — the
+project additionally links `LLVMIRPrinter`, `LLVMCGData`, `LLVMDebugInfoDWARFLowLevel`,
+`LLVMDWARFCFIChecker`, `LLVMSandboxIR`, `LLVMFrontendAtomic`, `LLVMFrontendDirective`.
 
 - Solution: [`AlloyCompiler.sln`](../AlloyCompiler.sln)
 - Project: [`AlloyCompiler/AlloyCompiler.vcxproj`](AlloyCompiler.vcxproj)
@@ -45,6 +59,15 @@ cd AlloyCompiler
 ..\x64\Debug\AlloyCompiler.exe
 ```
 
+To compile a single file all the way to a native executable (back-end, §6.C):
+
+```
+..\x64\Debug\AlloyCompiler.exe --build samples\demo.alloy
+```
+
+This runs the full pipeline, emits `build\demo.ll` + `build\demo.obj`, and links
+`build\demo.exe` with `clang`.
+
 ---
 
 ## 2. Architecture — Pipeline & Files
@@ -68,6 +91,7 @@ imports by path.
 | Types | [`src/typechecker/types.hpp`](src/typechecker/types.hpp) | `TypeInfo`, `TypeId`, `InternedTypes`. |
 | Type interner | [`src/typechecker/type_interner.hpp`](src/typechecker/type_interner.hpp), [`type_interner.cpp`](src/typechecker/type_interner.cpp) | Pass 1: assigns a canonical `TypeId` to every type; deduplicates structural types. |
 | Type checker | [`src/typechecker/type_checker.hpp`](src/typechecker/type_checker.hpp), [`type_checker.cpp`](src/typechecker/type_checker.cpp) | Pass 2: expression type inference, assignment/call checks, overload resolution, generic inference, §5.2 interface verification. |
+| Codegen | [`src/codegen/codegen.hpp`](src/codegen/codegen.hpp), [`codegen.cpp`](src/codegen/codegen.cpp) | Back-end (§6.C): lowers a `TypedModule` to an LLVM IR module; emits `.ll` + `.obj`. Core lowering — see §6.C. |
 | Utilities | [`src/util/allocator.hpp`](src/util/allocator.hpp) (arena), [`pointers.hpp`](src/util/pointers.hpp) (`Required`/`Optional`), [`result.hpp`](src/util/result.hpp) (`Result`/`Status`), [`logger.hpp`](src/util/logger.hpp), [`overloaded.hpp`](src/util/overloaded.hpp) | Support code. |
 
 ### Key data structures
@@ -235,9 +259,8 @@ strict it is a spec question (§7), not a checker bug.
 (`rootIdentifier`) and reports an error when that root is an immutable reference/pointer
 (`Reference`/`Pointer` kind) or a `const` binding. `&var`/`*var` (`RefMut`/`PtrMut`) and
 `var` bindings are permitted. This also closes a D3 gap — `const v; v.x = …;` (an access
-chain, not a bare identifier) is now caught. Limitation: only the *root* of the chain is
-checked; an immutable reference *field* mid-chain (`r.immutRefField.x = …`) is not yet
-rejected.
+chain, not a bare identifier) is now caught. The mid-chain case
+(`r.immutRefField.x = …`) is **also** rejected — see item 20 below.
 
 *Reference/pointer expression typing — DONE (prerequisite for A6).* The `&` operator now
 yields `&T` and `new`/`move` yield `*T` (see the unary handler in
@@ -299,9 +322,10 @@ user-function-body execution with a call frame, member access / array indexing /
 built-in `.length()`, loop/branch control flow, and a step budget guarding
 non-terminating loops. A scalar result is substituted as a `ComptimeResultExpression`; an
 array or struct result is substituted as a synthesised `ArrayLiteralExpression` /
-`StructInitializerExpression`. **Limitations:** a comptime field/element cannot be mutated
-through a member/index assignment target; an empty-array result is rejected (no inferable
-element type).
+`StructInitializerExpression`. Comptime `p.a = …` / `arr[i] = …` mutation is supported
+(see item 23). One remaining limitation: an empty-array comptime result is rejected —
+the element type isn't recorded on `ComptimeValue` and can't be inferred from zero
+samples.
 
 **B4. Comptime sandboxing — DONE (the parts checkable now).** The pointer barrier (`&`,
 `new`, `move` are rejected inside a comptime expression; §6.2) and the `extern`-call
@@ -327,33 +351,69 @@ self-reference guard (a back-edge yields a shallow `#Type`).
 pass also walks `TypeDefinition`s; a type-position `#` is evaluated and the
 resulting `#Type` recorded as a `SynthType` ([`comptime.hpp`](src/comptime/comptime.hpp))
 in a map threaded into `intern()`. `internBaseType` turns a `SynthType` into a
-real `Struct`/`Enum` `TypeInfo`. **Limitations:** a synthesised type's member
-types must be primitives (a named/nested member type is reported and interns to
-`INVALID_TYPE_ID`); the strict §3.4 runtime-barrier diagnostic is partial — a
-`#Type` reaching genuine runtime value position is left unsubstituted rather
-than always diagnosed.
+real `Struct`/`Enum` `TypeInfo`. Synth member types accept primitives **and**
+user-defined named types (item 24). One residual limitation: the strict §3.4
+runtime-barrier diagnostic is partial — a `#Type` reaching genuine runtime value
+position is left unsubstituted rather than always diagnosed.
 
-### C. Back-end / code generation — entirely absent (largest effort)
+### C. Back-end / code generation — core lowering DONE; advanced items pending
 
-The pipeline ends at `TypedModule`. To produce running programs:
+The back-end ([`src/codegen/`](src/codegen/codegen.cpp)) lowers a `TypedModule` to an
+**LLVM IR module** via the LLVM 18 C++ API and emits a textual `.ll` listing plus a
+native `.obj`. The driver's `--build <file.alloy>` mode runs the full pipeline and links
+the object into an executable with `clang`. Build wiring: the project links the LLVM
+static libraries from `C:\LLVM` (a debug-CRT build — the Debug config therefore keeps
+`/MDd` + `_DEBUG`); only the X86 back-end is linked.
 
-**C1. Lowering / IR.** Choose an IR (custom, or target LLVM). Lower the typed AST.
+**C1. Lowering / IR — DONE.** LLVM was chosen as the IR. `codegen.cpp` walks the typed
+AST: type lowering (`TypeId` → `llvm::Type`), function declaration/definition, statement
+and expression lowering. Each function is `verifyFunction`-checked.
 
-**C2. Memory model codegen.** (§4.2) Managed heap pointers (`new`/`move` semantics),
-unmanaged references, slices as `{ptr, u64 len}` fat pointers, dynamically-sized arrays
-`*[T]` with the length metadata stored in a prefix block immediately *before* the data
-pointer (C-FFI-compatible layout).
+**C2. Memory model codegen — DONE.** Slices are `{ ptr, i64 }` fat pointers
+(`%alloy.slice`); references/pointers are opaque `ptr`; fixed arrays are `[N x T]`.
+`new <value>` lowers to `malloc` + store. `*[T]` dynamically-sized arrays implement the
+spec's length-prefix layout (§4.2): `new [v0, v1, ...]` allocates `8 + N*sizeof(T)`
+bytes, stashes `N` as `i64` at the base, and the user-facing pointer is the base + 8 (so
+`arr[i]` is a single GEP off the element pointer, C-FFI-compatible). `arr.length()`
+loads the `i64` 8 bytes BEFORE the user pointer. See `samples/dynarr.alloy`.
 
-**C3. Interface vtables.** Dynamic dispatch is *typed* but not *generated*. Each
-concrete-type/interface pair needs a vtable; `&I`/`*I` values are `{data ptr, vtable ptr}`
-fat pointers. Default implementations populate vtable slots not overridden by a
-type-specific extension.
+**C3. Interface vtables — DONE.** `&I`/`*I` lowers to a `{ data ptr, vtable ptr }`
+struct (`%alloy.iface`). For each interface `I` a per-method-name slot map and a struct
+type `%alloy.vt.I = { ptr, ptr, ... }` are built. For each concrete type T implementing
+`I`, an `alloy.vt.<T>.<I>` global is materialised lazily on first coercion site, holding
+one function pointer per interface method (type-specific extension wins over interface
+default). At a `&T → &I` coercion the back-end builds the fat pointer from `genAddr(T)`
+and the vtable global. Member calls on an interface-typed receiver load the vtable
+slot and call through it. Default impls (extension whose `self` is `&I`) populate slots
+where no type-specific override exists. See `samples/iface.alloy`.
 
-**C4. Generic monomorphisation.** Instantiate generic functions per concrete type set
-(`TypedModule::typeArgs` already records the bindings per call site).
+**C4. Generic monomorphisation — DONE.** A `Codegen::monoBindings` map (TypeParam
+TypeId → concrete TypeId) is set while lowering each instance and consulted at the leaf
+in `lowerType`, `canonical`, `isFloat`, `isSigned`, `isIndirection`, and `Codegen::exprType`
+(the cache is skipped while bindings are active). The `monomorphize()` pass walks
+`TypedModule::typeArgs`, deduplicates `(genericFn, bindings)` keys, and creates a
+distinct `llvm::Function` per binding set. At each call site `lookupCallee` returns the
+monomorphized instance and the call activates that call's bindings while emitting args
+(so a `&T` parameter materialises a temporary at the substituted concrete width). See
+`samples/generic.alloy`. Nested generic calls (a mono fn calling another generic) are
+now fully supported via lazy mono dedup + binding merging — see item 22.
 
-**C5. Extension-function & overload lowering**, `extern` FFI linkage, object/executable
-emission.
+**C5. Extension/overload lowering & FFI — DONE.** Overloaded and extension functions get
+unique mangled symbols (`alloy.<name>.<n>`); a member call passes the receiver as the
+implicit `self` argument. `extern` declarations lower to external `declare`s (variadic
+preserved), so C FFI (`printf`, `malloc`) links directly.
+
+**What is lowered (core scope):** primitives + arithmetic/comparison/bitwise/logical
+(short-circuit) operators, `if`/`while`/`for`/`match` (statement and value-yielding
+expression positions, via a break-target stack with a result slot), `break`/`return`,
+struct/enum/array/array-fill literals and field/index access, enum-variant construction
+and `match` on enums and integers (with payload captures), `for` over fixed arrays and
+slices, `convert`/`reinterpret`/`.length()` builtins, string literals (as `i8*` globals
+or `{ptr,len}` slices). An unsupported construct is reported as a diagnostic and skipped
+rather than aborting compilation.
+
+A worked example lives in [`samples/demo.alloy`](samples/demo.alloy); `AlloyCompiler.exe
+--build samples/demo.alloy` compiles, links and produces a runnable `build/demo.exe`.
 
 ### D. Module system & visibility
 
@@ -432,10 +492,9 @@ These should be clarified with the language designer before the affected code is
 2. **`extern` return type.** §5.3 prose says extern declarations "mandate concrete arrow
    return types", but the EBNF and the `examples/main.alloy` `extern printf(...);` make it
    optional. The parser follows the EBNF (optional).
-3. **Capture on payload-less enum variants.** §4.3 says a capture is valid only on variants
-   "containing attached data payloads". The checker currently only errors when the subject
-   is provably a non-enum; a capture on a known payload-less variant is not yet rejected
-   (deliberately lenient to avoid false positives while A1 is unimplemented).
+3. ~~**Capture on payload-less enum variants.**~~ **Resolved (item 21).** A
+   pattern capture on a known payload-less variant is now rejected with a
+   diagnostic naming the variant. Test: `tests/match_capture_payloadless.alloy`.
 
 ---
 
@@ -471,6 +530,56 @@ To verify a change:
 13. ~~**B1 + B4** — comptime interpreter + sandboxing.~~ **DONE.**
 14. ~~**B3 reflection** — the `#Type` reflection API (§3.4).~~ **DONE.**
 15. ~~**B3 type synthesis (5-6) + B2** — type-position comptime + user-defined macros.~~ **DONE.**
-16. **C1–C5** — back-end. The largest effort; everything above is a prerequisite for a
-    correct one. With B complete, the front-end (lex → parse → resolve → comptime → intern →
-    type-check) is feature-complete against the spec; C is the remaining major work.
+16. ~~**C1–C5** — full LLVM back-end: core lowering, memory model (incl. `*[T]`
+    length-prefix layout), interface vtables, generic monomorphisation, FFI.~~ **DONE.**
+17. ~~**Lambda codegen + indirect calls** — non-capturing lambdas lower to anonymous
+    `llvm::Function`s; identifier callees of Function type dispatch through a function
+    pointer. Function-type structural compatibility added to `isAssignable` so a
+    lambda value matches a parameter of the same `(T) -> R` shape.~~ **DONE.**
+18. ~~**Generic explicit-bind with untyped-literal args** — `unifyParam` now defers
+    untyped-literal resolution until after consulting pre-seeded bindings, so
+    `add<u64>(10, 20)` (cross-sign-class) compiles cleanly.~~ **DONE.**
+19. ~~**Capturing lambdas / closures**~~ **DONE.** A function value is a
+    `{ fn_ptr, env_ptr }` closure (`%alloy.closure`); `lowerType(Function)` returns
+    it everywhere. Every lambda body (capturing or not) takes a hidden `ptr env`
+    first parameter — non-capturing lambdas pass `null` and ignore it. Each
+    capturing lambda emits a per-lambda env struct (`%alloy.env.N`) that is
+    **heap-allocated** via `malloc` so closures survive past their creator's frame.
+    Captures: by-value copies the outer value into the env slot; by-reference
+    (`&`/`&var`/`*`/`*var`) stores a pointer to the outer storage which
+    `genAddr` for a capture identifier follows transparently. Indirect calls
+    extract `(fn, env)` and pass `env` as the call's first arg. Named functions
+    used as `(T) -> R` values wrap in a cached `(env, args) -> ret` thunk
+    (`alloy.thunk.N`) so the closure ABI is uniform. See `samples/closure.alloy`
+    and `samples/fnref.alloy`. *Limitation:* heap envs are not freed — leaks until
+    a real `move` / drop story exists.
+20. ~~**A6 mid-chain immutable ref / ptr field**~~ **DONE.** The assignment-statement
+    handler now walks every `.field` step BEFORE the target step and rejects a
+    write that goes THROUGH an immutable `&` / `*` field. Test:
+    `tests/mutate_through_immut_field.alloy`.
+21. ~~**§7.3 capture on payload-less variant**~~ **DONE.** A pattern capture on a
+    variant whose `EnumVariant::payloadType` is absent now reports an error
+    naming the variant. Test: `tests/match_capture_payloadless.alloy`.
+22. ~~**Nested generic monomorphisation**~~ **DONE.** Mono creation is now
+    deferred / lazy. `getOrCreateMono` keys by sorted (TypeParam→concrete)
+    bindings and queues a `MonoTask` for body lowering; `monomorphize()` seeds
+    one task per call site, and the back-end drains `pendingMonoTasks` in a
+    fix-point loop. Inside `genCall`, when the caller is itself a mono, each
+    callee binding value is walked through the caller's bindings; a different
+    resolved key spawns / reuses a fully-concrete inner mono (e.g.
+    `twice<i32>` calling `id<U>(x)` produces `id<i32>`, not `id<U>`). During
+    arg lowering the back-end merges caller + callee bindings so arg
+    expressions typed against the caller's TypeParams substitute correctly.
+    The typechecker's `satisfiesConstraint` now optimistically accepts a
+    `TypeParam` argument (constraint re-checked at instantiation) so a generic
+    body can bind one TypeParam to another. See `samples/nested_generic.alloy`.
+23. ~~**Comptime member / index assignment**~~ **DONE.** `execAssignment`
+    resolves a chained lvalue (`p.a = ...`, `arr[i] = ...`) by walking the
+    Member / Array access chain and pointing at the nested `ComptimeValue`
+    slot inside a struct/array stored in a comptime frame. Compound assignments
+    too. Test: `tests/comptime_struct_mutate.alloy`.
+24. ~~**Synth types with named-type members**~~ **DONE.** `internSynthType`
+    falls back to a `namedTypeIdByName` scan over the module's already-interned
+    `namedTypeIds` when a member's `typeName` is not a primitive — so a macro
+    can `add_member("inner", #Inner)` and emit a real nested struct. End-to-end
+    sample `samples/synth_nested.alloy`.

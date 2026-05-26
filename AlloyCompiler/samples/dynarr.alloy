@@ -1,0 +1,20 @@
+// *[T] dynamic-array demo — heap allocation with hidden length prefix at -8.
+
+extern printf(...);
+
+fn main() -> u32 {
+	var arr: *var [u32] = new [ 10, 20, 30, 40, 50 ];
+
+	printf("length = %llu\n", arr.length());
+
+	var i: u64 = 0;
+	while (i < arr.length()) {
+		printf("arr[%llu] = %u\n", i, arr[i]);
+		i += 1;
+	}
+
+	arr[2] = 999;
+	printf("after write: arr[2] = %u\n", arr[2]);
+
+	return 0;
+}

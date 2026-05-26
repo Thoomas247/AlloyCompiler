@@ -262,10 +262,13 @@ namespace
 				return;   // diagnostic already reported; leave the node unevaluated
 
 			// §3.4 — a '#Type' value exists only at compile time and is not a
-			// runtime value, so the node is left unsubstituted. A `#Type` is
-			// meaningful only within comptime evaluation (e.g. a `#struct_type()`
-			// bound to a local inside a `#`-evaluated function); rejecting its
-			// use in genuine runtime position is B3 5-6 (type synthesis).
+			// runtime value. The current walker visits every '#'-expression in
+			// the module, including helpers that only ever execute inside an
+			// outer comptime evaluation (e.g. a fn that returns a #Type and is
+			// always reached via `#fn()`). Reliably distinguishing those from
+			// genuine runtime-position uses needs reachability analysis the
+			// front-end doesn't yet do, so leave the node unsubstituted; an
+			// actual misuse will surface as a downstream type error.
 			if (v.tag == ComptimeValue::Tag::Type)
 				return;
 
@@ -1542,38 +1545,72 @@ namespace
 			}, stmt);
 		}
 
+		// Resolves a comptime lvalue: an Identifier rooted in a frame, optionally
+		// followed by .field / [index] steps. Returns a pointer to the live
+		// ComptimeValue slot the assignment should mutate, or nullptr on failure.
+		ComptimeValue* resolveLvalue(const AST::Expression& target)
+		{
+			if (auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&target))
+			{
+				const ResolvedDeclaration* decl = lookupSingle(idReq->value());
+				const void* key = nullptr;
+				if (decl)
+				{
+					if (auto* var = std::get_if<Required<AST::VariableDefinitionStatement>>(&decl->definition))
+						key = var->ptr();
+					else if (auto* p = std::get_if<Required<AST::FunctionParameter>>(&decl->definition))
+						key = p->ptr();
+				}
+				if (!key) return nullptr;
+				for (auto it = m_frames.rbegin(); it != m_frames.rend(); ++it)
+				{
+					auto fIt = it->find(key);
+					if (fIt != it->end()) return &fIt->second;
+				}
+				return nullptr;
+			}
+			if (auto* mReq = std::get_if<Required<AST::MemberAccessExpression>>(&target))
+			{
+				ComptimeValue* parent = resolveLvalue(mReq->value().object.value());
+				if (!parent || parent->tag != ComptimeValue::Tag::Struct) return nullptr;
+				std::string_view name = text(mReq->value().memberName);
+				for (auto& fld : parent->structFields)
+					if (fld.name == name) return &fld.value;
+				return nullptr;
+			}
+			if (auto* aReq = std::get_if<Required<AST::ArrayAccessExpression>>(&target))
+			{
+				ComptimeValue* parent = resolveLvalue(aReq->value().object.value());
+				if (!parent || parent->tag != ComptimeValue::Tag::Array) return nullptr;
+				ComptimeValue idx = eval(aReq->value().index.value());
+				if (stop() || !idx.isNumber()) return nullptr;
+				size_t i = static_cast<size_t>(idx.intVal);
+				if (i >= parent->arrayElems.size()) return nullptr;
+				return &parent->arrayElems[i];
+			}
+			return nullptr;
+		}
+
 		void execAssignment(const AST::AssignmentStatement& assign)
 		{
-			const auto* targetIdent = std::get_if<Required<AST::IdentifierExpression>>(&assign.target.value());
-			if (!targetIdent)
+			const AST::Expression& tgt = assign.target.value();
+			const bool isComplex =
+				std::holds_alternative<Required<AST::MemberAccessExpression>>(tgt) ||
+				std::holds_alternative<Required<AST::ArrayAccessExpression>>(tgt);
+			const auto* targetIdent = std::get_if<Required<AST::IdentifierExpression>>(&tgt);
+			if (!targetIdent && !isComplex)
 			{
-				fail(*m_currentHash, "A compile-time assignment target must be a simple variable.");
+				fail(*m_currentHash, "A compile-time assignment target must resolve to "
+					"a variable or one of its fields / elements.");
 				return;
 			}
 
-			const ResolvedDeclaration* decl = lookupSingle(targetIdent->value());
-			const void* key = nullptr;
-			if (decl)
+			ComptimeValue* slot = resolveLvalue(tgt);
+			if (!slot)
 			{
-				if (auto* var = std::get_if<Required<AST::VariableDefinitionStatement>>(&decl->definition))
-					key = var->ptr();
-				else if (auto* p = std::get_if<Required<AST::FunctionParameter>>(&decl->definition))
-					key = p->ptr();
-			}
-			if (!key)
-			{
-				fail(*identToken(targetIdent->value()), "Unresolved assignment target in compile-time code.");
-				return;
-			}
-
-			std::unordered_map<const void*, ComptimeValue>* frame = nullptr;
-			for (auto it = m_frames.rbegin(); it != m_frames.rend(); ++it)
-			{
-				if (it->count(key)) { frame = &*it; break; }
-			}
-			if (!frame)
-			{
-				fail(*identToken(targetIdent->value()), "Assignment to a non-comptime variable.");
+				const Token* loc = targetIdent ? identToken(targetIdent->value()) : m_currentHash;
+				fail(loc ? *loc : *m_currentHash,
+					"Unresolved assignment target in compile-time code.");
 				return;
 			}
 
@@ -1582,7 +1619,7 @@ namespace
 
 			if (assign.op == TokenKind::Assign)
 			{
-				(*frame)[key] = rhs;
+				*slot = std::move(rhs);
 				return;
 			}
 
@@ -1604,9 +1641,9 @@ namespace
 					fail(*m_currentHash, "Unsupported compile-time assignment operator.");
 					return;
 			}
-			ComptimeValue updated = applyBinary(arith, (*frame)[key], rhs);
+			ComptimeValue updated = applyBinary(arith, *slot, rhs);
 			if (stop()) return;
-			(*frame)[key] = updated;
+			*slot = std::move(updated);
 		}
 
 		// === Helpers ========================================================

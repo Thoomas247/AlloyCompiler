@@ -277,6 +277,32 @@ static TypeId primitiveTypeId(std::string_view name)
     return INVALID_TYPE_ID;
 }
 
+// Look up a named user-defined type by source-text name, scanning the
+// already-interned `result.namedTypeIds` table.
+static TypeId namedTypeIdByName(InternState& state, std::string_view name)
+{
+    for (const auto& [tok, id] : state.result.namedTypeIds)
+        if (state.getStringView(*tok) == name)
+            return id;
+    return INVALID_TYPE_ID;
+}
+
+// Resolve a synth member's typeName string to a TypeId — first a built-in
+// primitive, then a named user-defined type already interned in this module.
+static TypeId resolveSynthMemberType(InternState& state, std::string_view typeName,
+    std::string_view memberName, bool isVariant)
+{
+    TypeId t = primitiveTypeId(typeName);
+    if (t != INVALID_TYPE_ID) return t;
+    t = namedTypeIdByName(state, typeName);
+    if (t != INVALID_TYPE_ID) return t;
+    Log::error(isVariant
+        ? "Synthesised enum variant '{}' has an unknown payload type '{}'."
+        : "Synthesised struct member '{}' has an unknown type '{}'.",
+        memberName, typeName);
+    return INVALID_TYPE_ID;
+}
+
 static TypeId internSynthType(InternState& state, const SynthType& st)
 {
     if (st.isEnum)
@@ -286,13 +312,7 @@ static TypeId internSynthType(InternState& state, const SynthType& st)
         {
             std::optional<TypeId> payload;
             if (m.typeName != "void")
-            {
-                TypeId t = primitiveTypeId(m.typeName);
-                if (t == INVALID_TYPE_ID)
-                    Log::error("Synthesised enum variant '{}' has a non-primitive payload type "
-                        "'{}' (B3-5 supports primitive member types only).", m.name, m.typeName);
-                payload = t;
-            }
+                payload = resolveSynthMemberType(state, m.typeName, m.name, /*isVariant=*/true);
             data.variants.push_back({ std::string_view(m.name), payload });
         }
         TypeInfo info;
@@ -304,10 +324,7 @@ static TypeId internSynthType(InternState& state, const SynthType& st)
     TypeInfo::StructData data;
     for (const SynthType::Member& m : st.members)
     {
-        TypeId t = primitiveTypeId(m.typeName);
-        if (t == INVALID_TYPE_ID)
-            Log::error("Synthesised struct member '{}' has a non-primitive type "
-                "'{}' (B3-5 supports primitive member types only).", m.name, m.typeName);
+        TypeId t = resolveSynthMemberType(state, m.typeName, m.name, /*isVariant=*/false);
         data.members.push_back({ std::string_view(m.name), t });
     }
     TypeInfo info;

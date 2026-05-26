@@ -1,0 +1,28 @@
+// Capturing-lambda / closure demo.
+//   - by-value captures (no modifier)
+//   - by-reference capture (& modifier reads the outer var's current value)
+
+extern printf(...);
+
+fn run(f: () -> i32) -> i32 {
+	return f();
+}
+
+fn main() -> u32 {
+	var a: i32 = 100;
+	var b: i32 = 7;
+
+	// Two by-value captures: closure carries a snapshot of a and b.
+	const sum = run(| a, b | () -> i32 { return a + b; });
+	printf("by-value sum: %d\n", sum);
+
+	// One by-reference capture: closure reads a live.
+	const cur = run(| &a | () -> i32 { return a; });
+	printf("by-ref read: %d\n", cur);
+
+	a = 999;
+	const cur2 = run(| &a | () -> i32 { return a; });
+	printf("by-ref re-read after a=999: %d\n", cur2);
+
+	return 0;
+}

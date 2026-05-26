@@ -1,0 +1,17 @@
+// Named function used as a `(T) -> R` value — closure ABI requires a thunk
+// wrapper so the callee can extract a (fn, env) pair uniformly.
+
+extern printf(...);
+
+fn square(x: i32) -> i32 { return x * x; }
+fn cube(x: i32)   -> i32 { return x * x * x; }
+
+fn apply(f: (i32) -> i32, x: i32) -> i32 {
+	return f(x);
+}
+
+fn main() -> u32 {
+	printf("square(5) = %d\n", apply(square, 5));
+	printf("cube(3)   = %d\n", apply(cube,   3));
+	return 0;
+}

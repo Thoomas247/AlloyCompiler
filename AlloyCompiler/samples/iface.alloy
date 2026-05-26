@@ -1,0 +1,36 @@
+// Interface vtable / dynamic dispatch demo (§5.2).
+//   - Two concrete types (Circle, Square) implementing Shape.
+//   - A default impl shared via the interface (sides defaults to 0 for Circle).
+//   - Square overrides sides to return 4.
+
+extern printf(...);
+
+interface Shape {
+	fn area() -> f32;
+	fn sides() -> u32;
+}
+
+type Circle : Shape = struct { r: f32; };
+type Square : Shape = struct { s: f32; };
+
+fn area(self c: &Circle) -> f32 { return c.r * c.r; }
+fn area(self sq: &Square) -> f32 { return sq.s * sq.s; }
+
+// Default implementation of Shape::sides — applies to any implementer
+// that does not provide a type-specific override (Circle uses this).
+fn sides(self s: &Shape) -> u32 { return 0; }
+
+// Type-specific override on Square.
+fn sides(self sq: &Square) -> u32 { return 4; }
+
+fn describe(s: &Shape) {
+	printf("area=%.2f sides=%u\n", s.area(), s.sides());
+}
+
+fn main() -> u32 {
+	const c  = Circle { .r = 2.0 };
+	const sq = Square { .s = 3.0 };
+	describe(&c);
+	describe(&sq);
+	return 0;
+}

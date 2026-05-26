@@ -46,18 +46,26 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
-      <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <SDLCheck>false</SDLCheck>
+      <!-- The prebuilt LLVM libraries at C:\LLVM were built against the debug CRT
+           (/MDd, _ITERATOR_DEBUG_LEVEL=2). Keep the debug runtime so our objects
+           match their ABI (_CrtDbgReport / _calloc_dbg resolve cleanly). -->
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;__STDC_CONSTANT_MACROS;__STDC_FORMAT_MACROS;__STDC_LIMIT_MACROS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DisableLanguageExtensions>true</DisableLanguageExtensions>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <AdditionalIncludeDirectories>C:\LLVM\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>C:\LLVM\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>LLVMX86AsmParser.lib;LLVMX86CodeGen.lib;LLVMX86Desc.lib;LLVMX86Info.lib;LLVMMCDisassembler.lib;LLVMInstrumentation.lib;LLVMGlobalISel.lib;LLVMSelectionDAG.lib;LLVMCFGuard.lib;LLVMAsmPrinter.lib;LLVMCodeGen.lib;LLVMCGData.lib;LLVMTarget.lib;LLVMScalarOpts.lib;LLVMInstCombine.lib;LLVMAggressiveInstCombine.lib;LLVMObjCARCOpts.lib;LLVMTransformUtils.lib;LLVMCodeGenTypes.lib;LLVMBitWriter.lib;LLVMAnalysis.lib;LLVMProfileData.lib;LLVMSymbolize.lib;LLVMDebugInfoBTF.lib;LLVMDebugInfoPDB.lib;LLVMDebugInfoMSF.lib;LLVMDebugInfoDWARF.lib;LLVMDebugInfoDWARFLowLevel.lib;LLVMDWARFCFIChecker.lib;LLVMObject.lib;LLVMTextAPI.lib;LLVMMCParser.lib;LLVMIRReader.lib;LLVMAsmParser.lib;LLVMIRPrinter.lib;LLVMMC.lib;LLVMDebugInfoCodeView.lib;LLVMBitReader.lib;LLVMCore.lib;LLVMSandboxIR.lib;LLVMFrontendAtomic.lib;LLVMFrontendDirective.lib;LLVMRemarks.lib;LLVMBitstreamReader.lib;LLVMBinaryFormat.lib;LLVMTargetParser.lib;LLVMSupport.lib;LLVMDemangle.lib;psapi.lib;shell32.lib;ole32.lib;uuid.lib;advapi32.lib;ws2_32.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -86,6 +94,7 @@
     <ClCompile Include="src\comptime\comptime.cpp" />
     <ClCompile Include="src\typechecker\type_interner.cpp" />
     <ClCompile Include="src\typechecker\type_checker.cpp" />
+    <ClCompile Include="src\codegen\codegen.cpp" />
     <ClCompile Include="src\util\logger.hpp" />
     <ClCompile Include="src\parser\parser.cpp" />
     <ClCompile Include="src\source\source.cpp" />
@@ -102,6 +111,7 @@
     <ClInclude Include="src\typechecker\types.hpp" />
     <ClInclude Include="src\typechecker\type_interner.hpp" />
     <ClInclude Include="src\typechecker\type_checker.hpp" />
+    <ClInclude Include="src\codegen\codegen.hpp" />
     <ClInclude Include="src\util\allocator.hpp" />
     <ClInclude Include="src\util\overloaded.hpp" />
     <ClInclude Include="src\util\pointers.hpp" />

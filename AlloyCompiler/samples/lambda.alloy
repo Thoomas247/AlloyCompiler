@@ -1,0 +1,26 @@
+// Lambda / function-pointer demo. Non-capturing lambdas only — captured
+// closures aren't lowered yet.
+
+extern printf(...);
+
+fn apply(f: (i32) -> i32, x: i32) -> i32 {
+	return f(x);
+}
+
+fn compose(g: (i32) -> i32, h: (i32) -> i32, x: i32) -> i32 {
+	return g(h(x));
+}
+
+fn main() -> u32 {
+	const a = apply((x: i32) -> i32 { return x * 2; }, 21);
+	printf("apply double 21 = %d\n", a);
+
+	const b = compose(
+		(x: i32) -> i32 { return x + 1; },
+		(x: i32) -> i32 { return x * 10; },
+		4
+	);
+	printf("compose (+1)((*10)) 4 = %d\n", b);
+
+	return 0;
+}

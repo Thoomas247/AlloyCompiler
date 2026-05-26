@@ -1,0 +1,15 @@
+// §7.3: pattern capture on a payload-less enum variant is rejected.
+
+type Code = enum {
+	Ok;
+	Err;
+};
+
+fn classify(c: &Code) -> i32 {
+	match (c) {
+		Code::Ok  |v| { return 1; }   //@expect-error Pattern capture not allowed on payload-less variant 'Ok'
+		Code::Err     { return 2; }
+		else          { return 0; }
+	}
+	return 0;
+}
