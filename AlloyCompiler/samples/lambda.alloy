@@ -1,7 +1,7 @@
 // Lambda / function-pointer demo. Non-capturing lambdas only — captured
 // closures aren't lowered yet.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 fn apply(f: (i32) -> i32, x: i32) -> i32 {
 	return f(x);

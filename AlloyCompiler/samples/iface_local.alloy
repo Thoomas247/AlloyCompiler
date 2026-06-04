@@ -1,0 +1,26 @@
+// Regression: a local of interface-reference type (`const p: &Printer = ...`)
+// must store the {data, vtable} fat pointer, not a plain data pointer.
+extern printf(...) -> i32;
+
+interface Printer {
+	fn print();
+}
+
+fn print(self p: &Printer) { printf("Default printer\n"); }
+
+type SuccessPrinter : Printer = struct {};
+type ErrorPrinter   : Printer = struct {};
+
+fn print(self p: &SuccessPrinter) { printf("Success printer\n"); }
+
+fn main() -> u32 {
+	const success_printer = SuccessPrinter {};
+	success_printer.print();
+
+	const error_printer = ErrorPrinter {};
+	error_printer.print();
+
+	const p: &Printer = &error_printer;
+	p.print();
+	return 0;
+}

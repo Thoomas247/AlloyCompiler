@@ -1353,9 +1353,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				{
 					if (callTok)
 						state.logger.logErrorInRange(*callTok, *callTok,
-							"Ambiguous function call — multiple non-generic overloads match.");
+							"Ambiguous function call - multiple non-generic overloads match.");
 					else
-						Log::error("Ambiguous function call — multiple non-generic overloads match.");
+						Log::error("Ambiguous function call - multiple non-generic overloads match.");
 				}
 
 				const AST::Function* fn = getDeclFunction(*selected);
@@ -1427,9 +1427,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					{
 						if (callTok)
 							state.logger.logErrorInRange(*callTok, *callTok,
-								"Ambiguous function call — multiple generic overloads match.");
+								"Ambiguous function call - multiple generic overloads match.");
 						else
-							Log::error("Ambiguous function call — multiple generic overloads match.");
+							Log::error("Ambiguous function call - multiple generic overloads match.");
 					}
 
 					selected = genericMatches[0].first;

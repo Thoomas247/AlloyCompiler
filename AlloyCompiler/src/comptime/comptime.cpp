@@ -700,7 +700,13 @@ namespace
 				case ComptimeValue::Tag::Array:
 				{
 					if (v.arrayElems.empty())
-						return nullptr;   // element type cannot be inferred
+					{
+						// Empty arrays are not valid Alloy values — like C, every
+						// array has a fixed size and zero-element arrays are
+						// rejected.
+						fail(origin, "Empty arrays are not valid in Alloy; comptime expression produced []. Provide at least one element or guard the call site.");
+						return nullptr;
+					}
 					AST::ListBuilder<AST::Expression> elems;
 					for (const ComptimeValue& el : v.arrayElems)
 					{

@@ -1,6 +1,6 @@
 // *[T] dynamic-array demo — heap allocation with hidden length prefix at -8.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 fn main() -> u32 {
 	var arr: *var [u32] = new [ 10, 20, 30, 40, 50 ];

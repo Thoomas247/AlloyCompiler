@@ -1,6 +1,6 @@
 // Synth type with a named-type member — `#Inner` reflected into the env.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 type Inner = struct { v: i32; };
 

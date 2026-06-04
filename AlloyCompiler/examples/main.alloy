@@ -9,7 +9,7 @@
 		~ returns by reference
 */
 
-extern printf(...);
+extern printf(...) -> i32;
 
 type CharArray = [u8];
 

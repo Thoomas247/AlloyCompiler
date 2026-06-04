@@ -320,6 +320,11 @@ static Result<Required<AST::ArrayType>> parseArrayType(ParserState& state)
 		ERROR_IF_ERROR(status);
 
 		size = std::stoull(std::string(state.it.createView(sizeToken, sizeToken)));
+		if (size == 0)
+		{
+			state.logger.logErrorInRange(sizeToken, sizeToken, "Empty arrays are not valid in Alloy — array size must be at least 1. Use the slice type '[T]' if no fixed size is required.");
+			return { Error };
+		}
 	}
 
 	ERROR_IF_FALSE(state.it.consume<RBracket>("']' after array type"));
@@ -951,6 +956,19 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 			auto [sizeStatus, sizeToken] = state.it.consume<IntegerLiteral>("integral array size after ';'");
 			ERROR_IF_ERROR(sizeStatus);
 
+			{
+				std::string_view sizeView = state.it.createView(sizeToken, sizeToken);
+				size_t sz = 0;
+				for (char ch : sizeView)
+					if (ch >= '0' && ch <= '9')
+						sz = sz * 10 + static_cast<size_t>(ch - '0');
+				if (sz == 0)
+				{
+					state.logger.logErrorInRange(sizeToken, sizeToken, "Empty arrays are not valid in Alloy — array fill size must be at least 1.");
+					return { Error };
+				}
+			}
+
 			ERROR_IF_FALSE(state.it.consume<RBracket>("']' after array fill"));
 
 			return { Ok, state.allocator.allocate<AST::Expression>(
@@ -1484,15 +1502,15 @@ static Result<Required<AST::ExternDefinition>> parseExternDefinition(ParserState
 		return { Error };
 	}
 
-	// optional return type: extern f(...) -> Type;  (§5.3)
+	// §5.3 — return type is optional because Alloy has no 'void' keyword.
+	// When omitted, the extern is treated as returning nothing (the codegen
+	// backend lowers absent → void in the C ABI).
 	Optional<AST::Type> returnType;
 	if (state.it.peek().kind == Arrow)
 	{
 		state.it.consume<Arrow>();
-
 		auto [retStatus, retType] = parseType(state);
 		ERROR_IF_ERROR(retStatus);
-
 		returnType = retType.ptr();
 	}
 

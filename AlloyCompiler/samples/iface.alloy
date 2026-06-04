@@ -3,7 +3,7 @@
 //   - A default impl shared via the interface (sides defaults to 0 for Circle).
 //   - Square overrides sides to return 4.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 interface Shape {
 	fn area() -> f32;

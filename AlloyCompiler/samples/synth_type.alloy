@@ -1,7 +1,7 @@
 // Synthesized type — a macro builds a `#struct_type` and `type T = #macro()`
 // installs it. End-to-end through codegen.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 macro makePoint() {
 	var t = #struct_type();

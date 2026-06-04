@@ -1,7 +1,7 @@
 // Back-end demonstration program — exercises the core lowering path:
 // structs, extension functions, enums + match, loops, arrays, FFI.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 type Vec3 = struct {
 	x: i32;

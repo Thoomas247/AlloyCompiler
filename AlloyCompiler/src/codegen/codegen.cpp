@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -469,6 +470,29 @@ namespace
 		while (interned.get(inner).kind == TypeInfo::Kind::Named)
 			inner = interned.get(inner).asNamed().underlying;
 		return interned.get(inner).asSlice().elem;
+	}
+
+	// Emit a runtime bounds check: `idx (i64)` must satisfy 0 <= idx < len.
+	// On failure jump to a trap block which executes @llvm.trap and an
+	// unreachable terminator. Both idx and len are treated as i64 / unsigned.
+	// (Idx is sign-extended from whatever width the source expression used,
+	// so a negative index falls through to a very large unsigned compare and
+	// still trips the check.)
+	void emitBoundsCheck(Codegen& cg, llvm::Value* idx, llvm::Value* len)
+	{
+		if (!idx || !len) return;
+		llvm::Function* fn = cg.builder.GetInsertBlock()->getParent();
+		llvm::BasicBlock* ok   = llvm::BasicBlock::Create(cg.ctx, "bounds.ok",   fn);
+		llvm::BasicBlock* fail = llvm::BasicBlock::Create(cg.ctx, "bounds.fail", fn);
+		llvm::Value* idx64 = cg.builder.CreateIntCast(idx, cg.builder.getInt64Ty(), false, "idx.u64");
+		llvm::Value* len64 = cg.builder.CreateIntCast(len, cg.builder.getInt64Ty(), false, "len.u64");
+		llvm::Value* cmp = cg.builder.CreateICmpULT(idx64, len64, "bounds.cmp");
+		cg.builder.CreateCondBr(cmp, ok, fail);
+		cg.builder.SetInsertPoint(fail);
+		llvm::Function* trap = llvm::Intrinsic::getOrInsertDeclaration(cg.mod.get(), llvm::Intrinsic::trap);
+		cg.builder.CreateCall(trap);
+		cg.builder.CreateUnreachable();
+		cg.builder.SetInsertPoint(ok);
 	}
 
 	// --- C3: interface helpers ---------------------------------------------
@@ -1074,10 +1098,17 @@ namespace
 			idx = cg.builder.CreateIntCast(idx, cg.builder.getInt64Ty(), true, "idx");
 
 			// C2: *[T] dynamic array — index directly off the user-facing pointer.
+			// Length is stored as i64 at user_ptr - 8 (see genUnary 'new').
 			TypeId rawObj = rawTypeOf(cg, a.object.value());
 			if (isDynArr(cg.interned, rawObj))
 			{
 				llvm::Value* dataPtr = genAddr(cg, a.object.value());
+				// Debug bounds check.
+				llvm::Value* lenPtr = cg.builder.CreateGEP(cg.builder.getInt8Ty(),
+					dataPtr, { cg.builder.getInt64(-8) }, "dyn.len.ptr");
+				llvm::Value* len = cg.builder.CreateLoad(cg.builder.getInt64Ty(),
+					lenPtr, "dyn.len");
+				emitBoundsCheck(cg, idx, len);
 				TypeId elem = dynArrElemType(cg.interned, rawObj);
 				return cg.builder.CreateGEP(cg.lowerType(elem), dataPtr,
 					{ idx }, "dyn.elem");
@@ -1091,6 +1122,12 @@ namespace
 				if (!sliceAddr) return nullptr;
 				llvm::Value* dataPtr = cg.builder.CreateLoad(cg.builder.getPtrTy(),
 					cg.builder.CreateStructGEP(cg.getSliceTy(), sliceAddr, 0, "slice.ptr"));
+				// Debug bounds check using the slice length field.
+				llvm::Value* lenPtr = cg.builder.CreateStructGEP(cg.getSliceTy(),
+					sliceAddr, 1, "slice.len.ptr");
+				llvm::Value* len = cg.builder.CreateLoad(cg.builder.getInt64Ty(),
+					lenPtr, "slice.len");
+				emitBoundsCheck(cg, idx, len);
 				TypeId elem = cg.interned.get(objTy).asSlice().elem;
 				return cg.builder.CreateGEP(cg.lowerType(elem), dataPtr, { idx }, "elem");
 			}
@@ -1100,6 +1137,8 @@ namespace
 			if (objTy != INVALID_TYPE_ID && objTy < static_cast<TypeId>(cg.interned.table.size())
 				&& cg.interned.get(objTy).kind == TypeInfo::Kind::Array)
 			{
+				size_t sz = cg.interned.get(objTy).asArray().size;
+				emitBoundsCheck(cg, idx, cg.builder.getInt64(sz));
 				return cg.builder.CreateGEP(cg.lowerType(objTy), base,
 					{ cg.builder.getInt64(0), idx }, "elem");
 			}
@@ -2224,13 +2263,25 @@ namespace
 			if (storage == INVALID_TYPE_ID)
 				storage = cg.exprType(vd.value.value());
 
-			TypeId valueCtx = cg.isIndirection(storage)
-				? storage : cg.canonical(storage);
-			llvm::Value* init = genExpr(cg, vd.value.value(), valueCtx);
-
-			llvm::Type* slotTy = cg.isIndirection(storage)
-				? static_cast<llvm::Type*>(cg.builder.getPtrTy())
-				: cg.lowerType(storage);
+			const bool ifaceStore = isIfaceIndirection(cg.interned, storage);
+			llvm::Value* init = nullptr;
+			llvm::Type*  slotTy = nullptr;
+			if (ifaceStore)
+			{
+				// Coerce RHS into a { data, vtable } fat pointer using the
+				// interface's TypeId (the inner of the &I/*I storage).
+				init   = makeIfaceArg(cg, vd.value.value(), ifaceInner(cg.interned, storage));
+				slotTy = cg.getIfaceTy();
+			}
+			else
+			{
+				TypeId valueCtx = cg.isIndirection(storage)
+					? storage : cg.canonical(storage);
+				init = genExpr(cg, vd.value.value(), valueCtx);
+				slotTy = cg.isIndirection(storage)
+					? static_cast<llvm::Type*>(cg.builder.getPtrTy())
+					: cg.lowerType(storage);
+			}
 			llvm::Value* slot = cg.entryAlloca(slotTy, cg.tokenText(vd.name));
 
 			if (!cg.isIndirection(storage))
@@ -2252,8 +2303,16 @@ namespace
 				return;
 			}
 			TypeId tt = cg.exprType(as.target.value());
-			llvm::Value* rhs = genExpr(cg, as.value.value(), tt);
-			rhs = coerce(cg, rhs, cg.exprType(as.value.value()), tt);
+			llvm::Value* rhs = nullptr;
+			if (isIfaceIndirection(cg.interned, tt))
+			{
+				rhs = makeIfaceArg(cg, as.value.value(), ifaceInner(cg.interned, tt));
+			}
+			else
+			{
+				rhs = genExpr(cg, as.value.value(), tt);
+				rhs = coerce(cg, rhs, cg.exprType(as.value.value()), tt);
+			}
 
 			if (as.op != TokenKind::Assign)
 			{
@@ -2391,6 +2450,32 @@ namespace
 		return llvm::FunctionType::get(ret, params, false);
 	}
 
+	// §5.3 / FFI: lower a TypeId for an extern signature. Alloy references and
+	// pointers (&T / *T / &var T / *var T) map to a plain C pointer regardless
+	// of the inner type — the C ABI has only one notion of pointer. Slice and
+	// interface (fat-pointer) types cannot be represented by a single C
+	// pointer; we lower them as a plain pointer with a diagnostic so the
+	// programmer notices.
+	llvm::Type* lowerExternType(Codegen& cg, TypeId t, const char* role)
+	{
+		if (t == INVALID_TYPE_ID || t >= (TypeId)cg.interned.table.size())
+			return cg.builder.getInt32Ty();
+		const auto& info = cg.interned.get(t);
+		if (info.isIndirection())
+			return cg.builder.getPtrTy();
+		if (info.kind == TypeInfo::Kind::Slice)
+		{
+			cg.warn(std::string("extern ") + role + " cannot be a slice — C has no slice ABI; lowering as plain pointer");
+			return cg.builder.getPtrTy();
+		}
+		if (info.kind == TypeInfo::Kind::Interface)
+		{
+			cg.warn(std::string("extern ") + role + " cannot be an interface — C has no fat-pointer ABI; lowering as plain pointer");
+			return cg.builder.getPtrTy();
+		}
+		return cg.lowerType(t);
+	}
+
 	void declareExtern(Codegen& cg, const AST::ExternDefinition& ext)
 	{
 		std::string name(cg.tokenText(ext.name));
@@ -2401,14 +2486,16 @@ namespace
 			{
 				auto it = cg.interned.astTypes.find(&p.value().type.value());
 				TypeId t = it != cg.interned.astTypes.end() ? it->second : INVALID_TYPE_ID;
-				params.push_back(cg.lowerType(t));
+				params.push_back(lowerExternType(cg, t, "parameter"));
 			});
-		llvm::Type* ret = cg.builder.getInt32Ty();
+		// Alloy has no 'void' keyword, so absence of '-> T' on an extern
+		// means the C function returns nothing.
+		llvm::Type* ret = cg.builder.getVoidTy();
 		if (ext.returnType.hasValue())
 		{
 			auto it = cg.interned.astTypes.find(&ext.returnType.value());
 			if (it != cg.interned.astTypes.end())
-				ret = cg.lowerType(it->second);
+				ret = lowerExternType(cg, it->second, "return type");
 		}
 		auto* fty = llvm::FunctionType::get(ret, params, ext.isVariadic || params.empty());
 		auto* fn = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, *cg.mod);

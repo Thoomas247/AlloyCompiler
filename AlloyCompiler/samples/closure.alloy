@@ -2,7 +2,7 @@
 //   - by-value captures (no modifier)
 //   - by-reference capture (& modifier reads the outer var's current value)
 
-extern printf(...);
+extern printf(...) -> i32;
 
 fn run(f: () -> i32) -> i32 {
 	return f();

@@ -1,6 +1,6 @@
 // Generic monomorphisation demo — one `add<T>` definition, three concrete instances.
 
-extern printf(...);
+extern printf(...) -> i32;
 
 fn add<T: Number>(a: &T, b: &T) -> T {
 	return a + b;
