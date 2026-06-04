@@ -72,6 +72,7 @@ namespace AST
 	struct LambdaExpression;
 	struct BinaryExpression;
 	struct UnaryExpression;
+	struct IsExpression;
 	struct ComptimeExpression;
 	struct ComptimeResultExpression;
 
@@ -98,6 +99,7 @@ namespace AST
 		Required<LambdaExpression>,
 		Required<BinaryExpression>,
 		Required<UnaryExpression>,
+		Required<IsExpression>,
 		Required<ComptimeExpression>,
 		Required<ComptimeResultExpression>
 	>;
@@ -144,6 +146,7 @@ namespace AST
 	struct NamedType
 	{
 		Required<IdentifierExpression> name;
+		Optional<ListNode<Type>> typeArguments;   // generic instantiation: Foo<i32, u8>
 	};
 
 	struct StructType
@@ -322,6 +325,16 @@ namespace AST
 		Required<Expression> right;
 	};
 
+	// `<expr> is <NamedType>` — runtime concrete-type test on an interface
+	// object (§3.2). Evaluates to bool. When the test succeeds, an accompanying
+	// `if (… is T) |cap| { … }` capture binds `cap` to the downcasted reference.
+	struct IsExpression
+	{
+		Required<Expression> object;
+		Required<NamedType> testType;
+		const Token& isKeyword;   // 'is' token, for diagnostics
+	};
+
 	// comptime_expr = "#" postfix_expr
 	// '#' marks any value-yielding expression for compile-time evaluation (§6.1).
 	// A macro call is just a '#'-prefixed call whose callee resolves to a macro.
@@ -391,6 +404,7 @@ namespace AST
 	struct TypeDefinition
 	{
 		const Token& name;
+		Optional<ListNode<TypeParameter>> typeParameters;   // '<T, U: I>' generic parameters
 		Optional<ListNode<const Token*>> interfaces;   // ': I1, I2' interface markers
 		Required<BaseType> baseType;
 	};

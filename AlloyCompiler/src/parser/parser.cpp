@@ -232,7 +232,19 @@ static Result<Required<AST::NamedType>> parseNamedType(ParserState& state)
 {
 	auto [status, identifier] = parseIdentifierExpression(state);
 	ERROR_IF_ERROR(status);
-	return { Ok, state.allocator.allocate<AST::NamedType>(identifier) };
+
+	// Optional generic instantiation: Foo<T1, T2>. Unambiguous in type position.
+	Optional<AST::ListNode<AST::Type>> typeArgs;
+	if (state.it.peek().kind == Less)
+	{
+		state.it.consume<Less>();
+		auto [taStatus, taList] = commaSeparatedList<Greater, AST::Type>(state,
+			[](ParserState& state) -> Result<Required<AST::Type>> { return parseType(state); });
+		ERROR_IF_ERROR(taStatus);
+		typeArgs = taList;
+	}
+
+	return { Ok, state.allocator.allocate<AST::NamedType>(identifier, typeArgs) };
 }
 
 static Result<Required<AST::StructType>> parseStructType(ParserState& state)
@@ -1128,6 +1140,19 @@ static Result<Required<AST::Expression>> parseExpression(ParserState& state, int
 	auto [status, left] = parseUnaryExpression(state);
 	ERROR_IF_ERROR(status);
 
+	// `expr is Type` — interface-object concrete-type test (§3.2). Postfix
+	// binding tighter than every binary operator: it consumes a single
+	// NamedType from the input and yields a boolean expression.
+	while (state.it.peek().kind == Is)
+	{
+		const Token& isTok = state.it.peek();
+		state.it.consume<Is>();
+		auto [typeStatus, typeNode] = parseNamedType(state);
+		ERROR_IF_ERROR(typeStatus);
+		auto* isExpr = state.allocator.allocate<AST::IsExpression>(left, typeNode, isTok);
+		left = state.allocator.allocate<AST::Expression>(Required<AST::IsExpression>(isExpr));
+	}
+
 	while (true)
 	{
 		TokenKind op = state.it.peek().kind;
@@ -1378,6 +1403,32 @@ static Result<Required<AST::TypeDefinition>> parseTypeDefinition(ParserState& st
 	auto [status, typeNameToken] = state.it.consume<Identifier>("type name after 'type' keyword");
 	ERROR_IF_ERROR(status);
 
+	// optional type-parameter list: type Name<T, U: I> = ...
+	Optional<AST::ListNode<AST::TypeParameter>> typeParams;
+	if (state.it.peek().kind == Less)
+	{
+		state.it.consume<Less>();
+		auto [tpStatus, tpList] = commaSeparatedList<Greater, AST::TypeParameter>(
+			state,
+			[](ParserState& state) -> Result<Required<AST::TypeParameter>>
+			{
+				auto [nameStatus, nameToken] = state.it.consume<Identifier>("type parameter name");
+				ERROR_IF_ERROR(nameStatus);
+
+				Optional<Token> interface;
+				if (state.it.peek().kind == Colon)
+				{
+					state.it.consume<Colon>();
+					auto [ifStatus, ifToken] = state.it.consume<Identifier>("interface name after ':'");
+					ERROR_IF_ERROR(ifStatus);
+					interface = Optional(state.allocator.allocate<Token>(ifToken));
+				}
+				return { Ok, state.allocator.allocate<AST::TypeParameter>(nameToken, interface) };
+			});
+		ERROR_IF_ERROR(tpStatus);
+		typeParams = tpList;
+	}
+
 	// optional interface markers: type Name : I1, I2 = ...  (§2.1 type_def)
 	Optional<AST::ListNode<const Token*>> interfaces;
 	if (state.it.peek().kind == Colon)
@@ -1407,7 +1458,7 @@ static Result<Required<AST::TypeDefinition>> parseTypeDefinition(ParserState& st
 
 	ERROR_IF_FALSE(state.it.consume<Semicolon>("a semicolon after type definition"));
 
-	return { Ok, state.allocator.allocate<AST::TypeDefinition>(typeNameToken, interfaces, baseTypeResult.value) };
+	return { Ok, state.allocator.allocate<AST::TypeDefinition>(typeNameToken, typeParams, interfaces, baseTypeResult.value) };
 }
 
 static Result<Required<AST::FunctionDefinition>> parseFunctionDefinition(ParserState& state)

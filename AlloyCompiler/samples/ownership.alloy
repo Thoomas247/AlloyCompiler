@@ -1,0 +1,13 @@
+// §4.2 ownership: `*T` heap allocations are freed at scope end. `move p`
+// transfers ownership; the source slot is nulled out so it does not
+// double-free.
+extern printf(...) -> i32;
+
+fn main() -> u32 {
+	const p: *u32 = new 42;
+	printf("p = %u\n", p);
+	const arr: *[u32] = new [10, 20, 30];
+	printf("arr[0] = %u, arr[2] = %u\n", arr[0], arr[2]);
+	// p and arr freed automatically on return.
+	return 0;
+}

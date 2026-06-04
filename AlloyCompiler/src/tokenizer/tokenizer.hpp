@@ -53,6 +53,7 @@ enum class TokenKind
 	False,
 	Interface,
 	Macro,
+	Is,
 
 	LParen, RParen,
 	LBrace, RBrace,

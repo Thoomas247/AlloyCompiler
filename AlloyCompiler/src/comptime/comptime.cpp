@@ -239,6 +239,7 @@ namespace
 					rewriteExpr(e.value().right.value());
 				},
 				[&](Required<AST::UnaryExpression>& e) { rewriteExpr(e.value().expression.value()); },
+				[&](Required<AST::IsExpression>& e) { rewriteExpr(e.value().object.value()); },
 				[&](Required<AST::ComptimeExpression>&) {},   // handled above
 			}, expr);
 		}
@@ -347,6 +348,7 @@ namespace
 				[&](const Required<AST::LiteralExpression>& e)    { result = evalLiteral(e.value()); },
 				[&](const Required<AST::BinaryExpression>& e)     { result = evalBinary(e.value()); },
 				[&](const Required<AST::UnaryExpression>& e)      { result = evalUnary(e.value()); },
+				[&](const Required<AST::IsExpression>&)           { fail(*m_currentHash, "'is' operator is not supported in comptime expressions."); result = ComptimeValue::error(); },
 				[&](const Required<AST::IfExpression>& e)         { result = evalIf(e.value()); },
 				[&](const Required<AST::WhileExpression>& e)      { result = evalWhile(e.value()); },
 				[&](const Required<AST::MatchExpression>& e)      { result = evalMatch(e.value()); },

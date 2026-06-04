@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -100,6 +101,22 @@ namespace
 		// Local declaration node -> its stack slot (alloca) and declared storage type.
 		std::unordered_map<const void*, llvm::Value*> slots;
 		std::unordered_map<const void*, TypeId> slotStorage;
+		// Set of capture nodes whose slot holds a pointer that should be
+		// dereffed on access (downcast iface captures from `match` arms and
+		// `if (… is T) |c|` forms). Inhabitants behave like a ref binding.
+		std::unordered_set<const void*> ifaceCaptureDeref;
+
+		// §4.2 ownership — owning heap-pointer slots for the function being
+		// emitted. At every return path (explicit or fall-through) the back-
+		// end emits `free(p)` for each entry. `move <p>` stores null into
+		// the source slot, so a moved pointer doesn't double-free.
+		struct OwnedSlot
+		{
+			llvm::Value* slot;     // alloca holding the user-facing pointer
+			bool isDynArr;         // true for *[T] (header at user_ptr - 8)
+		};
+		std::vector<OwnedSlot> ownedSlots;
+		llvm::Function* freeFn = nullptr;
 
 		llvm::Function* currentFn = nullptr;
 		TypeId currentReturnType = INVALID_TYPE_ID;
@@ -109,10 +126,14 @@ namespace
 		int mangleCounter = 0;
 		int lambdaCounter = 0;
 
+		// Codegen options threaded from the driver (Debug vs Release etc.).
+		CodegenOptions options;
+
 		Codegen(const Source& src, const AST::Module& m, const ResolvedModule& r,
-			const InternedTypes& i, const TypedModule& t, const SymbolTable& s)
+			const InternedTypes& i, const TypedModule& t, const SymbolTable& s,
+			const CodegenOptions& opts)
 			: source(src), astModule(m), resolved(r), interned(i), typed(t), syms(s),
-			builder(ctx)
+			builder(ctx), options(opts)
 		{
 		}
 
@@ -472,6 +493,54 @@ namespace
 		return interned.get(inner).asSlice().elem;
 	}
 
+	// §4.2 debug — emit `if (p == null) @llvm.trap` after a `*T` load to
+	// catch use-after-move (`move` nulls the source slot). No-op in release.
+	llvm::Value* emitNullCheck(Codegen& cg, llvm::Value* p)
+	{
+		if (!cg.options.debug || !p) return p;
+		llvm::Function* fn = cg.builder.GetInsertBlock()->getParent();
+		llvm::BasicBlock* ok   = llvm::BasicBlock::Create(cg.ctx, "ptr.ok",   fn);
+		llvm::BasicBlock* fail = llvm::BasicBlock::Create(cg.ctx, "ptr.null", fn);
+		llvm::Value* isNull = cg.builder.CreateICmpEQ(p,
+			llvm::ConstantPointerNull::get(cg.builder.getPtrTy()), "ptr.null.cmp");
+		cg.builder.CreateCondBr(isNull, fail, ok);
+		cg.builder.SetInsertPoint(fail);
+		llvm::Function* trap = llvm::Intrinsic::getOrInsertDeclaration(
+			cg.mod.get(), llvm::Intrinsic::trap);
+		cg.builder.CreateCall(trap);
+		cg.builder.CreateUnreachable();
+		cg.builder.SetInsertPoint(ok);
+		return p;
+	}
+
+	// Lazy declare `void free(void* p)` and emit one call per owning slot
+	// recorded in `Codegen::ownedSlots`. Each slot stores the user-facing
+	// pointer; for dyn-array slots (*[T]), the malloc base is at user_ptr - 8
+	// (the length-prefix header). `free(NULL)` is a no-op so `move`-nulled
+	// slots are safe to release unconditionally.
+	void emitFreeAll(Codegen& cg)
+	{
+		if (cg.ownedSlots.empty()) return;
+		if (!cg.freeFn)
+		{
+			auto* fty = llvm::FunctionType::get(cg.builder.getVoidTy(),
+				{ cg.builder.getPtrTy() }, false);
+			cg.freeFn = llvm::Function::Create(fty,
+				llvm::Function::ExternalLinkage, "free", *cg.mod);
+		}
+		// Free in reverse declaration order (LIFO scope semantics).
+		for (auto it = cg.ownedSlots.rbegin(); it != cg.ownedSlots.rend(); ++it)
+		{
+			llvm::Value* p = cg.builder.CreateLoad(cg.builder.getPtrTy(),
+				it->slot, "own.load");
+			llvm::Value* base = p;
+			if (it->isDynArr)
+				base = cg.builder.CreateGEP(cg.builder.getInt8Ty(), p,
+					{ cg.builder.getInt64(-8) }, "own.base");
+			cg.builder.CreateCall(cg.freeFn, { base });
+		}
+	}
+
 	// Emit a runtime bounds check: `idx (i64)` must satisfy 0 <= idx < len.
 	// On failure jump to a trap block which executes @llvm.trap and an
 	// unreachable terminator. Both idx and len are treated as i64 / unsigned.
@@ -481,6 +550,9 @@ namespace
 	void emitBoundsCheck(Codegen& cg, llvm::Value* idx, llvm::Value* len)
 	{
 		if (!idx || !len) return;
+		// Release mode skips the runtime check entirely; the spec's "debug
+		// builds" qualifier (§4.2 array layout) becomes meaningful here.
+		if (!cg.options.debug) return;
 		llvm::Function* fn = cg.builder.GetInsertBlock()->getParent();
 		llvm::BasicBlock* ok   = llvm::BasicBlock::Create(cg.ctx, "bounds.ok",   fn);
 		llvm::BasicBlock* fail = llvm::BasicBlock::Create(cg.ctx, "bounds.fail", fn);
@@ -735,7 +807,8 @@ namespace
 		TypeId payloadType = INVALID_TYPE_ID;
 	};
 
-	VariantInfo classifyVariant(Codegen& cg, const AST::IdentifierExpression& ident)
+	VariantInfo classifyVariant(Codegen& cg, const AST::IdentifierExpression& ident,
+		TypeId fallbackEnumTy = INVALID_TYPE_ID)
 	{
 		VariantInfo vi;
 		const AST::ListNode<const Token*>* first = ident.path.ptr();
@@ -749,11 +822,31 @@ namespace
 		if (!td)
 			return vi;
 
+		TypeId namedId = INVALID_TYPE_ID;
 		auto namedIt = cg.interned.namedTypeIds.find(&td->value().name);
-		if (namedIt == cg.interned.namedTypeIds.end())
-			return vi;
+		if (namedIt != cg.interned.namedTypeIds.end())
+		{
+			namedId = namedIt->second;
+		}
+		else
+		{
+			// Generic enum: locate the mono instance via fallbackEnumTy (the
+			// call-expression's typed result type, or the var-annotation type).
+			TypeId ctx = fallbackEnumTy;
+			while (ctx != INVALID_TYPE_ID && ctx < static_cast<TypeId>(cg.interned.table.size())
+				&& cg.interned.get(ctx).isIndirection())
+				ctx = cg.interned.get(ctx).asIndirection().inner;
+			if (ctx != INVALID_TYPE_ID)
+			{
+				auto monoIt = cg.interned.monoSourceDef.find(ctx);
+				if (monoIt != cg.interned.monoSourceDef.end() && monoIt->second == &td->value())
+					namedId = ctx;
+			}
+			if (namedId == INVALID_TYPE_ID)
+				return vi;
+		}
 
-		TypeId underlying = cg.canonical(namedIt->second);
+		TypeId underlying = cg.canonical(namedId);
 		if (underlying == INVALID_TYPE_ID || underlying >= static_cast<TypeId>(cg.interned.table.size())
 			|| cg.interned.get(underlying).kind != TypeInfo::Kind::Enum)
 			return vi;
@@ -769,7 +862,7 @@ namespace
 			if (variants[i].name == variantName)
 			{
 				vi.isVariant = true;
-				vi.enumTypeId = namedIt->second;
+				vi.enumTypeId = namedId;
 				vi.enumUnderlying = underlying;
 				vi.tag = static_cast<int>(i);
 				vi.hasPayload = variants[i].payloadType.has_value();
@@ -1023,6 +1116,34 @@ namespace
 						agg, cg.builder.getInt64(bytes.size()), { 1 });
 					return agg;
 				}
+				// A8: a string literal is typed `&[u8]`. If the context is a
+				// reference / pointer to slice, materialise a private global
+				// slice header `{ ptr, len }` and return its address so the
+				// value semantics (length + data) survive an identifier
+				// deref. Without this, `var s = "yes";` stored only the raw
+				// bytes pointer and a later `s.length()` / `match (s)`
+				// loaded garbage from the string's bytes as the slice header.
+				TypeId ic = ctxType;
+				if (ic != INVALID_TYPE_ID && ic < (TypeId)cg.interned.table.size()
+					&& cg.interned.get(ic).isIndirection())
+				{
+					TypeId inner = cg.interned.get(ic).asIndirection().inner;
+					while (inner < (TypeId)cg.interned.table.size()
+						&& cg.interned.get(inner).kind == TypeInfo::Kind::Named)
+						inner = cg.interned.get(inner).asNamed().underlying;
+					if (inner < (TypeId)cg.interned.table.size()
+						&& cg.interned.get(inner).kind == TypeInfo::Kind::Slice)
+					{
+						llvm::Constant* sliceHdr = llvm::ConstantStruct::get(
+							cg.getSliceTy(),
+							{ llvm::cast<llvm::Constant>(strPtr),
+							  llvm::ConstantInt::get(cg.builder.getInt64Ty(), bytes.size()) });
+						auto* gv = new llvm::GlobalVariable(*cg.mod, cg.getSliceTy(), true,
+							llvm::GlobalValue::PrivateLinkage, sliceHdr, "alloy.str.slice");
+						gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+						return gv;
+					}
+				}
 				return strPtr;
 			}
 			default:
@@ -1060,6 +1181,10 @@ namespace
 					|| m == AST::Type::Modifier::Pointer
 					|| m == AST::Type::Modifier::PointerToMutable)
 					return cg.builder.CreateLoad(cg.builder.getPtrTy(), slot, "cap.deref");
+				// A match-arm or if-`is` capture: the slot holds the iface
+				// data pointer; deref to reach the concrete struct.
+				if (cg.ifaceCaptureDeref.count(&capReq->value()))
+					return cg.builder.CreateLoad(cg.builder.getPtrTy(), slot, "cap.is.deref");
 				return slot;
 			}
 			// C3: an interface-typed binding stores the { data, vtable } fat pointer
@@ -1067,7 +1192,16 @@ namespace
 			if (isIfaceIndirection(cg.interned, storage))
 				return slot;
 			if (cg.isIndirection(storage))
-				return cg.builder.CreateLoad(cg.builder.getPtrTy(), slot, "deref");
+			{
+				llvm::Value* p = cg.builder.CreateLoad(cg.builder.getPtrTy(), slot, "deref");
+				// §4.2 debug — null-check owning `*T`/`*[T]` accesses (a
+				// moved-from pointer is null; deref would otherwise segfault).
+				const auto& info = cg.interned.get(storage);
+				if (info.kind == TypeInfo::Kind::Pointer
+				 || info.kind == TypeInfo::Kind::PtrMut)
+					p = emitNullCheck(cg, p);
+				return p;
+			}
 			return slot;
 		}
 
@@ -1078,6 +1212,15 @@ namespace
 			if (!base)
 				return nullptr;
 			TypeId objTy = cg.canonical(cg.exprType(m.object.value()));
+			// Transparent dereference (§4.2): a reference / pointer to a
+			// struct accesses fields directly. Strip one indirection so
+			// e.g. `c.r` where `c: &Circle` finds the Circle struct.
+			if (objTy < (TypeId)cg.interned.table.size()
+				&& cg.interned.get(objTy).isIndirection())
+				objTy = cg.interned.get(objTy).asIndirection().inner;
+			while (objTy < (TypeId)cg.interned.table.size()
+				&& cg.interned.get(objTy).kind == TypeInfo::Kind::Named)
+				objTy = cg.interned.get(objTy).asNamed().underlying;
 			if (objTy == INVALID_TYPE_ID || objTy >= static_cast<TypeId>(cg.interned.table.size())
 				|| cg.interned.get(objTy).kind != TypeInfo::Kind::Struct)
 				return nullptr;
@@ -1298,7 +1441,9 @@ namespace
 		// Enum-variant construction: Enum::Variant( payload ).
 		if (auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&callee))
 		{
-			VariantInfo vi = classifyVariant(cg, idReq->value());
+			// Pass the call expression's typed result type so generic enums
+			// (which lack a namedTypeIds entry) resolve via monoSourceDef.
+			VariantInfo vi = classifyVariant(cg, idReq->value(), cg.exprType(self));
 			if (vi.isVariant)
 			{
 				llvm::Value* payload = nullptr;
@@ -1767,7 +1912,40 @@ namespace
 				return mem;
 			}
 			case K::Move:
-				return genExpr(cg, un.expression.value(), ctxType);
+			{
+				// §4.2 — `move p` transfers ownership of the heap allocation
+				// addressed by `p`. The expression's type is `*T`, so the
+				// result is the raw pointer (NOT the dereffed value `p` would
+				// normally yield via §4.2 transparent dereferencing). The
+				// source's binding slot is then overwritten with null so the
+				// scope-end frees do not double-free and, in debug, every
+				// later access of the moved-from binding traps.
+				llvm::Value* ptrVal = nullptr;
+				if (auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&un.expression.value()))
+				{
+					const ResolvedDeclaration* decl = cg.resolveIdent(idReq->value());
+					if (decl)
+					{
+						const void* key = cg.declKey(*decl);
+						auto sit = cg.slots.find(key);
+						if (sit != cg.slots.end())
+						{
+							ptrVal = cg.builder.CreateLoad(cg.builder.getPtrTy(),
+								sit->second, "move.src");
+							cg.builder.CreateStore(
+								llvm::ConstantPointerNull::get(cg.builder.getPtrTy()),
+								sit->second);
+						}
+					}
+				}
+				if (!ptrVal)
+				{
+					// Non-identifier operand (e.g. `move (expr)`): fall back to
+					// the dereffed value path. Cannot null a non-identifier.
+					ptrVal = genExpr(cg, un.expression.value(), ctxType);
+				}
+				return ptrVal;
+			}
 			case K::Minus:
 			{
 				TypeId t = cg.exprType(un.expression.value());
@@ -1814,8 +1992,11 @@ namespace
 
 		if (auto* p = std::get_if<Required<AST::IdentifierExpression>>(&e))
 		{
-			// payload-less enum variant used as a value
-			VariantInfo vi = classifyVariant(cg, p->value());
+			// payload-less enum variant used as a value. Pass typed result +
+			// context type so generic-enum monos (no namedTypeIds entry) resolve.
+			TypeId hint = cg.exprType(e);
+			if (hint == INVALID_TYPE_ID) hint = ctxType;
+			VariantInfo vi = classifyVariant(cg, p->value(), hint);
 			if (vi.isVariant && !vi.hasPayload)
 				return buildEnum(cg, vi, nullptr);
 
@@ -1872,6 +2053,58 @@ namespace
 
 		if (auto* p = std::get_if<Required<AST::UnaryExpression>>(&e))
 			return genUnary(cg, p->value(), ctxType);
+
+		if (auto* p = std::get_if<Required<AST::IsExpression>>(&e))
+		{
+			// `obj is T` — compare obj's vtable pointer (slot 1 of %alloy.iface)
+			// against the per-(T, I) vtable global. Returns i1.
+			const AST::IsExpression& ie = p->value();
+			TypeId objTy = cg.exprType(ie.object.value());
+			TypeId ifaceTypeId = objTy;
+			if (ifaceTypeId < (TypeId)cg.interned.table.size()
+				&& cg.interned.get(ifaceTypeId).isIndirection())
+				ifaceTypeId = cg.interned.get(ifaceTypeId).asIndirection().inner;
+			while (ifaceTypeId < (TypeId)cg.interned.table.size()
+				&& cg.interned.get(ifaceTypeId).kind == TypeInfo::Kind::Named)
+				ifaceTypeId = cg.interned.get(ifaceTypeId).asNamed().underlying;
+
+			// Load the existing %alloy.iface fat pointer rather than
+			// re-coercing — `makeIfaceArg` is for concrete→iface conversions,
+			// not for already-interface-typed operands.
+			llvm::Value* objVal = nullptr;
+			llvm::Value* addr = genAddr(cg, ie.object.value());
+			if (addr)
+				objVal = cg.builder.CreateLoad(cg.getIfaceTy(), addr, "obj.iface");
+			else
+				objVal = genExpr(cg, ie.object.value(), objTy);
+			llvm::Value* objVT  = cg.builder.CreateExtractValue(objVal, { 1 }, "obj.vt");
+
+			// Resolve testType TypeId from resolved.names → namedTypeIds.
+			TypeId concreteT = INVALID_TYPE_ID;
+			auto resIt = cg.resolved.names.find(&ie.testType.value().name.value());
+			if (resIt != cg.resolved.names.end() && !resIt->second.empty())
+			{
+				const ResolvedDeclaration* decl = resIt->second[0];
+				if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
+				{
+					auto nit = cg.interned.namedTypeIds.find(&td->value().name);
+					if (nit != cg.interned.namedTypeIds.end())
+						concreteT = nit->second;
+				}
+			}
+			if (concreteT == INVALID_TYPE_ID)
+			{
+				cg.warn("'is' RHS type unresolved");
+				return cg.builder.getInt1(false);
+			}
+			llvm::Constant* vt = getVtable(cg, concreteT, ifaceTypeId);
+			if (!vt)
+			{
+				cg.warn("'is' RHS type has no vtable for the LHS interface");
+				return cg.builder.getInt1(false);
+			}
+			return cg.builder.CreateICmpEQ(objVT, vt, "is.eq");
+		}
 
 		if (auto* p = std::get_if<Required<AST::FunctionCallExpression>>(&e))
 			return genCall(cg, p->value(), e);
@@ -1985,6 +2218,30 @@ namespace
 		cg.breakStack.push_back({ mergeBB, resultSlot, resultType });
 
 		cg.builder.SetInsertPoint(thenBB);
+
+		// `if (obj is Type) |c| { ... }` — bind `c` to the iface object's
+		// data pointer (already concretely typed: the test succeeded). The
+		// stored slot type matches a regular reference (a plain ptr).
+		if (ifx.capture.hasValue())
+		{
+			if (auto* isReq = std::get_if<Required<AST::IsExpression>>(&ifx.condition.value()))
+			{
+				const AST::IsExpression& ie = isReq->value();
+				llvm::Value* ifaceVal = nullptr;
+				llvm::Value* addr = genAddr(cg, ie.object.value());
+				if (addr)
+					ifaceVal = cg.builder.CreateLoad(cg.getIfaceTy(), addr, "is.cap.iface");
+				else
+					ifaceVal = genExpr(cg, ie.object.value(), cg.exprType(ie.object.value()));
+				llvm::Value* dataPtr = cg.builder.CreateExtractValue(ifaceVal, { 0 }, "is.cap.data");
+				llvm::Value* slot = cg.entryAlloca(cg.builder.getPtrTy(), "is.cap");
+				cg.builder.CreateStore(dataPtr, slot);
+				cg.slots[&ifx.capture.value()] = slot;
+				cg.slotStorage[&ifx.capture.value()] = cg.exprType(ie.object.value());
+				cg.ifaceCaptureDeref.insert(&ifx.capture.value());
+			}
+		}
+
 		genStatement(cg, ifx.thenBranch.value());
 		if (cg.blockOpen())
 			cg.builder.CreateBr(mergeBB);
@@ -2144,12 +2401,225 @@ namespace
 
 	void genMatch(Codegen& cg, const AST::MatchExpression& mx, llvm::Value* resultSlot, TypeId resultType)
 	{
-		TypeId subjTy = cg.canonical(cg.exprType(mx.subject.value()));
-		llvm::Value* subjVal = genExpr(cg, mx.subject.value(), cg.exprType(mx.subject.value()));
+		TypeId subjTyRaw = cg.exprType(mx.subject.value());
+		TypeId subjTy = cg.canonical(subjTyRaw);
+		llvm::Value* subjVal = genExpr(cg, mx.subject.value(), subjTyRaw);
 
 		const bool isEnum = subjTy != INVALID_TYPE_ID
 			&& subjTy < static_cast<TypeId>(cg.interned.table.size())
 			&& cg.interned.get(subjTy).kind == TypeInfo::Kind::Enum;
+
+		// §3.2 interface-object match — subject is `&I`/`*I`, arm patterns
+		// are concrete-type names. Lower as a chain of vtable comparisons.
+		TypeId ifaceSubjType = INVALID_TYPE_ID;
+		if (subjTy != INVALID_TYPE_ID && subjTy < (TypeId)cg.interned.table.size())
+		{
+			TypeId inner = subjTy;
+			if (cg.interned.get(inner).isIndirection())
+				inner = cg.interned.get(inner).asIndirection().inner;
+			while (inner < (TypeId)cg.interned.table.size()
+				&& cg.interned.get(inner).kind == TypeInfo::Kind::Named)
+				inner = cg.interned.get(inner).asNamed().underlying;
+			if (inner < (TypeId)cg.interned.table.size()
+				&& cg.interned.get(inner).kind == TypeInfo::Kind::Interface)
+				ifaceSubjType = inner;
+		}
+		if (ifaceSubjType != INVALID_TYPE_ID)
+		{
+			// subjVal here is the already-loaded %alloy.iface (the identifier
+			// dispatch follows iface storage). Extract vtable + data once.
+			llvm::Value* iv = subjVal;
+			if (iv->getType() != cg.getIfaceTy())
+			{
+				if (iv->getType() == cg.builder.getPtrTy())
+					iv = cg.builder.CreateLoad(cg.getIfaceTy(), iv, "subj.iface.load");
+				else
+				{
+					cg.warn("interface match subject is not a fat pointer");
+					return;
+				}
+			}
+			llvm::Value* subjData = cg.builder.CreateExtractValue(iv, { 0 }, "subj.data");
+			llvm::Value* subjVT   = cg.builder.CreateExtractValue(iv, { 1 }, "subj.vt");
+
+			llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(cg.ctx, "match.exit", cg.currentFn);
+			cg.breakStack.push_back({ exitBB, resultSlot, resultType });
+
+			const AST::Statement* elseArm = nullptr;
+			mx.arms.forEach([&](const Required<AST::MatchArm>& armReq)
+			{
+				const AST::MatchArm& arm = armReq.value();
+				if (!arm.pattern.hasValue()) { elseArm = &arm.body.value(); return; }
+				if (!cg.blockOpen()) return;
+
+				// Pattern must be an identifier resolving to a concrete type.
+				auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&arm.pattern.value());
+				if (!idReq) { cg.warn("interface match: unsupported pattern"); return; }
+
+				const ResolvedDeclaration* decl = cg.resolveIdent(idReq->value());
+				TypeId concreteT = INVALID_TYPE_ID;
+				if (decl)
+				{
+					if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
+					{
+						auto nit = cg.interned.namedTypeIds.find(&td->value().name);
+						if (nit != cg.interned.namedTypeIds.end())
+							concreteT = nit->second;
+					}
+				}
+				if (concreteT == INVALID_TYPE_ID) { cg.warn("interface match: unresolved concrete type"); return; }
+
+				llvm::Constant* vt = getVtable(cg, concreteT, ifaceSubjType);
+				if (!vt) { cg.warn("interface match: no vtable for arm type"); return; }
+
+				llvm::BasicBlock* armBB  = llvm::BasicBlock::Create(cg.ctx, "match.arm",  cg.currentFn);
+				llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(cg.ctx, "match.next", cg.currentFn);
+				llvm::Value* eq = cg.builder.CreateICmpEQ(subjVT, vt, "vt.eq");
+				cg.builder.CreateCondBr(eq, armBB, nextBB);
+
+				cg.builder.SetInsertPoint(armBB);
+				if (arm.capture.hasValue())
+				{
+					llvm::Value* slot = cg.entryAlloca(cg.builder.getPtrTy(), "iface.cap");
+					cg.builder.CreateStore(subjData, slot);
+					cg.slots[&arm.capture.value()] = slot;
+					cg.slotStorage[&arm.capture.value()] = subjTy;
+					cg.ifaceCaptureDeref.insert(&arm.capture.value());
+				}
+				genStatement(cg, arm.body.value());
+				if (cg.blockOpen())
+					cg.builder.CreateBr(exitBB);
+
+				cg.builder.SetInsertPoint(nextBB);
+			});
+
+			if (elseArm)
+				genStatement(cg, *elseArm);
+			if (cg.blockOpen())
+				cg.builder.CreateBr(exitBB);
+
+			cg.breakStack.pop_back();
+			cg.builder.SetInsertPoint(exitBB);
+
+			if (mx.externalElse.hasValue())
+				genStatement(cg, mx.externalElse.value());
+			return;
+		}
+
+		// §4.3 — a match subject may be a string, in which case patterns are
+		// string literals matched by length + byte compare. Detect this before
+		// the integer-switch path: the subject's *value* type (stripping one
+		// indirection) is `[u8]` (Slice of u8). subjVal at this point is the
+		// loaded `%alloy.slice` (see the string-literal handler / ref deref).
+		const bool isStringSubject = [&]()
+		{
+			TypeId t = subjTy;
+			if (t == INVALID_TYPE_ID || t >= (TypeId)cg.interned.table.size()) return false;
+			const auto& info = cg.interned.get(t);
+			TypeId inner = info.isIndirection() ? info.asIndirection().inner : t;
+			while (inner < (TypeId)cg.interned.table.size() && cg.interned.get(inner).kind == TypeInfo::Kind::Named)
+				inner = cg.interned.get(inner).asNamed().underlying;
+			if (inner >= (TypeId)cg.interned.table.size()) return false;
+			const auto& innerInfo = cg.interned.get(inner);
+			return innerInfo.kind == TypeInfo::Kind::Slice
+				&& innerInfo.asSlice().elem == TYPE_U8;
+		}();
+		if (isStringSubject)
+		{
+			// Pull data + length out of the subject slice.
+			if (subjVal->getType() != cg.getSliceTy())
+			{
+				// Subject may have come in as a ptr (reference to slice) — load it.
+				if (subjVal->getType() == cg.builder.getPtrTy())
+					subjVal = cg.builder.CreateLoad(cg.getSliceTy(), subjVal, "subj.slice");
+				else
+				{
+					cg.warn("string match subject is not a slice value");
+					return;
+				}
+			}
+			llvm::Value* subjPtr = cg.builder.CreateExtractValue(subjVal, { 0 }, "subj.ptr");
+			llvm::Value* subjLen = cg.builder.CreateExtractValue(subjVal, { 1 }, "subj.len");
+
+			// Lazy declare `int memcmp(const void*, const void*, size_t)`.
+			llvm::Function* memcmpFn = cg.mod->getFunction("memcmp");
+			if (!memcmpFn)
+			{
+				auto* fty = llvm::FunctionType::get(
+					cg.builder.getInt32Ty(),
+					{ cg.builder.getPtrTy(), cg.builder.getPtrTy(), cg.builder.getInt64Ty() },
+					false);
+				memcmpFn = llvm::Function::Create(fty,
+					llvm::Function::ExternalLinkage, "memcmp", *cg.mod);
+			}
+
+			llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(cg.ctx, "match.exit", cg.currentFn);
+			cg.breakStack.push_back({ exitBB, resultSlot, resultType });
+
+			const AST::Statement* elseArm = nullptr;
+			mx.arms.forEach([&](const Required<AST::MatchArm>& armReq)
+			{
+				const AST::MatchArm& arm = armReq.value();
+				if (!arm.pattern.hasValue()) { elseArm = &arm.body.value(); return; }
+				if (!cg.blockOpen()) return;
+
+				// Pattern must be a string literal — anything else is rejected.
+				auto* litReq = std::get_if<Required<AST::LiteralExpression>>(&arm.pattern.value());
+				if (!litReq || litReq->value().value.kind != TokenKind::StringLiteral)
+				{
+					cg.warn("non-string pattern in string match — arm skipped");
+					return;
+				}
+				if (arm.capture.hasValue())
+					cg.warn("pattern capture is not valid on a string match — ignored");
+
+				std::string raw = std::string(cg.tokenText(litReq->value().value));
+				// Strip surrounding quotes; decode escapes the same way the
+				// string-literal handler does.
+				std::string_view body = raw;
+				if (body.size() >= 2 && body.front() == '"' && body.back() == '"')
+					body = body.substr(1, body.size() - 2);
+				std::string bytes = decodeStringLiteral(body);
+				llvm::Constant* patPtr = cg.builder.CreateGlobalString(bytes, "str");
+				uint64_t patLen = bytes.size();
+
+				llvm::BasicBlock* armBB  = llvm::BasicBlock::Create(cg.ctx, "match.arm",  cg.currentFn);
+				llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(cg.ctx, "match.next", cg.currentFn);
+
+				// length compare → if !=, jump to next arm; if ==, memcmp.
+				llvm::Value* lenEq = cg.builder.CreateICmpEQ(subjLen,
+					cg.builder.getInt64(patLen), "len.eq");
+				llvm::BasicBlock* cmpBB = llvm::BasicBlock::Create(cg.ctx, "match.cmp", cg.currentFn);
+				cg.builder.CreateCondBr(lenEq, cmpBB, nextBB);
+
+				cg.builder.SetInsertPoint(cmpBB);
+				llvm::Value* cmp = cg.builder.CreateCall(memcmpFn,
+					{ subjPtr, patPtr, cg.builder.getInt64(patLen) }, "memcmp");
+				llvm::Value* eq = cg.builder.CreateICmpEQ(cmp,
+					cg.builder.getInt32(0), "mem.eq");
+				cg.builder.CreateCondBr(eq, armBB, nextBB);
+
+				cg.builder.SetInsertPoint(armBB);
+				genStatement(cg, arm.body.value());
+				if (cg.blockOpen())
+					cg.builder.CreateBr(exitBB);
+
+				cg.builder.SetInsertPoint(nextBB);
+			});
+
+			// Fall-through to the internal 'else' arm (or straight to exit).
+			if (elseArm)
+				genStatement(cg, *elseArm);
+			if (cg.blockOpen())
+				cg.builder.CreateBr(exitBB);
+
+			cg.breakStack.pop_back();
+			cg.builder.SetInsertPoint(exitBB);
+
+			if (mx.externalElse.hasValue())
+				genStatement(cg, mx.externalElse.value());
+			return;
+		}
 
 		// Materialise the subject so the payload area is addressable.
 		llvm::Value* subjSlot = cg.entryAlloca(subjVal->getType(), "match.subj");
@@ -2186,7 +2656,9 @@ namespace
 				VariantInfo vi;
 				if (auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&arm.pattern.value()))
 				{
-					vi = classifyVariant(cg, idReq->value());
+					// Pass subject's uncanonicalized type so generic-enum monos
+					// (no namedTypeIds entry) resolve via monoSourceDef.
+					vi = classifyVariant(cg, idReq->value(), subjTyRaw);
 					if (vi.isVariant)
 						caseVal = cg.builder.getInt32(static_cast<uint32_t>(vi.tag));
 				}
@@ -2290,6 +2762,19 @@ namespace
 
 			cg.slots[&vd] = slot;
 			cg.slotStorage[&vd] = storage;
+
+			// §4.2 ownership: a `*T`/`*[T]` binding owns its heap allocation
+			// and is freed at scope end. `*[T]` is the length-prefix layout —
+			// the malloc base sits at user_ptr - 8.
+			if (storage != INVALID_TYPE_ID && storage < (TypeId)cg.interned.table.size())
+			{
+				const auto& info = cg.interned.get(storage);
+				if (info.kind == TypeInfo::Kind::Pointer
+				 || info.kind == TypeInfo::Kind::PtrMut)
+				{
+					cg.ownedSlots.push_back({ slot, isDynArr(cg.interned, storage) });
+				}
+			}
 			return;
 		}
 
@@ -2406,15 +2891,18 @@ namespace
 			{
 				llvm::Value* v = genExpr(cg, p->value().value.value(), cg.currentReturnType);
 				v = coerce(cg, v, cg.exprType(p->value().value.value()), cg.currentReturnType);
+				emitFreeAll(cg);
 				cg.builder.CreateRet(v);
 			}
 			else if (p->value().value.hasValue())
 			{
 				genExpr(cg, p->value().value.value(), INVALID_TYPE_ID);
+				emitFreeAll(cg);
 				cg.builder.CreateRetVoid();
 			}
 			else
 			{
+				emitFreeAll(cg);
 				cg.builder.CreateRetVoid();
 			}
 			return;
@@ -2529,12 +3017,14 @@ namespace
 		// or two instances of the same generic) doesn't trample shared maps.
 		auto savedSlots = std::move(cg.slots);
 		auto savedStorage = std::move(cg.slotStorage);
+		auto savedOwned = std::move(cg.ownedSlots);
 		auto* savedFn = cg.currentFn;
 		TypeId savedRet = cg.currentReturnType;
 		const auto* savedBindings = cg.currentMonoBindings;
 		llvm::BasicBlock* savedBB = cg.builder.GetInsertBlock();
 		cg.slots.clear();
 		cg.slotStorage.clear();
+		cg.ownedSlots.clear();
 
 		cg.currentMonoBindings = bindings;
 		cg.currentFn = lfn;
@@ -2569,6 +3059,7 @@ namespace
 
 		if (cg.blockOpen())
 		{
+			emitFreeAll(cg);
 			if (lfn->getReturnType()->isVoidTy())
 				cg.builder.CreateRetVoid();
 			else
@@ -2586,6 +3077,7 @@ namespace
 		cg.currentMonoBindings = savedBindings;
 		cg.slots = std::move(savedSlots);
 		cg.slotStorage = std::move(savedStorage);
+		cg.ownedSlots = std::move(savedOwned);
 		if (savedBB) cg.builder.SetInsertPoint(savedBB);
 	}
 
@@ -2622,6 +3114,7 @@ namespace
 	{
 		auto savedSlots = std::move(cg.slots);
 		auto savedStorage = std::move(cg.slotStorage);
+		auto savedOwned = std::move(cg.ownedSlots);
 		auto* savedFn = cg.currentFn;
 		TypeId savedRet = cg.currentReturnType;
 		const auto* savedBindings = cg.currentMonoBindings;
@@ -2629,6 +3122,7 @@ namespace
 
 		cg.slots.clear();
 		cg.slotStorage.clear();
+		cg.ownedSlots.clear();
 		cg.currentFn = lfn;
 
 		const AST::Function& fn = lambda.function.value();
@@ -2678,6 +3172,7 @@ namespace
 
 		if (cg.blockOpen())
 		{
+			emitFreeAll(cg);
 			if (lfn->getReturnType()->isVoidTy())
 				cg.builder.CreateRetVoid();
 			else
@@ -2694,6 +3189,7 @@ namespace
 		cg.currentMonoBindings = savedBindings;
 		cg.slots = std::move(savedSlots);
 		cg.slotStorage = std::move(savedStorage);
+		cg.ownedSlots = std::move(savedOwned);
 		if (savedBB) cg.builder.SetInsertPoint(savedBB);
 	}
 
@@ -2970,9 +3466,10 @@ Status codegen(
 	const InternedTypes& interned,
 	const TypedModule& typed,
 	const SymbolTable& moduleSymbols,
-	const std::string& outBasePath)
+	const std::string& outBasePath,
+	const CodegenOptions& options)
 {
-	Codegen cg(source, module, resolved, interned, typed, moduleSymbols);
+	Codegen cg(source, module, resolved, interned, typed, moduleSymbols, options);
 
 	// --- target setup -------------------------------------------------------
 	// Only the X86 back-end is linked (see the project's LLVM library list).

@@ -1,0 +1,20 @@
+extern printf(...) -> i32;
+
+fn classify(s: &[u8]) -> u32 {
+	match (s) {
+		"yes"   { printf("yes\n");   break 1; }
+		"no"    { printf("no\n");    break 2; }
+		"maybe" { printf("maybe\n"); break 3; }
+		else    { printf("other\n"); break 0; }
+	}
+	return 0;
+}
+
+fn main() -> u32 {
+	const a = classify("yes");
+	const b = classify("no");
+	const c = classify("maybe");
+	const d = classify("idk");
+	printf("a=%u b=%u c=%u d=%u\n", a, b, c, d);
+	return 0;
+}

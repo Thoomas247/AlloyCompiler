@@ -24,6 +24,13 @@
  *
  * Requires the output of intern() + typeCheck(). All inputs must outlive the call.
  */
+struct CodegenOptions
+{
+	// Debug mode emits runtime bounds checks on every `[]` access.
+	// Release mode skips them (caller is responsible for staying in bounds).
+	bool debug = true;
+};
+
 Status codegen(
 	const Source& source,
 	const AST::Module& module,
@@ -31,4 +38,5 @@ Status codegen(
 	const InternedTypes& interned,
 	const TypedModule& typed,
 	const SymbolTable& moduleSymbols,
-	const std::string& outBasePath);
+	const std::string& outBasePath,
+	const CodegenOptions& options = {});

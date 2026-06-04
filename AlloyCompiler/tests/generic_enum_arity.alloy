@@ -1,0 +1,10 @@
+// Negative: generic type used with wrong arity.
+type Pair<A, B> = struct {
+	first: A;
+	second: B;
+};
+
+fn main() -> u32 {
+	var p: Pair<u32> = Pair<u32> { .first = 1, .second = 2 };  //@expect-error expects 2 type argument
+	return 0;
+}

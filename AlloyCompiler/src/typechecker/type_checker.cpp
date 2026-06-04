@@ -645,7 +645,11 @@ struct EnumVariantInfo
 };
 
 // A1: classify a qualified identifier (A::B) as an enum-variant access.
-static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::IdentifierExpression& ident)
+// `contextType` is used to disambiguate generic enums (Option::Some with no
+// explicit type-args): if the call context expects e.g. Option<u32>, that mono
+// instance is used and T is substituted in the payload.
+static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::IdentifierExpression& ident,
+	TypeId contextType = INVALID_TYPE_ID)
 {
 	EnumVariantInfo result;
 
@@ -661,12 +665,36 @@ static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::Identifi
 	if (!typeDefReq)
 		return result;
 
+	TypeId namedId = INVALID_TYPE_ID;
 	auto namedIt = state.interned.namedTypeIds.find(&typeDefReq->value().name);
-	if (namedIt == state.interned.namedTypeIds.end())
+	if (namedIt != state.interned.namedTypeIds.end())
+	{
+		namedId = namedIt->second;
+	}
+	else if (typeDefReq->value().typeParameters.hasValue())
+	{
+		// Generic enum — find the mono instance whose source def matches.
+		// Strip indirection from contextType so `var x: Option<u32> = Option::Some(5);` works.
+		TypeId ctx = contextType;
+		while (ctx != INVALID_TYPE_ID && ctx < static_cast<TypeId>(state.interned.table.size())
+			&& state.interned.get(ctx).isIndirection())
+			ctx = state.interned.get(ctx).asIndirection().inner;
+		if (ctx != INVALID_TYPE_ID)
+		{
+			auto monoIt = state.interned.monoSourceDef.find(ctx);
+			if (monoIt != state.interned.monoSourceDef.end() && monoIt->second == &typeDefReq->value())
+				namedId = ctx;
+		}
+		if (namedId == INVALID_TYPE_ID)
+			return result;
+	}
+	else
+	{
 		return result;
+	}
 
 	// unwrap the Named chain to the underlying type
-	TypeId cur = namedIt->second;
+	TypeId cur = namedId;
 	while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size())
 		&& state.interned.get(cur).kind == TypeInfo::Kind::Named)
 		cur = state.interned.get(cur).asNamed().underlying;
@@ -675,7 +703,7 @@ static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::Identifi
 		|| state.interned.get(cur).kind != TypeInfo::Kind::Enum)
 		return result;   // first segment is a type, but not an enum
 
-	result.enumTypeId = namedIt->second;
+	result.enumTypeId = namedId;
 
 	// the last path segment names the variant
 	const AST::ListNode<const Token*>* node = first;
@@ -922,7 +950,7 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				// variant referenced without an argument list is incomplete and is
 				// left untyped (lenient — see §7.3 of the spec).
 				{
-					EnumVariantInfo ev = resolveEnumVariant(state, ident.value());
+					EnumVariantInfo ev = resolveEnumVariant(state, ident.value(), contextType);
 					if (ev.enumTypeId != INVALID_TYPE_ID && ev.variantFound && !ev.hasPayload)
 						resultType = ev.enumTypeId;
 				}
@@ -1006,6 +1034,70 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			}
 		},
 
+		// `expr is Type` — interface-object concrete-type test (§3.2). Result type is bool.
+		// Validate that the object is an interface object and that Type is a concrete
+		// type implementing the interface.
+		[&](const Required<AST::IsExpression>& isExpr)
+		{
+			TypeId objTy = checkExpression(state, isExpr.value().object.value(), scope);
+			resultType = TYPE_BOOL;
+
+			// Find the test type's TypeId via the resolved name.
+			TypeId testTy = INVALID_TYPE_ID;
+			auto resIt = state.resolved.names.find(&isExpr.value().testType.value().name.value());
+			if (resIt != state.resolved.names.end() && !resIt->second.empty())
+			{
+				const ResolvedDeclaration* decl = resIt->second[0];
+				if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
+				{
+					auto nit = state.interned.namedTypeIds.find(&td->value().name);
+					if (nit != state.interned.namedTypeIds.end())
+						testTy = nit->second;
+				}
+			}
+
+			const Token& isTok = isExpr.value().isKeyword;
+			if (objTy == INVALID_TYPE_ID) return;
+
+			// LHS must be an interface object (indirection to Interface).
+			TypeId objInner = objTy;
+			if (objInner < (TypeId)state.interned.table.size()
+				&& state.interned.get(objInner).isIndirection())
+				objInner = state.interned.get(objInner).asIndirection().inner;
+			while (objInner < (TypeId)state.interned.table.size()
+				&& state.interned.get(objInner).kind == TypeInfo::Kind::Named)
+				objInner = state.interned.get(objInner).asNamed().underlying;
+
+			const bool lhsIsIface = objInner < (TypeId)state.interned.table.size()
+				&& state.interned.get(objInner).kind == TypeInfo::Kind::Interface;
+			if (!lhsIsIface)
+			{
+				state.logger.logErrorInRange(isTok, isTok,
+					"'is' operator: left operand must be an interface object (&I/*I).");
+				return;
+			}
+
+			if (testTy == INVALID_TYPE_ID)
+			{
+				// Resolver should have reported the unknown name.
+				return;
+			}
+
+			// Test type must implement the interface (objInner is the interface TypeId).
+			auto implIt = state.interned.implementedInterfaces.find(testTy);
+			bool implements = false;
+			if (implIt != state.interned.implementedInterfaces.end())
+			{
+				for (TypeId iface : implIt->second)
+					if (iface == objInner) { implements = true; break; }
+			}
+			if (!implements)
+			{
+				state.logger.logErrorInRange(isTok, isTok,
+					"'is' operator: the right-hand type does not implement the left-hand interface.");
+			}
+		},
+
 		// binary
 		[&](const Required<AST::BinaryExpression>& binary)
 		{
@@ -1061,8 +1153,12 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			TypeId objType = checkExpression(state, access.value().object.value(), scope);
 			if (objType == INVALID_TYPE_ID || objType >= static_cast<TypeId>(state.interned.table.size())) return;
 
-			// Unwrap Named types.
+			// Transparent dereference (§4.2): a `&T`/`*T` accesses fields
+			// directly on the pointee — strip one indirection.
 			TypeId cur = objType;
+			if (state.interned.get(cur).isIndirection())
+				cur = state.interned.get(cur).asIndirection().inner;
+			// Unwrap Named types.
 			while (state.interned.get(cur).kind == TypeInfo::Kind::Named)
 				cur = state.interned.get(cur).asNamed().underlying;
 
@@ -1103,7 +1199,7 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			// type and check the argument against the variant payload type.
 			if (auto* enumIdent = std::get_if<Required<AST::IdentifierExpression>>(&calleeExpr))
 			{
-				EnumVariantInfo ev = resolveEnumVariant(state, enumIdent->value());
+				EnumVariantInfo ev = resolveEnumVariant(state, enumIdent->value(), contextType);
 				if (ev.enumTypeId != INVALID_TYPE_ID)
 				{
 					const Token& loc = *ev.variantToken;
@@ -1133,7 +1229,7 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 							// untyped literals inside it concretise correctly.
 							TypeId payloadArg = checkExpression(state, *firstArg, scope, ev.payloadType);
 							if (payloadArg != INVALID_TYPE_ID &&
-								!isAssignable(resolveUntypedLiteral(payloadArg), ev.payloadType, state.interned))
+								!isAssignable(payloadArg, ev.payloadType, state.interned))
 							{
 								state.logger.logErrorInRange(loc, loc,
 									"Enum variant '{}' payload type mismatch.", variantName);
@@ -1288,6 +1384,37 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			}
 
 			if (candidates.empty()) return;
+
+			// If the identifier-callee resolved to a value binding (parameter,
+			// local var, capture) of Function type, treat the call as an
+			// indirect call and use the function type's return — same path as
+			// a lambda/expression callee. This keeps function-typed parameters
+			// (e.g. `fn call(func: () -> u64)` calling `func()`) callable
+			// without spuriously firing the no-matching-overload diagnostic.
+			{
+				bool allValueBindings = !candidates.empty();
+				for (const auto* d : candidates)
+				{
+					if (!std::holds_alternative<Required<AST::FunctionParameter>>(d->definition)
+					 && !std::holds_alternative<Required<AST::VariableDefinitionStatement>>(d->definition)
+					 && !std::holds_alternative<Required<AST::Capture>>(d->definition))
+					{
+						allValueBindings = false;
+						break;
+					}
+				}
+				if (allValueBindings)
+				{
+					TypeId calleeType = checkExpression(state, calleeExpr, scope);
+					if (calleeType != INVALID_TYPE_ID)
+					{
+						const TypeInfo& info = state.interned.get(calleeType);
+						if (info.kind == TypeInfo::Kind::Function)
+							resultType = info.asFunction().ret.value_or(INVALID_TYPE_ID);
+					}
+					return;
+				}
+			}
 
 			// Split generic / non-generic.
 			std::vector<const ResolvedDeclaration*> nonGeneric, generic;
@@ -1464,6 +1591,23 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 
 			if (selected)
 				state.result.selectedOverloads[&call.value()] = selected;
+			else if (!candidates.empty() && callTok)
+			{
+				// Candidates existed by name (and self-type for member calls)
+				// but neither the non-generic exact-match sweep nor the generic
+				// inference accepted the argument types. Report a located
+				// diagnostic naming the callee. (We deliberately stay silent
+				// when `candidates` is empty — that case is "undefined name"
+				// territory and is already reported elsewhere.)
+				if (!generic.empty())
+					state.logger.logErrorInRange(*callTok, *callTok,
+						"No matching overload for '{}': none of the {} candidate(s) satisfied the argument types (generic constraint or unification failed).",
+						state.getStringView(*callTok), candidates.size());
+				else
+					state.logger.logErrorInRange(*callTok, *callTok,
+						"No matching overload for '{}': none of the {} candidate(s) accepted the argument types.",
+						state.getStringView(*callTok), candidates.size());
+			}
 
 			// A9: §5.2 item 3 — a method whose `self` receiver is a mutable
 			// indirection (&var/*var) cannot be invoked on an immutable receiver.
@@ -1723,11 +1867,46 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			std::vector<TypeId>* prevCollector = state.breakCollector;
 			state.breakCollector = &breaks;
 
-			// B4: if a capture is present, bind it to the condition's value type
+			// B4: if a capture is present, bind it to the condition's value type.
+			// Special case (§3.2): when the condition is `obj is Type`, the
+			// capture binds the *downcasted* reference — same indirection kind
+			// as the subject (so `&Shape` → `&Concrete`).
 			if (ifExpr.value().capture.hasValue())
 			{
 				ScopedVarMap ifScope{ scope };
-				ifScope.captures[&ifExpr.value().capture.value()] = condType;
+				TypeId capTy = condType;
+				if (auto* isReq = std::get_if<Required<AST::IsExpression>>(&ifExpr.value().condition.value()))
+				{
+					const AST::IsExpression& ie = isReq->value();
+					TypeId objTy = checkExpression(state, ie.object.value(), scope);
+					// Find the concrete TypeId via resolved.names.
+					TypeId concreteT = INVALID_TYPE_ID;
+					auto rIt = state.resolved.names.find(&ie.testType.value().name.value());
+					if (rIt != state.resolved.names.end() && !rIt->second.empty())
+					{
+						const ResolvedDeclaration* decl = rIt->second[0];
+						if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
+						{
+							auto nit = state.interned.namedTypeIds.find(&td->value().name);
+							if (nit != state.interned.namedTypeIds.end())
+								concreteT = nit->second;
+						}
+					}
+					// Subject indirection wraps the concrete: &Shape → &Concrete.
+					// If subject was already stripped to bare Interface, default
+					// to immutable Reference.
+					if (concreteT != INVALID_TYPE_ID
+						&& objTy < (TypeId)state.interned.table.size())
+					{
+						TypeInfo wrap;
+						wrap.kind = state.interned.get(objTy).isIndirection()
+							? state.interned.get(objTy).kind
+							: TypeInfo::Kind::Reference;
+						wrap.data = TypeInfo::IndirectionData{ concreteT };
+						capTy = state.internType(std::move(wrap));
+					}
+				}
+				ifScope.captures[&ifExpr.value().capture.value()] = capTy;
 				checkStatement(state, ifExpr.value().thenBranch.value(), &ifScope);
 				if (ifExpr.value().elseBranch.hasValue())
 					checkStatement(state, ifExpr.value().elseBranch.value(), scope);
@@ -1852,6 +2031,25 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 				}
 			}
 
+			// §3.2 interface-object match — when the subject is `&I`/`*I` or
+			// resolves to an Interface directly, arm patterns are concrete-type
+			// names whose captures bind to downcasted references mirroring the
+			// subject's indirection. The identifier handler typically strips
+			// one indirection, so `s: &Shape` is checked here as Interface.
+			TypeId ifaceTypeId = INVALID_TYPE_ID;
+			if (subjectType != INVALID_TYPE_ID && subjectType < (TypeId)state.interned.table.size())
+			{
+				TypeId inner = subjectType;
+				if (state.interned.get(inner).isIndirection())
+					inner = state.interned.get(inner).asIndirection().inner;
+				while (inner < (TypeId)state.interned.table.size()
+					&& state.interned.get(inner).kind == TypeInfo::Kind::Named)
+					inner = state.interned.get(inner).asNamed().underlying;
+				if (inner < (TypeId)state.interned.table.size()
+					&& state.interned.get(inner).kind == TypeInfo::Kind::Interface)
+					ifaceTypeId = inner;
+			}
+
 			match.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
 			{
 				// Identify the variant name when the pattern is an identifier path.
@@ -1868,21 +2066,52 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 							node = node->next.ptr();
 						if (node) variantName = state.getStringView(*node->item.value());
 					}
-					checkExpression(state, pat, scope, subjectType);
+					if (ifaceTypeId == INVALID_TYPE_ID)
+						checkExpression(state, pat, scope, subjectType);
 				}
 
 				if (arm.value().capture.hasValue())
 				{
-					// §4.3: a pattern capture is valid only on an enum-variant pattern.
-					// Only flag it when the subject is typed and is definitively not an
-					// enum — an untyped subject cannot be judged here.
+					// §4.3: a pattern capture is valid only on an enum-variant
+					// pattern *or* an interface-object concrete-type pattern.
 					TypeId captureType = INVALID_TYPE_ID;
 
-					if (subjectType != INVALID_TYPE_ID && enumTypeId == INVALID_TYPE_ID)
+					if (ifaceTypeId != INVALID_TYPE_ID && patternIsIdent)
+					{
+						// Resolve concrete type from the pattern identifier.
+						const AST::Expression& pat = arm.value().pattern.value();
+						const AST::IdentifierExpression& id = std::get_if<Required<AST::IdentifierExpression>>(&pat)->value();
+						TypeId concreteT = INVALID_TYPE_ID;
+						auto rIt = state.resolved.names.find(&id);
+						if (rIt != state.resolved.names.end() && !rIt->second.empty())
+						{
+							const ResolvedDeclaration* decl = rIt->second[0];
+							if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
+							{
+								auto nit = state.interned.namedTypeIds.find(&td->value().name);
+								if (nit != state.interned.namedTypeIds.end())
+									concreteT = nit->second;
+							}
+						}
+						if (concreteT != INVALID_TYPE_ID)
+						{
+							// Mirror subject indirection: &Shape → &Concrete.
+							// If the subject was already stripped to bare
+							// Interface (identifier handler dereffed), default
+							// to immutable Reference.
+							TypeInfo wrap;
+							wrap.kind = state.interned.get(subjectType).isIndirection()
+								? state.interned.get(subjectType).kind
+								: TypeInfo::Kind::Reference;
+							wrap.data = TypeInfo::IndirectionData{ concreteT };
+							captureType = state.internType(std::move(wrap));
+						}
+					}
+					else if (subjectType != INVALID_TYPE_ID && enumTypeId == INVALID_TYPE_ID && ifaceTypeId == INVALID_TYPE_ID)
 					{
 						const Token& capTok = arm.value().capture.value().variableName;
 						state.logger.logErrorInRange(capTok, capTok,
-							"Pattern capture is only valid when matching an enum variant.");
+							"Pattern capture is only valid when matching an enum variant or interface object.");
 					}
 					else if (enumTypeId != INVALID_TYPE_ID && patternIsIdent)
 					{

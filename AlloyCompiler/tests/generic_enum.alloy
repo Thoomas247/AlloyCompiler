@@ -1,0 +1,12 @@
+// Positive: a generic enum monomorphises per use; Option<u32>::Some(x) and
+// Option<u32>::Nothing both type-check against a `var x: Option<u32>` slot.
+type Option<T> = enum {
+	Some: T;
+	Nothing;
+};
+
+fn main() -> u32 {
+	var a: Option<u32> = Option::Some(7);
+	var b: Option<u32> = Option::Nothing;
+	return 0;
+}

@@ -1,0 +1,8 @@
+// A regular call whose argument types match no candidate must be reported.
+//@expect-error No matching overload for 'f'
+
+fn f(x: u32) -> u32 { return x; }
+
+fn main() -> u32 {
+	return f(1.5);
+}

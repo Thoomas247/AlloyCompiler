@@ -1,6 +1,7 @@
 #include "type_interner.hpp"
 
 #include <functional>
+#include <map>
 #include <unordered_map>
 #include <variant>
 
@@ -155,9 +156,18 @@ struct InternState
     // Maps TypeDefinition* → Named TypeId (prevents re-interning the same named type).
     std::unordered_map<const AST::TypeDefinition*, TypeId> namedTypeCache;
 
-    // The current generic function's TypeParam scope (name → TypeId).
-    // Set while interning a FunctionDefinition with type parameters.
+    // The current generic function's (or generic type's) TypeParam scope (name → TypeId).
+    // Set while interning a FunctionDefinition with type parameters, or while
+    // monomorphising a generic TypeDefinition.
     std::unordered_map<std::string_view, TypeId> typeParamScope;
+
+    // Generic type defs: per-def, the TypeParam TypeIds for the def's parameters.
+    // A generic def is not interned at top level; its body is monomorphised lazily
+    // on each use site.
+    std::unordered_map<const AST::TypeDefinition*, std::vector<TypeId>> genericTypeParamIds;
+
+    // Monomorphisation cache: (generic def, concrete arg TypeIds) → Named TypeId.
+    std::map<std::pair<const AST::TypeDefinition*, std::vector<TypeId>>, TypeId> monoTypeCache;
 
     // B3-5: types synthesised by type-position comptime expressions (§3.4).
     const SynthTypeMap* synthTypes = nullptr;
@@ -209,6 +219,47 @@ static TypeId internInterfaceType(InternState& state, const AST::InterfaceDefini
     TypeId id = state.internUnique(std::move(info));
     state.result.interfaceIds[&ifaceDef] = id;
     return id;
+}
+
+// ---------------------------------------------------------------------------
+// Register a generic TypeParam (used for both generic functions and generic
+// type definitions).
+// ---------------------------------------------------------------------------
+
+static TypeId registerTypeParam(InternState& state, const AST::TypeParameter& tp, const ResolvedModule& resolved)
+{
+    TypeInfo info;
+    info.kind = TypeInfo::Kind::TypeParam;
+    auto tpName = state.getStringView(tp.name);
+    std::optional<BuiltinInterface> constraint;
+    std::optional<TypeId> interfaceConstraint;
+    if (tp.interface.hasValue())
+    {
+        auto riIt = resolved.resolvedInterfaces.find(&tp.interface.value());
+        if (riIt != resolved.resolvedInterfaces.end())
+        {
+            std::visit(Overloaded
+            {
+                [&](BuiltinInterface bi) { constraint = bi; },
+                [&](const ResolvedDeclaration* decl)
+                {
+                    if (auto* ifReq = std::get_if<Required<AST::InterfaceDefinition>>(&decl->definition))
+                        interfaceConstraint = internInterfaceType(state, ifReq->value());
+                },
+            }, riIt->second);
+        }
+        else
+        {
+            auto ifName = state.getStringView(tp.interface.value());
+            auto it = s_BuiltinInterfaces.find(ifName);
+            if (it != s_BuiltinInterfaces.end())
+                constraint = it->second;
+        }
+    }
+    info.data = TypeInfo::TypeParamData{ tpName, constraint, interfaceConstraint };
+    TypeId tpId = state.internUnique(std::move(info));
+    state.result.typeParamIds[&tp.name] = tpId;
+    return tpId;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +423,92 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
 
             const ResolvedDeclaration* decl = resolvedIt->second[0];
             if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition))
-                return internNamedType(state, td->value(), resolved);
+            {
+                const AST::TypeDefinition& tdef = td->value();
+                bool isGeneric = tdef.typeParameters.hasValue();
+                bool hasArgs = namedType.value().typeArguments.hasValue();
+
+                if (!isGeneric && !hasArgs)
+                    return internNamedType(state, tdef, resolved);
+
+                if (!isGeneric && hasArgs)
+                {
+                    state.logger.logErrorInRange(*firstToken, *firstToken,
+                        "Type '{}' is not generic; no type arguments expected.", name);
+                    return INVALID_TYPE_ID;
+                }
+
+                // isGeneric ==
+                // Collect parameter names.
+                std::vector<std::string_view> paramNames;
+                tdef.typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
+                {
+                    paramNames.push_back(state.getStringView(tp.value().name));
+                });
+
+                // Collect arg TypeIds (intern each AST type-arg).
+                std::vector<TypeId> argIds;
+                if (hasArgs)
+                {
+                    namedType.value().typeArguments.forEach([&](const Required<AST::Type>& ta)
+                    {
+                        argIds.push_back(internASTType(state, ta.value(), resolved));
+                    });
+                }
+
+                if (!hasArgs || argIds.size() != paramNames.size())
+                {
+                    state.logger.logErrorInRange(*firstToken, *firstToken,
+                        "Generic type '{}' expects {} type argument(s), got {}.",
+                        name, paramNames.size(), hasArgs ? argIds.size() : 0u);
+                    return INVALID_TYPE_ID;
+                }
+
+                // Cache check.
+                auto cacheKey = std::make_pair(&tdef, argIds);
+                auto cacheIt = state.monoTypeCache.find(cacheKey);
+                if (cacheIt != state.monoTypeCache.end())
+                    return cacheIt->second;
+
+                // Reserve placeholder Named slot (so recursive monos see a stable id).
+                TypeId placeholderId = static_cast<TypeId>(state.result.table.size());
+                state.result.table.emplace_back();
+                state.monoTypeCache[cacheKey] = placeholderId;
+
+                // Build a substituted typeParamScope for body interning.
+                auto savedScope = state.typeParamScope;
+                state.typeParamScope.clear();
+                for (size_t i = 0; i < paramNames.size(); ++i)
+                    state.typeParamScope[paramNames[i]] = argIds[i];
+
+                TypeId underlying = internBaseType(state, tdef.baseType.value(), resolved);
+
+                state.typeParamScope = std::move(savedScope);
+
+                TypeInfo info;
+                info.kind = TypeInfo::Kind::Named;
+                info.data = TypeInfo::NamedData{ state.getStringView(tdef.name), underlying };
+                state.result.table[placeholderId] = std::move(info);
+                state.result.monoSourceDef[placeholderId] = &tdef;
+
+                // Inherit the generic def's interface markers for mono instantiations.
+                tdef.interfaces.forEach([&](const Required<const Token*>& markerReq)
+                {
+                    auto riIt = resolved.resolvedInterfaces.find(markerReq.value());
+                    if (riIt == resolved.resolvedInterfaces.end())
+                        return;
+                    if (auto* declPtr = std::get_if<const ResolvedDeclaration*>(&riIt->second))
+                    {
+                        if (auto* ifReq = std::get_if<Required<AST::InterfaceDefinition>>(&(*declPtr)->definition))
+                        {
+                            TypeId ifId = internInterfaceType(state, ifReq->value());
+                            state.result.implementedInterfaces[placeholderId].push_back(ifId);
+                        }
+                    }
+                });
+
+                return placeholderId;
+            }
             if (auto* ifd = std::get_if<Required<AST::InterfaceDefinition>>(&decl->definition))
                 return internInterfaceType(state, ifd->value());  // interface used as a type
             return INVALID_TYPE_ID;
@@ -599,6 +735,14 @@ static void internExpression(InternState& state, const AST::Expression& expr, co
             internExpression(state, unary.value().expression.value(), resolved);
         },
 
+        [&](const Required<AST::IsExpression>& isExpr)
+        {
+            internExpression(state, isExpr.value().object.value(), resolved);
+            // The right-hand `testType` is an AST::NamedType — its TypeId
+            // is resolved on demand in the type checker / codegen via
+            // resolved.names[&testType.name].
+        },
+
         [&](const Required<AST::BinaryExpression>& binary)
         {
             internExpression(state, binary.value().left.value(), resolved);
@@ -801,7 +945,20 @@ Result<InternedTypes> intern(
         {
             [&](const Required<AST::TypeDefinition>& typeDef)
             {
-                // Intern the named type (and its underlying structural type).
+                if (typeDef.value().typeParameters.hasValue())
+                {
+                    // Generic type definition: register a TypeParam id for each
+                    // parameter, do NOT intern the body. Body is monomorphised
+                    // lazily at each use site (Foo<i32>).
+                    std::vector<TypeId> paramIds;
+                    typeDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
+                    {
+                        paramIds.push_back(registerTypeParam(state, tp.value(), resolved));
+                    });
+                    state.genericTypeParamIds[&typeDef.value()] = std::move(paramIds);
+                    return;
+                }
+                // Non-generic: intern the named type (and its underlying structural type).
                 internNamedType(state, typeDef.value(), resolved);
             },
 

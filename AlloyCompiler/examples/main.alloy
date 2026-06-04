@@ -98,7 +98,7 @@ fn main() -> u32 {
 	printf("ref value: %f\n", ref);
 
 	call(
-		| &arr | () { return arr[4]; },
+		| &arr | () -> f32 { return arr[4]; },
 		(x: u32) { return; }
 	);
 
@@ -136,7 +136,7 @@ fn main() -> u32 {
 	return 0;
 }
 
-fn call(func: () -> u64, func2: (u32)) {
+fn call(func: () -> f32, func2: (u32)) {
 	func();
 	func2(123);
 }

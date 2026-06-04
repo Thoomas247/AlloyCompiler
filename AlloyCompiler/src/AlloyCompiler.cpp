@@ -253,7 +253,7 @@ static int runTests()
 // executable with clang. Output lands in ./build.
 // ---------------------------------------------------------------------------
 
-static int buildFile(const std::string& path)
+static int buildFile(const std::string& path, bool debug)
 {
 	fs::path file(path);
 	if (!fs::exists(file))
@@ -301,7 +301,9 @@ static int buildFile(const std::string& path)
 	fs::create_directories("build");
 	const std::string base = "build/" + source.moduleName;
 
-	Status cgStatus = codegen(source, moduleNode.value(), resolved, interned, typed, symbols, base);
+	CodegenOptions cgOpts;
+	cgOpts.debug = debug;
+	Status cgStatus = codegen(source, moduleNode.value(), resolved, interned, typed, symbols, base, cgOpts);
 
 	DiagnosticEngine::instance().printAll();
 	if (cgStatus != Status::Ok || DiagnosticEngine::instance().hasError())
@@ -337,7 +339,18 @@ int main(int argc, char** argv)
 		return runTests();
 
 	if (argc > 2 && std::string_view(argv[1]) == "--build")
-		return buildFile(argv[2]);
+	{
+		// `--build <file> [--release]` — default is Debug; --release strips
+		// runtime bounds checks and other debug-only emissions.
+		bool debug = true;
+		for (int i = 3; i < argc; ++i)
+		{
+			std::string_view a(argv[i]);
+			if (a == "--release") debug = false;
+			else if (a == "--debug") debug = true;
+		}
+		return buildFile(argv[2], debug);
+	}
 
 	return compileExamples();
 }

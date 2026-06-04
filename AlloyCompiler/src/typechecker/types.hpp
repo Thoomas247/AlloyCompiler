@@ -186,6 +186,10 @@ struct InternedTypes
 	// concrete Named TypeId to the Interface TypeIds it implements ('type T : I' markers)
 	std::unordered_map<TypeId, std::vector<TypeId>> implementedInterfaces;
 
+	// Monomorphised generic Named TypeId → source generic TypeDefinition.
+	// Set by the interner when it instantiates `Foo<T1, T2>` from a generic def.
+	std::unordered_map<TypeId, const AST::TypeDefinition*> monoSourceDef;
+
 	const TypeInfo& get(TypeId id) const { return table[id]; }
 
 	// returns the innermost value type: strips one level of *, &, *var, &var

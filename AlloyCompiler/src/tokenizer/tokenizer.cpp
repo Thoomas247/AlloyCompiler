@@ -149,6 +149,7 @@ static const std::unordered_map<std::string_view, TokenKind> s_KnownSymbols =
 	{"false", False},
 	{"interface", Interface},
 	{"macro", Macro},
+	{"is", Is},
 
 	{"(", LParen},		{")", RParen},
 	{"{", LBrace},		{"}", RBrace},

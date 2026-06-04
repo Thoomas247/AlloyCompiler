@@ -1,0 +1,23 @@
+// Generic enum: Option<T> monomorphises per use.
+extern printf(...) -> i32;
+
+type Option<T> = enum {
+	Some: T;
+	Nothing;
+};
+
+fn main() -> u32 {
+	var x: Option<u32> = Option::Some(42);
+	var y: Option<u32> = Option::Nothing;
+
+	match (x) {
+		Option::Some |v| { printf("x = Some(%u)\n", v); }
+		Option::Nothing { printf("x = None\n"); }
+	}
+
+	match (y) {
+		Option::Some |v| { printf("y = Some(%u)\n", v); }
+		Option::Nothing { printf("y = None\n"); }
+	}
+	return 0;
+}

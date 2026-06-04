@@ -339,6 +339,11 @@ static void resolveBaseType(ResolveState& state, const AST::BaseType& baseType, 
 			[&](const Required<AST::NamedType>& namedType)
 			{
 				resolveIdentifier(state, namedType.value().name.value(), scope);
+				// Resolve generic type arguments (Foo<T, U>).
+				namedType.value().typeArguments.forEach([&](const Required<AST::Type>& ta)
+					{
+						resolveType(state, ta.value(), scope);
+					});
 			},
 			[&](const Required<AST::StructType>& structType)
 			{
@@ -409,6 +414,13 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 			[&](const Required<AST::UnaryExpression>& unary)
 			{
 				resolveExpression(state, unary.value().expression.value(), scope);
+			},
+			[&](const Required<AST::IsExpression>& isExpr)
+			{
+				resolveExpression(state, isExpr.value().object.value(), scope);
+				// Right-hand side is a NamedType — resolve its identifier so
+				// the type interner can find the user-declared concrete type.
+				resolveIdentifier(state, isExpr.value().testType.value().name.value(), scope);
 			},
 			[&](const Required<AST::BinaryExpression>& binary)
 			{
@@ -670,7 +682,21 @@ Result<ResolvedModule> resolve(
 								resolveInterfaceToken(state, ifaceTok.value());
 							});
 
-						resolveBaseType(state, typeDef.value().baseType.value(), nullptr);
+						// Resolve type-parameter interface constraints + inject params into scope
+						// so 'T' inside the body resolves.
+						typeDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
+							{
+								if (tp.value().interface.hasValue())
+									resolveInterfaceToken(state, tp.value().interface.ptr());
+							});
+						ScopedSymbolTable typeParamScope(nullptr);
+						typeDef.value().typeParameters.forEach([&](const Required<AST::TypeParameter>& tp)
+							{
+								auto name = state.getStringView(tp.value().name);
+								typeParamScope.declare(name, state.allocateLocal(AST::Definition::Visibility::Private, tp));
+							});
+
+						resolveBaseType(state, typeDef.value().baseType.value(), &typeParamScope);
 					},
 					[&](const Required<AST::FunctionDefinition>& fnDef)
 					{

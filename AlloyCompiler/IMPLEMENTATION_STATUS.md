@@ -489,9 +489,11 @@ These should be clarified with the language designer before the affected code is
    yields via `break` (like `for`/`while`/`match`), so `#if (c) break 50; else break 100;`
    is the correct form; the old §6 bare-expression examples were corrected. There are no
    built-in comptime macros — `#isDevelopment()` was illustrative only.
-2. **`extern` return type.** §5.3 prose says extern declarations "mandate concrete arrow
-   return types", but the EBNF and the `examples/main.alloy` `extern printf(...);` make it
-   optional. The parser follows the EBNF (optional).
+2. ~~**`extern` return type.**~~ **Resolved (designer decision).** The EBNF wins:
+   the return type is optional. The language has no `void` keyword, so requiring
+   `-> T` on every extern would leave no way to spell a C function that returns
+   nothing. An extern with no `->` lowers to a C function returning `void`
+   (codegen `declareExtern` defaults `ret = getVoidTy()`).
 3. ~~**Capture on payload-less enum variants.**~~ **Resolved (item 21).** A
    pattern capture on a known payload-less variant is now rejected with a
    diagnostic naming the variant. Test: `tests/match_capture_payloadless.alloy`.
@@ -532,6 +534,8 @@ To verify a change:
 15. ~~**B3 type synthesis (5-6) + B2** — type-position comptime + user-defined macros.~~ **DONE.**
 16. ~~**C1–C5** — full LLVM back-end: core lowering, memory model (incl. `*[T]`
     length-prefix layout), interface vtables, generic monomorphisation, FFI.~~ **DONE.**
+17b. ~~**Iface-typed local slot, empty-array rejection, C-FFI pointer ABI,
+    debug bounds checks.**~~ **DONE** (items 25–28).
 17. ~~**Lambda codegen + indirect calls** — non-capturing lambdas lower to anonymous
     `llvm::Function`s; identifier callees of Function type dispatch through a function
     pointer. Function-type structural compatibility added to `isAssignable` so a
@@ -583,3 +587,214 @@ To verify a change:
     `namedTypeIds` when a member's `typeName` is not a primitive — so a macro
     can `add_member("inner", #Inner)` and emit a real nested struct. End-to-end
     sample `samples/synth_nested.alloy`.
+25. ~~**Interface-typed local slot (regression: `const p: &Printer = …`)**~~
+    **DONE.** `VariableDefinitionStatement` and `AssignmentStatement` in
+    [`codegen.cpp`](src/codegen/codegen.cpp) detect when the declared type is
+    `&I`/`*I` (an *interface* indirection) and (a) allocate `%alloy.iface`
+    (16-byte fat pointer) instead of plain `ptr` for the slot, and (b) coerce
+    the RHS through `makeIfaceArg` so the vtable global is built into the
+    stored value. Before this fix, an indirection-to-interface local stored
+    only the data pointer and a later virtual call loaded garbage as the
+    vtable. Regression sample: `samples/iface_local.alloy`.
+26. ~~**Empty arrays rejected**~~ **DONE.** §3.2 fixes array size at ≥ 1
+    (`[T; N]` with N > 0). The parser rejects `[T; 0]` type forms and
+    `[expr; 0]` array-fill expressions with a located diagnostic; the comptime
+    interpreter fails materialisation if a comptime expression yields `[]`
+    (the prior silent `return nullptr` is now a `fail(origin, …)` call). Use
+    `[T]` (slice) when no fixed size is wanted.
+27. ~~**C-pointer ABI for `extern` signatures**~~ **DONE.** A new
+    `lowerExternType` helper in [`codegen.cpp`](src/codegen/codegen.cpp)
+    forces every Alloy indirection (`&T` / `*T` / `&var T` / `*var T`) to
+    a plain LLVM `ptr` regardless of inner type, so an extern declared
+    with `&u8` lowers to a C `char*` rather than the fat pointer that
+    pointee analysis would otherwise produce. Slice and bare-interface
+    parameter / return types are rejected with a diagnostic (C has no
+    fat-pointer ABI) and downgraded to a plain `ptr` so the link still
+    succeeds. A missing `-> T` continues to default to `void`.
+29. ~~**No-matching-overload diagnostic**~~ **DONE.** When a call's name has
+    candidates by self-type but none of the non-generic exact-match sweep
+    nor the generic inference accept the argument types, the type checker
+    now reports `"No matching overload for '<callee>': none of the N
+    candidate(s) accepted/satisfied the argument types."` with a located
+    diagnostic. A guard short-circuits when all candidates are value
+    bindings (parameter / local var / capture) of Function type — the call
+    is treated as an indirect call and uses the function type's return
+    rather than firing the diagnostic. The stale silence-relying call site
+    in `examples/main.alloy` (`call(λ() { return arr[4]; }, …)`) had its
+    lambda return type made explicit to match the parameter's declared
+    `() -> f32` signature. Test: `tests/no_matching_overload.alloy`.
+30. ~~**String-subject `match` lowering**~~ **DONE.** §4.3 — a `match`
+    whose subject's value-type is `[u8]` (slice of u8) now lowers as a
+    chain of length-compare + `memcmp` arms, with arm patterns required
+    to be string literals. Pattern captures are rejected (no payload on a
+    string). The codegen detects the subject by walking through Named /
+    indirection wrappers until it finds `Slice(u8)`. As a prerequisite,
+    the string-literal handler now materialises a private global slice
+    constant `{ ptr, len }` and returns its address when the context is
+    a reference to slice — previously `var s = "yes"; match (s)` loaded
+    the raw bytes as a slice header (garbage length). `memcmp` is lazily
+    declared as an `extern int memcmp(const void*, const void*, size_t)`.
+    Sample: `samples/str_match.alloy`.
+31. ~~**Release config + bounds-check gating**~~ **DONE.** Added
+    `CodegenOptions { bool debug = true }` threaded from the driver. The
+    driver accepts `--build <file> [--release | --debug]` (default debug).
+    `emitBoundsCheck` no-ops when `options.debug == false` — so a release
+    build skips the `idx <u len` test and the trap block entirely.
+    Verified by `grep bounds.fail` on the generated `.ll`: 6 occurrences
+    in `dynarr.ll` Debug, 0 in Release.
+32. ~~**Interface downcast: `match` arms + `is` keyword**~~ **DONE.**
+    §3.2 reverse conversion. Two new constructs:
+    - **Exhaustive `match`.** When the subject's stripped type is an
+      Interface, arm patterns become concrete-type identifiers (e.g.
+      `Circle |c|`, `Square |s|`); the capture binds a downcasted
+      reference whose indirection mirrors the subject's. Codegen lowers
+      as a chain of vtable-pointer comparisons against per-(T, I)
+      vtable globals (slot 1 of `%alloy.iface`), branching on equality.
+      The captured slot stores the iface data pointer and is dereffed on
+      access via a `ifaceCaptureDeref` set keyed by `AST::Capture*`.
+    - **Non-exhaustive `expr is T`.** New `Is` keyword (tokenizer +
+      grammar `is_expr = unary_expr { "is" named_type }`). Produces an
+      `i1` from a vtable equality check. When paired with a typed
+      capture (`if (shape is Circle) |c| { ... }`), the `if` handler
+      builds a `&Concrete` capture using the same vtable lookup; the
+      capture's body sees `c: &Circle` transparently via the existing
+      §4.2 deref-through-reference rule.
+    Type checker validates: LHS must be an interface object, RHS must
+    implement the same interface. The `MemberAccessExpression` handler
+    now strips one indirection before requiring `Struct` so `c.r` on
+    `c: &Circle` resolves correctly (previously typed as `INVALID` →
+    codegen defaulted to `i32`). Sample: `samples/iface_is.alloy`.
+34. ~~**`move` + scope-end free + debug null check**~~ **DONE.** §4.2
+    ownership story. Three pieces wired into codegen:
+    - `Codegen::ownedSlots` tracks every `*T` / `*[T]` local in the
+      current function. A `VariableDefinitionStatement` whose storage
+      type is `Kind::Pointer` / `Kind::PtrMut` pushes its slot (with
+      an `isDynArr` flag). The helper `emitFreeAll` lazily declares
+      `extern void free(void*)` and emits one `free` call per slot
+      (popping the malloc base via `user_ptr - 8` for dyn arrays) in
+      LIFO declaration order. `emitFreeAll` runs before every
+      `ReturnStatement` and at the implicit function-end fall-through
+      for both named functions and lambdas. `free(NULL)` is a no-op,
+      so moved-from slots are safely freed unconditionally.
+    - `move p` now returns the raw `*T` pointer (NOT the §4.2-deref'd
+      value), then writes `null` into the source binding's slot via
+      `cg.slots[decl]`. `genAddr` for an owning identifier would
+      otherwise dereference to the heap pointee — we look up the slot
+      directly to null the *binding*, not the *contents*.
+    - `emitNullCheck` injects `if (p == null) @llvm.trap` after every
+      load of a `*T`/`*[T]` indirection in debug builds (
+      `options.debug == true`). A use-after-move sees the nulled slot
+      and traps. Release builds skip both the null-store and the
+      null check, matching the "manual safety" tier.
+    Sample: `samples/ownership.alloy` (positive — heap freed at
+    return). The dual-mode behaviour was verified inline (an ad-hoc
+    `move_uaf.alloy` segfaults in release, traps in debug). The
+    **static use-after-move warning** layer remains a follow-up —
+    today the runtime catches the bug; a flow analysis would catch
+    it at compile time.
+33. ~~**Comptime filesystem I/O**~~ **DONE (designer decision: defer).**
+    §6.3 cites `readTypeFromJson` as illustrative only; no real consumer
+    exists. The pointer barrier (§6.2) is in place and the FS sandbox is
+    inert until a primitive is added. Revisit when a use case appears.
+35. ~~**Generic type definitions (Option<T> etc.)**~~ **DONE.**
+    Grammar (§2.1): `type_def = "type" ident [ "<" type_param { "," type_param } ">" ] …`
+    and `named_type = ident { "::" ident } [ "<" type { "," type } ">" ]`. AST:
+    `TypeDefinition::typeParameters` and `NamedType::typeArguments` added; parser
+    accepts both. Resolver injects each generic type's params into a `ScopedSymbolTable`
+    around `resolveBaseType`. Interner: a generic def is **not** interned at top level;
+    each use site `Foo<i32, u8>` lazily instantiates a fresh `Named` TypeId whose
+    underlying is the body re-interned with the per-param `typeParamScope[name] →
+    concrete TypeId`. Monos are cached by `(TypeDefinition*, vector<TypeId>)`.
+    `InternedTypes::monoSourceDef[TypeId] → TypeDefinition*` lets the typechecker
+    and codegen recover the source def from a mono instance. Typechecker
+    `resolveEnumVariant` and codegen `classifyVariant` fall back to a caller-supplied
+    `contextType` (the var-annotation type, or the call expression's typed result, or
+    the match subject's type) when `namedTypeIds` lookup misses — so
+    `var x: Option<u32> = Option::Some(7);` and `match (x) { Option::Some |v| … }`
+    both resolve. Also fixed a latent variant-payload typecheck bug: the ctor handler
+    called `resolveUntypedLiteral` *before* `isAssignable`, defeating the untyped-literal
+    mechanism (so `Option::Some(7) : Option<u32>` was a sign-class error); now passes
+    `payloadArg` directly to `isAssignable`. Sample: `samples/generic_enum.alloy`;
+    tests: `tests/generic_enum.alloy`, `tests/generic_enum_arity.alloy`.
+    *Limitations:* (a) explicit-turbofish on the variant call (`Option::Some<u32>(7)`)
+    is not yet supported — variant ctors rely on context inference; (b) generic-of-
+    generic at top level (`type X = Y<i32>;` referencing a generic Y) works, but
+    nested instantiation referring to outer type-params is only validated at the
+    eventual concrete leaf.
+
+28. ~~**Debug-build array bounds checks**~~ **DONE.** `emitBoundsCheck` in
+    [`codegen.cpp`](src/codegen/codegen.cpp) injects a runtime test
+    (`idx <u len → cond br ok / fail`; `fail` block calls `@llvm.trap` and
+    terminates with `unreachable`) at every `[]` access. Three sources of
+    length are wired in: fixed arrays use the compile-time constant from
+    `TypeInfo::ArrayData::size`; slices load field 1 of `%alloy.slice`;
+    dynamic arrays (`*[T]`) load the `i64` stashed at `user_ptr - 8` (the
+    §4.2 length-prefix). Negative indices use the unsigned compare and
+    therefore also trap. The check runs in every build for now — the
+    spec's "debug builds" qualifier becomes meaningful once a release
+    configuration is added (§7 item 4).
+
+---
+
+## What's Left vs. the Spec
+
+The front-end is feature-complete against `LANGUAGE_SPEC.md`. The back-end
+implements the core scope (C1–C5) plus closures, monomorphisation, dyn-array
+length prefix, vtables, bounds checks, and the C-FFI pointer mapping. The
+remaining gaps are concentrated in three areas:
+
+### Genuinely missing language features (require new design or substantial code)
+
+* **Explicit downcast cast** (§3.2). The spec says converting an interface
+  object back to a concrete type "requires an explicit cast". No cast syntax
+  exists in the grammar (`as` is only an import alias). Needs an EBNF
+  addition (`expr as Type` or `Type(expr)`) and matching checker + codegen
+  paths.
+* **Real `move` semantics + drop / free** (§4.2). The parser accepts
+  `move p`, and codegen passes the pointer through, but there is no
+  ownership tracking and no destructor / `Drop` story. Closure heap envs,
+  `*[T]` allocations, and `new` heap blocks are never freed — programs
+  leak by construction. A real solution needs a lifetime / ownership
+  pass on top of the typechecker.
+* **`String` and standard collections** (§5). No stdlib modules exist.
+  String literals are typed `&[u8]`; there is no `String` value type,
+  no `Vec`, etc. The generic-enum prerequisite for an `Option<T>` value
+  is now in place (item 35).
+* **Comptime filesystem I/O** (§6.3 example: `readTypeFromJson`). §6.2
+  defines the sandbox but no comptime I/O primitives exist. `Iterable`
+  is structurally satisfied for arrays/slices but custom iterator
+  structures are not yet supported.
+
+### Codegen partial implementations (architectural, not quick fixes)
+
+* **Strict `#Type` runtime-barrier diagnostic** (§3.4). A `#Type` that
+  reaches a genuine runtime value position is left silently
+  unsubstituted rather than always reported, because a reachability
+  pass would be required to distinguish legitimate comptime helper
+  bodies (which contain `#u32` etc.) from real runtime escapes.
+* **String-subject `match`** (§4.3). A `match` on a string subject
+  falls through the enum path leniently; there's no real
+  string-pattern matching. Needs a dedicated lowering path.
+* **Closure / dyn-array / `new` heap reclaim** (§4.2). See `move`
+  above — until the ownership story is settled, every heap allocation
+  leaks. Pragmatically the right fix is per-frame arena release for
+  short-lived closures plus `move`-driven free for long-lived heap
+  values.
+
+### Diagnostics & ergonomics
+
+* **"No matching generic overload" diagnostic.** A generic call whose
+  constraint or unification fails currently selects no overload and
+  yields `INVALID_TYPE_ID` silently (see A4 / item 18). A located
+  diagnostic naming the failing constraint would be cheap.
+* **Release vs. debug build configuration.** Bounds checks (item 28),
+  bookkeeping IR, and (eventually) optimisations should be config-
+  gated. There is currently only a Debug build of the compiler and of
+  the generated code.
+
+### Open spec ambiguities (see §7)
+
+None remaining as of this revision — the two prior open items (`if`
+branch grammar and extern return type) are both resolved. New
+ambiguities, if any, should be added back to §7 rather than buried
+in code comments.

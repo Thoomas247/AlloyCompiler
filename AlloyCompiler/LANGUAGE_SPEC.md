@@ -47,7 +47,7 @@ Reserved — cannot be used as identifiers:
 import   as       extern   type     enum     struct
 const    var      fn       if       else     while
 for      match    break    return   new      move    self
-pub      exp      true     false    interface macro
+pub      exp      true     false    interface macro    is
 
 ```
 
@@ -123,7 +123,7 @@ module          = { import_decl } { definition } EOF ;
 import_decl     = "import" ident { "::" ident } [ "as" ident ] ";" ;
 
 definition      = [ "pub" | "exp" ] ( type_def | fn_def | extern_def | interface_def | macro_def ) ;
-type_def        = "type" ident [ ":" ident { "," ident } ] "=" base_type ";" ;
+type_def        = "type" ident [ "<" type_param { "," type_param } ">" ] [ ":" ident { "," ident } ] "=" base_type ";" ;
 interface_def   = "interface" ident "{" { interface_fn } "}" ;
 interface_fn    = "fn" ident "(" [ param { "," param } ] ")" [ "->" type ] ";" ;
 fn_def          = "fn" ident [ "<" type_param { "," type_param } ">" ] function ;
@@ -150,7 +150,7 @@ base_type       = named_type
                 | fn_type
                 | comptime_expr ;
 
-named_type      = ident { "::" ident } ;
+named_type      = ident { "::" ident } [ "<" type { "," type } ">" ] ;
 struct_type     = "struct" "{" { ident ":" type ";" } "}" ;
 enum_type       = "enum" "{" { ident [ ":" type ] ";" } "}" ;
 array_type      = "[" type [ ";" integer_literal ] "]" | "[" type "]" ;
@@ -177,7 +177,9 @@ assign_op       = "=" | "+=" | "-=" | "*=" | "/=" | "%="
                 | "<<=" | ">>=" | "&=" | "|=" | "^=" ;
 
 (* Expressions *)
-expression      = unary_expr [ binary_op expression ] ;
+expression      = is_expr [ binary_op expression ] ;
+
+is_expr         = unary_expr { "is" named_type } ;
 
 unary_expr      = unary_op unary_expr | postfix_expr ;
 unary_op        = "~" | "!" | "&" | "new" | "move" ;
@@ -299,7 +301,27 @@ Boolean literals are explicitly reserved via the language keywords `true` and `f
 | `&var T` | Mutable reference | Unmanaged mutable borrowed reference |
 | `&I` / `*I` (`I` an interface) | Interface object | Dynamic-dispatch fat pointer: a data pointer plus a vtable pointer (§5.2). |
 
-An **interface used as a type** (only behind an indirection — `&I`, `&var I`, `*I`, `*var I`) is an *interface object*: a fat pointer carrying the address of a value together with the vtable of the concrete type's interface implementation. A value of concrete type `T` is implicitly convertible to an interface object of `I` if and only if `T` declares `I` among its interface markers (`type T : I = ...`). The reverse conversion (interface object down to a concrete type) requires an explicit cast.
+An **interface used as a type** (only behind an indirection — `&I`, `&var I`, `*I`, `*var I`) is an *interface object*: a fat pointer carrying the address of a value together with the vtable of the concrete type's interface implementation. A value of concrete type `T` is implicitly convertible to an interface object of `I` if and only if `T` declares `I` among its interface markers (`type T : I = ...`). The reverse conversion (interface object down to a concrete type) is expressed through the same constructs used for enum discrimination:
+
+* **Exhaustive (`match`).** A `match` whose subject is an interface object accepts concrete-type names as arm patterns, with a payload capture that binds a reference to the concrete value:
+
+```alloy
+match (shape) {            // shape: &Shape
+    Circle |c| { /* c: &Circle */ }
+    Square |s| { /* s: &Square */ }
+    else    { /* unhandled concrete type */ }
+}
+```
+
+The capture's indirection mirrors the subject's: a `&Shape` subject yields `&Concrete` captures, a `&var Shape` subject yields `&var Concrete` captures, and similarly for `*` / `*var`.
+
+* **Non-exhaustive (`if (… is Type)`).** The new `is` keyword tests whether an interface object's concrete type matches a target type, and — when paired with a typed capture — also produces the downcasted reference:
+
+```alloy
+if (shape is Circle) |c| { /* c: &Circle, only runs when shape's concrete is Circle */ }
+```
+
+`shape is Type` is a boolean expression in its own right; the `|c|` capture is optional. The `is` operator is only valid when the left operand is an interface object and the right operand is a concrete type implementing the same interface.
 
 ### 3.3 Type Compatibility & Coercion Rules
 
@@ -377,6 +399,13 @@ var arr: *[u32] = new [0; 120]; // Allocates 120 elements of u32 initialized to 
 
 * **Memory Layout & C-FFI Compatibility:** To retain total binary drop-in compatibility with legacy C ecosystems, a pointer to an Alloy dynamically sized array points directly to the memory address of the first active data element (`element[0]`).
 * **Length Metadata Tracking:** The allocation's length value (returned via `arr.length()`) is stored automatically by the runtime in a dedicated metadata prefix block located **immediately before the array data pointer** (i.e., at a negative memory offset from the user-facing pointer address).
+
+#### Ownership & `move`
+
+* A `*T` (or `*[T]`, or `*var T`) binding **owns** the heap allocation it points to. When the owning binding goes out of scope, the runtime emits a `free` for the allocation (the dyn-array form releases the malloc base at `user_ptr - 8`). Plain references (`&T`, `&var T`) are non-owning views and never trigger a free.
+* The `move` operator transfers ownership: `var q = move p` copies the pointer into `q` and clears the source slot. After `move p`, the binding `p` no longer owns anything — it is a null pointer.
+* **Debug builds** insert a null check on every dereference of a `*T` binding. A use-after-move accesses the null slot and traps (`@llvm.trap`). **Release builds** skip both the null check and the null-store on `move`, so a use-after-move dereferences null and the OS faults.
+* Closure environments and other long-lived allocations are owned by the slot that holds the closure value (or its delegate); the same scope-end free rules apply when ownership tracking is implemented for those forms (today only `*T` / `*[T]` are tracked).
 
 
 
