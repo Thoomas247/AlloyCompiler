@@ -1,0 +1,10 @@
+// §5.1a — built-in (prelude) type names are reserved; a user `type` that
+// redeclares one is a compile error.
+type Option<T> = enum {  //@expect-error built-in type name and cannot be redeclared
+	Some: T;
+	Nothing;
+};
+
+fn main() -> u32 {
+	return 0;
+}

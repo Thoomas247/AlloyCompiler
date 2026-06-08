@@ -1,0 +1,34 @@
+// Positive: a generic growable Vec<T> — generic struct, generic `&var self`
+// mutating method, runtime-sized heap fill (`new [x; v.len + 1]`), a generic
+// factory returning a generic type, and structural reclaim. Compiles clean.
+type Vec<T> = struct {
+	data: *var [T];
+	len: u64;
+};
+
+fn makeVec<T>(seed: T) -> Vec<T> {
+	return Vec<T> { .data = new [seed; 1], .len = 0 };
+}
+
+fn push<T>(self v: &var Vec<T>, x: T) {
+	var bigger: *var [T] = new [x; v.len + 1];
+	var i: u64 = 0;
+	while (i < v.len) {
+		bigger[i] = v.data[i];
+		i += 1;
+	}
+	bigger[v.len] = x;
+	v.data = move bigger;
+	v.len += 1;
+}
+
+fn get<T>(self v: &Vec<T>, i: u64) -> T {
+	return v.data[i];
+}
+
+fn main() -> u32 {
+	var v: Vec<u32> = makeVec<u32>(0);
+	v.push(7);
+	v.push(11);
+	return v.get(0) + v.get(1);
+}

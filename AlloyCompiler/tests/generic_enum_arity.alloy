@@ -5,6 +5,9 @@ type Pair<A, B> = struct {
 };
 
 fn main() -> u32 {
+	// Both the annotation and the initializer name `Pair` with the wrong arity,
+	// so the arity error is reported at each position.
 	var p: Pair<u32> = Pair<u32> { .first = 1, .second = 2 };  //@expect-error expects 2 type argument
+	//@expect-error expects 2 type argument
 	return 0;
 }

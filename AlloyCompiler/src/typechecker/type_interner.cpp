@@ -169,6 +169,9 @@ struct InternState
     // Monomorphisation cache: (generic def, concrete arg TypeIds) → Named TypeId.
     std::map<std::pair<const AST::TypeDefinition*, std::vector<TypeId>>, TypeId> monoTypeCache;
 
+    // Built-in generic monomorphisation cache: (BuiltinType, concrete args) → Named TypeId.
+    std::map<std::pair<int, std::vector<TypeId>>, TypeId> builtinMonoCache;
+
     // B3-5: types synthesised by type-position comptime expressions (§3.4).
     const SynthTypeMap* synthTypes = nullptr;
 
@@ -385,6 +388,62 @@ static TypeId internSynthType(InternState& state, const SynthType& st)
 }
 
 // ---------------------------------------------------------------------------
+// Monomorphise a built-in generic type (e.g. Option<u32>) into a real Named
+// TypeId whose underlying is a synthesised Enum/Struct. Cached per (tag, args).
+// ---------------------------------------------------------------------------
+
+static TypeId internBuiltinMono(InternState& state, const BuiltinTypeInfo& bt, std::vector<TypeId> argIds)
+{
+    auto key = std::make_pair(static_cast<int>(bt.tag), argIds);
+    auto it = state.builtinMonoCache.find(key);
+    if (it != state.builtinMonoCache.end())
+        return it->second;
+
+    // Reserve a placeholder Named slot for stable identity / recursion.
+    TypeId placeholderId = static_cast<TypeId>(state.result.table.size());
+    state.result.table.emplace_back();
+    state.builtinMonoCache[key] = placeholderId;
+
+    TypeId underlying = INVALID_TYPE_ID;
+    if (bt.isEnum)
+    {
+        TypeInfo::EnumData data;
+        for (const auto& m : bt.members)
+        {
+            std::optional<TypeId> payload;
+            if (m.paramIndex >= 0 && static_cast<size_t>(m.paramIndex) < argIds.size())
+                payload = argIds[m.paramIndex];
+            data.variants.push_back({ m.name, payload });
+        }
+        TypeInfo info;
+        info.kind = TypeInfo::Kind::Enum;
+        info.data = std::move(data);
+        underlying = state.internStructural(std::move(info));
+    }
+    else
+    {
+        TypeInfo::StructData data;
+        for (const auto& m : bt.members)
+        {
+            TypeId mt = (m.paramIndex >= 0 && static_cast<size_t>(m.paramIndex) < argIds.size())
+                ? argIds[m.paramIndex] : INVALID_TYPE_ID;
+            data.members.push_back({ m.name, mt });
+        }
+        TypeInfo info;
+        info.kind = TypeInfo::Kind::Struct;
+        info.data = std::move(data);
+        underlying = state.internStructural(std::move(info));
+    }
+
+    TypeInfo named;
+    named.kind = TypeInfo::Kind::Named;
+    named.data = TypeInfo::NamedData{ bt.name, underlying, argIds };
+    state.result.table[placeholderId] = std::move(named);
+    state.result.builtinMonoType[placeholderId] = bt.tag;
+    return placeholderId;
+}
+
+// ---------------------------------------------------------------------------
 // Intern a base type node.
 // ---------------------------------------------------------------------------
 
@@ -412,6 +471,29 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
             // Generic type parameter?
             if (auto it = state.typeParamScope.find(name); it != state.typeParamScope.end())
                 return it->second;
+
+            // Built-in (prelude) type, e.g. Option<u32>? Built-in names are
+            // reserved (§5.1a), so this never collides with a user type.
+            if (const BuiltinTypeInfo* bt = findBuiltinType(name))
+            {
+                bool hasArgs = namedType.value().typeArguments.hasValue();
+                std::vector<TypeId> argIds;
+                if (hasArgs)
+                {
+                    namedType.value().typeArguments.forEach([&](const Required<AST::Type>& ta)
+                    {
+                        argIds.push_back(internASTType(state, ta.value(), resolved));
+                    });
+                }
+                if (argIds.size() != bt->arity)
+                {
+                    state.logger.logErrorInRange(*firstToken, *firstToken,
+                        "Built-in type '{}' expects {} type argument(s), got {}.",
+                        name, bt->arity, argIds.size());
+                    return INVALID_TYPE_ID;
+                }
+                return internBuiltinMono(state, *bt, std::move(argIds));
+            }
 
             // Named user-defined type — look up via resolved names.
             auto resolvedIt = resolved.names.find(&ident);
@@ -487,7 +569,7 @@ static TypeId internBaseType(InternState& state, const AST::BaseType& base, cons
 
                 TypeInfo info;
                 info.kind = TypeInfo::Kind::Named;
-                info.data = TypeInfo::NamedData{ state.getStringView(tdef.name), underlying };
+                info.data = TypeInfo::NamedData{ state.getStringView(tdef.name), underlying, argIds };
                 state.result.table[placeholderId] = std::move(info);
                 state.result.monoSourceDef[placeholderId] = &tdef;
 
@@ -760,10 +842,23 @@ static void internExpression(InternState& state, const AST::Expression& expr, co
         [&](const Required<AST::ArrayFillExpression>& fill)
         {
             internExpression(state, fill.value().value.value(), resolved);
+            internExpression(state, fill.value().size.value(), resolved);
         },
 
         [&](const Required<AST::StructInitializerExpression>& init)
         {
+            // A named struct initializer (`Foo { … }` / `Foo<i32> { … }`) carries a
+            // NamedType that is NOT an AST::Type node, so it was never interned. Intern
+            // it here — this instantiates the generic/built-in mono if type-args are
+            // present — and record the result so the checker/codegen can recover it.
+            if (init.value().type.hasValue())
+            {
+                AST::BaseType wrapped{ Required<AST::NamedType>{
+                    const_cast<AST::NamedType*>(init.value().type.ptr()) } };
+                TypeId tid = internBaseType(state, wrapped, resolved);
+                if (tid != INVALID_TYPE_ID)
+                    state.result.exprNamedTypes[init.value().type.ptr()] = tid;
+            }
             init.value().initializers.forEach([&](const Required<AST::StructInitializerExpression::MemberInitializer>& mi)
             {
                 internExpression(state, mi.value().value.value(), resolved);

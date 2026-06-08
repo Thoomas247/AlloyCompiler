@@ -1,0 +1,18 @@
+// Option<T> is a built-in (prelude) type — no declaration needed.
+extern printf(...) -> i32;
+
+fn main() -> u32 {
+	var x: Option<u32> = Option::Some(42);
+	var y: Option<u32> = Option::None;
+
+	match (x) {
+		Option::Some |v| { printf("x = Some(%u)\n", v); }
+		Option::None { printf("x = None\n"); }
+	}
+
+	match (y) {
+		Option::Some |v| { printf("y = Some(%u)\n", v); }
+		Option::None { printf("y = None\n"); }
+	}
+	return 0;
+}

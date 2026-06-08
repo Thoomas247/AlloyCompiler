@@ -1,0 +1,55 @@
+// §4.2 structural heap reclaim.
+//
+// Demonstrates the ownership story that backs growable collections:
+//   * a struct (`Buffer`) owns a `*[u32]` heap buffer through a field;
+//   * the buffer is reclaimed automatically by structural drop at scope end;
+//   * "growing" is manual (arrays are immutable in length): allocate a new
+//     buffer, copy, and reassign — free-on-reassign reclaims the old one;
+//   * returning an owned value transfers ownership (implicit move), so the
+//     callee does not free what it hands back.
+extern printf(...) -> i32;
+
+type Buffer = struct {
+	data: *var [u32];
+	len: u64;
+};
+
+// Allocate a 4-element buffer and hand it to the caller (ownership transfers).
+fn makeBuffer() -> Buffer {
+	var d: *var [u32] = new [0; 4];
+	var b: Buffer = Buffer { .data = move d, .len = 4 };
+	return b;            // implicit move — caller now owns b.data
+}
+
+fn total(self b: &Buffer) -> u32 {
+	var sum: u32 = 0;
+	var i: u64 = 0;
+	while (i < b.len) {
+		sum += b.data[i];
+		i += 1;
+	}
+	return sum;
+}
+
+fn main() -> u32 {
+	var b: Buffer = makeBuffer();
+	b.data[0] = 10;
+	b.data[1] = 20;
+	b.data[2] = 30;
+	b.data[3] = 40;
+
+	// Grow manually to 8 elements: allocate, copy, reassign.
+	var bigger: *var [u32] = new [0; 8];
+	var i: u64 = 0;
+	while (i < b.len) {
+		bigger[i] = b.data[i];
+		i += 1;
+	}
+	bigger[4] = 50;
+	b.data = move bigger;   // free-on-reassign frees the old 4-element buffer
+	b.len = 5;
+
+	printf("total = %u\n", total(&b));
+	return 0;
+	// scope end: `b` is dropped — its 8-element buffer is freed.
+}

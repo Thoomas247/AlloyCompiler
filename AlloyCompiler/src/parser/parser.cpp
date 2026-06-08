@@ -109,7 +109,10 @@ static Result<Optional<AST::ListNode<T>>> commaSeparatedList(ParserState& state,
 		}
 	}
 
-	ASSERT(state.it.consume<EndTokenKind>());
+	// A malformed list (an item not followed by ',' or the end token) must be a
+	// reported diagnostic, not a hard crash — e.g. `for (v in c)` where `in` is
+	// neither a comma nor ')'.
+	ERROR_IF_FALSE(state.it.consume<EndTokenKind>("',' or the closing delimiter after a list item"));
 
 	return { Ok, list.head };
 }
@@ -828,6 +831,57 @@ static bool isGenericCallAhead(const ParserState& state)
 	}
 }
 
+// Returns true if the current Identifier begins a generic struct initializer
+// `Ident <Types...> {`, rather than a comparison `Ident < ...`. Mirrors
+// isGenericCallAhead but checks for a trailing '{' instead of '('.
+static bool isGenericStructInitAhead(const ParserState& state)
+{
+	if (state.it.peek(1).kind != Less)
+		return false;
+
+	int depth = 1;
+	size_t offset = 2;  // after the Identifier and its '<'
+
+	while (true)
+	{
+		auto kind = state.it.peek(offset).kind;
+
+		if (kind == EndOfFile)
+			return false;
+
+		if (kind == Less)
+		{
+			++depth;
+		}
+		else if (kind == Greater)
+		{
+			--depth;
+			if (depth == 0)
+				return state.it.peek(offset + 1).kind == LBrace;
+		}
+		else if (
+			kind == Identifier ||
+			kind == DoubleColon ||
+			kind == Multiply ||
+			kind == BitwiseAnd ||
+			kind == Var ||
+			kind == LBracket ||
+			kind == RBracket ||
+			kind == Comma ||
+			kind == Semicolon ||
+			kind == IntegerLiteral)
+		{
+			// valid tokens inside a type-argument list — continue
+		}
+		else
+		{
+			return false;  // value-expression operator → it's a comparison
+		}
+
+		++offset;
+	}
+}
+
 static Result<Required<AST::MemberAccessExpression>> parseMemberAccessExpression(ParserState& state, Required<AST::Expression> left)
 {
 	ASSERT(state.it.consume<Dot>());
@@ -960,31 +1014,41 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 		auto [firstStatus, firstExpr] = parseExpression(state);
 		ERROR_IF_ERROR(firstStatus);
 
-		// [expr; N]
+		// [expr; N] — N is an integer-literal count (fixed array `[T; N]`) or a
+		// runtime expression (dynamically-sized array `[T]`, valid under `new`).
 		if (state.it.peek().kind == Semicolon)
 		{
 			state.it.consume<Semicolon>();
 
-			auto [sizeStatus, sizeToken] = state.it.consume<IntegerLiteral>("integral array size after ';'");
+			const Token& sizeFirst = state.it.peek();
+			auto [sizeStatus, sizeExpr] = parseExpression(state);
 			ERROR_IF_ERROR(sizeStatus);
 
+			// Reject a literal zero-sized array (`[v; 0]`). Runtime sizes are
+			// unchecked here (a negative/zero runtime size traps at the bounds
+			// check on first access).
+			if (auto* lit = std::get_if<Required<AST::LiteralExpression>>(&sizeExpr.value()))
 			{
-				std::string_view sizeView = state.it.createView(sizeToken, sizeToken);
-				size_t sz = 0;
-				for (char ch : sizeView)
-					if (ch >= '0' && ch <= '9')
-						sz = sz * 10 + static_cast<size_t>(ch - '0');
-				if (sz == 0)
+				const Token& tok = lit->value().value;
+				if (tok.kind == IntegerLiteral)
 				{
-					state.logger.logErrorInRange(sizeToken, sizeToken, "Empty arrays are not valid in Alloy — array fill size must be at least 1.");
-					return { Error };
+					std::string_view sizeView = state.it.createView(tok, tok);
+					size_t sz = 0;
+					for (char ch : sizeView)
+						if (ch >= '0' && ch <= '9')
+							sz = sz * 10 + static_cast<size_t>(ch - '0');
+					if (sz == 0)
+					{
+						state.logger.logErrorInRange(sizeFirst, sizeFirst, "Empty arrays are not valid in Alloy — array fill size must be at least 1.");
+						return { Error };
+					}
 				}
 			}
 
 			ERROR_IF_FALSE(state.it.consume<RBracket>("']' after array fill"));
 
 			return { Ok, state.allocator.allocate<AST::Expression>(
-				Required(state.allocator.allocate<AST::ArrayFillExpression>(firstExpr, sizeToken))
+				Required(state.allocator.allocate<AST::ArrayFillExpression>(firstExpr, sizeExpr))
 			) };
 		}
 
@@ -1020,7 +1084,8 @@ static Result<Required<AST::Expression>> parsePrimaryExpression(ParserState& sta
 
 	case Identifier:
 	{
-		if (state.it.peek(1).kind == LBrace)
+		// `Ident { ... }` or `Ident<Types...> { ... }` — a (generic) struct initializer.
+		if (state.it.peek(1).kind == LBrace || isGenericStructInitAhead(state))
 		{
 			auto [typeStatus, type] = parseNamedType(state);
 			ERROR_IF_ERROR(typeStatus);

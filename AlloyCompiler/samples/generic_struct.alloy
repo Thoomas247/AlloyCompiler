@@ -1,0 +1,36 @@
+// Generic struct definitions + generic extension methods + monomorphisation.
+//
+//   * `Pair<A, B>` is a generic struct; `Pair<u32, u32> { ... }` constructs an
+//     instance and the annotation/initializer agree on the monomorphised type.
+//   * `sum` and `swapFirst` are generic extension methods whose `self` receiver
+//     is a generic struct; the call site unifies `Pair<u32,u32>` against
+//     `Pair<A,B>` to bind A = B = u32, then monomorphises the method body.
+//   * Two distinct instantiations (`Pair<u32,u32>` and `Box<i64>`) prove a single
+//     generic definition lowers to a per-instance concrete struct.
+extern printf(...) -> i32;
+
+type Pair<A, B> = struct {
+	first: A;
+	second: B;
+};
+
+type Box<T> = struct {
+	value: T;
+};
+
+fn sum(self p: &Pair<u32, u32>) -> u32 {
+	return p.first + p.second;
+}
+
+fn get<T>(self b: &Box<T>) -> T {
+	return b.value;
+}
+
+fn main() -> u32 {
+	const p: Pair<u32, u32> = Pair<u32, u32> { .first = 30, .second = 12 };
+	printf("sum = %u\n", sum(&p));
+
+	const b: Box<i64> = Box<i64> { .value = 700 };
+	printf("box = %lld\n", get(&b));
+	return 0;
+}

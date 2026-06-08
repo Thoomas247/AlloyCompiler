@@ -1,0 +1,15 @@
+// Positive: `new [v; n]` with a RUNTIME element count yields a dynamically-sized
+// `*var [T]` (heap length-prefix layout). A compile-time literal count still
+// yields a fixed array. Compiles clean.
+extern printf(...) -> i32;
+
+fn main() -> u32 {
+	var n: u64 = 5;
+	var buf: *var [u32] = new [0; n];   // runtime-sized fill
+	var i: u64 = 0;
+	while (i < n) {
+		buf[i] = 7;
+		i += 1;
+	}
+	return buf[4];
+}

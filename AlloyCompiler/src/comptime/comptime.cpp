@@ -92,12 +92,24 @@ namespace
 
 		void run(AST::Module& module)
 		{
+			// §3.4 — compute which functions are reachable at runtime (from `main`
+			// via non-'#' calls). A '#Type' value escaping into a runtime position
+			// is an error only inside a runtime-reachable function; comptime-only
+			// helper functions (reached solely via `#fn()`) legitimately manipulate
+			// '#Type' values, so they must not be flagged.
+			computeRuntimeReachable(module);
+
 			AST::ListNode<AST::Definition>* node = module.definitions.ptr();
 			while (node)
 			{
 				std::visit(Overloaded
 				{
-					[&](Required<AST::FunctionDefinition>& fn) { rewriteFunction(fn.value()); },
+					[&](Required<AST::FunctionDefinition>& fn)
+					{
+						m_currentFnReachable = m_runtimeReachable.count(fn.ptr()) > 0;
+						rewriteFunction(fn.value());
+						m_currentFnReachable = false;
+					},
 					[&](Required<AST::TypeDefinition>& td)      { evalTypeDefinition(td.value()); },
 					[&](auto&) {},
 				}, node->item.value().definition);
@@ -106,6 +118,148 @@ namespace
 		}
 
 	private:
+		// === §3.4 runtime-reachability (for the '#Type' barrier) =============
+
+		void computeRuntimeReachable(AST::Module& module)
+		{
+			const AST::FunctionDefinition* mainFn = nullptr;
+			module.definitions.forEach([&](const Required<AST::Definition>& def)
+			{
+				if (auto* fd = std::get_if<Required<AST::FunctionDefinition>>(&def.value().definition))
+					if (text(fd->value().name) == "main")
+						mainFn = fd->ptr();
+			});
+			if (!mainFn)
+				return;   // no runtime entry point — nothing is runtime-reachable
+
+			std::vector<const AST::FunctionDefinition*> work{ mainFn };
+			while (!work.empty())
+			{
+				const AST::FunctionDefinition* fd = work.back();
+				work.pop_back();
+				if (!m_runtimeReachable.insert(fd).second)
+					continue;
+				std::unordered_set<const AST::FunctionDefinition*> callees;
+				collectCallsStmt(AST::Statement(fd->function.value().body), callees);
+				for (const auto* c : callees)
+					work.push_back(c);
+			}
+		}
+
+		// Collect runtime (non-'#') call targets. Does NOT descend into a
+		// ComptimeExpression — calls inside a '#' run at compile time.
+		void collectCallsExpr(const AST::Expression& expr,
+			std::unordered_set<const AST::FunctionDefinition*>& out)
+		{
+			std::visit(Overloaded
+			{
+				[&](const Required<AST::IdentifierExpression>&) {},
+				[&](const Required<AST::LiteralExpression>&) {},
+				[&](const Required<AST::ComptimeExpression>&) {},        // comptime — skip
+				[&](const Required<AST::ComptimeResultExpression>&) {},
+				[&](const Required<AST::FunctionCallExpression>& c)
+				{
+					if (auto* id = std::get_if<Required<AST::IdentifierExpression>>(&c.value().function.value()))
+						for (const auto* d : lookupAll(id->value()))
+							if (auto* fd = std::get_if<Required<AST::FunctionDefinition>>(&d->definition))
+								out.insert(fd->ptr());
+					collectCallsExpr(c.value().function.value(), out);
+					c.value().arguments.forEach([&](const Required<AST::Expression>& a)
+						{ collectCallsExpr(a.value(), out); });
+				},
+				[&](const Required<AST::MemberAccessExpression>& m)
+				{ collectCallsExpr(m.value().object.value(), out); },
+				[&](const Required<AST::ArrayAccessExpression>& a)
+				{ collectCallsExpr(a.value().object.value(), out); collectCallsExpr(a.value().index.value(), out); },
+				[&](const Required<AST::ArrayLiteralExpression>& a)
+				{ a.value().elements.forEach([&](const Required<AST::Expression>& e){ collectCallsExpr(e.value(), out); }); },
+				[&](const Required<AST::ArrayFillExpression>& a)
+				{ collectCallsExpr(a.value().value.value(), out); collectCallsExpr(a.value().size.value(), out); },
+				[&](const Required<AST::StructInitializerExpression>& s)
+				{ s.value().initializers.forEach([&](const Required<AST::StructInitializerExpression::MemberInitializer>& mi){ collectCallsExpr(mi.value().value.value(), out); }); },
+				[&](const Required<AST::LambdaExpression>& l)
+				{ collectCallsStmt(AST::Statement(l.value().function.value().body), out); },
+				[&](const Required<AST::BinaryExpression>& b)
+				{ collectCallsExpr(b.value().left.value(), out); collectCallsExpr(b.value().right.value(), out); },
+				[&](const Required<AST::UnaryExpression>& u)
+				{ collectCallsExpr(u.value().expression.value(), out); },
+				[&](const Required<AST::IsExpression>& i)
+				{ collectCallsExpr(i.value().object.value(), out); },
+				[&](const Required<AST::IfExpression>& e)
+				{
+					collectCallsExpr(e.value().condition.value(), out);
+					collectCallsStmt(e.value().thenBranch.value(), out);
+					if (e.value().elseBranch.hasValue()) collectCallsStmt(e.value().elseBranch.value(), out);
+				},
+				[&](const Required<AST::ForExpression>& e)
+				{
+					e.value().iterables.value().forEach([&](const Required<AST::Expression>& it){ collectCallsExpr(it.value(), out); });
+					collectCallsStmt(e.value().body.value(), out);
+					if (e.value().elseBody.hasValue()) collectCallsStmt(e.value().elseBody.value(), out);
+				},
+				[&](const Required<AST::WhileExpression>& e)
+				{
+					collectCallsExpr(e.value().condition.value(), out);
+					collectCallsStmt(e.value().body.value(), out);
+					if (e.value().elseBody.hasValue()) collectCallsStmt(e.value().elseBody.value(), out);
+				},
+				[&](const Required<AST::MatchExpression>& e)
+				{
+					collectCallsExpr(e.value().subject.value(), out);
+					e.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
+					{
+						if (arm.value().pattern.hasValue()) collectCallsExpr(arm.value().pattern.value(), out);
+						collectCallsStmt(arm.value().body.value(), out);
+					});
+					if (e.value().externalElse.hasValue()) collectCallsStmt(e.value().externalElse.value(), out);
+				},
+			}, expr);
+		}
+
+		void collectCallsStmt(const AST::Statement& stmt,
+			std::unordered_set<const AST::FunctionDefinition*>& out)
+		{
+			std::visit(Overloaded
+			{
+				[&](const Required<AST::VariableDefinitionStatement>& s) { collectCallsExpr(s.value().value.value(), out); },
+				[&](const Required<AST::AssignmentStatement>& s)
+				{ collectCallsExpr(s.value().target.value(), out); collectCallsExpr(s.value().value.value(), out); },
+				[&](const Required<AST::ExpressionStatement>& s) { collectCallsExpr(s.value().expression.value(), out); },
+				[&](const Required<AST::StatementBlock>& s)
+				{ s.value().statements.forEach([&](const Required<AST::Statement>& x){ collectCallsStmt(x.value(), out); }); },
+				[&](const Required<AST::IfExpression>& s)
+				{
+					collectCallsExpr(s.value().condition.value(), out);
+					collectCallsStmt(s.value().thenBranch.value(), out);
+					if (s.value().elseBranch.hasValue()) collectCallsStmt(s.value().elseBranch.value(), out);
+				},
+				[&](const Required<AST::ForExpression>& s)
+				{
+					s.value().iterables.value().forEach([&](const Required<AST::Expression>& it){ collectCallsExpr(it.value(), out); });
+					collectCallsStmt(s.value().body.value(), out);
+					if (s.value().elseBody.hasValue()) collectCallsStmt(s.value().elseBody.value(), out);
+				},
+				[&](const Required<AST::WhileExpression>& s)
+				{
+					collectCallsExpr(s.value().condition.value(), out);
+					collectCallsStmt(s.value().body.value(), out);
+					if (s.value().elseBody.hasValue()) collectCallsStmt(s.value().elseBody.value(), out);
+				},
+				[&](const Required<AST::MatchExpression>& s)
+				{
+					collectCallsExpr(s.value().subject.value(), out);
+					s.value().arms.forEach([&](const Required<AST::MatchArm>& arm)
+					{
+						if (arm.value().pattern.hasValue()) collectCallsExpr(arm.value().pattern.value(), out);
+						collectCallsStmt(arm.value().body.value(), out);
+					});
+					if (s.value().externalElse.hasValue()) collectCallsStmt(s.value().externalElse.value(), out);
+				},
+				[&](const Required<AST::BreakStatement>& s)  { if (s.value().value.hasValue()) collectCallsExpr(s.value().value.value(), out); },
+				[&](const Required<AST::ReturnStatement>& s) { if (s.value().value.hasValue()) collectCallsExpr(s.value().value.value(), out); },
+			}, stmt);
+		}
+
 		// === AST walker (value-substitution rewrite) =========================
 
 		void rewriteFunction(AST::FunctionDefinition& fn)
@@ -226,7 +380,7 @@ namespace
 					AST::ListNode<AST::Expression>* el = e.value().elements.ptr();
 					while (el) { rewriteExpr(el->item.value()); el = el->next.ptr(); }
 				},
-				[&](Required<AST::ArrayFillExpression>& e) { rewriteExpr(e.value().value.value()); },
+				[&](Required<AST::ArrayFillExpression>& e) { rewriteExpr(e.value().value.value()); rewriteExpr(e.value().size.value()); },
 				[&](Required<AST::StructInitializerExpression>& e)
 				{
 					AST::ListNode<AST::StructInitializerExpression::MemberInitializer>* m = e.value().initializers.ptr();
@@ -263,15 +417,18 @@ namespace
 				return;   // diagnostic already reported; leave the node unevaluated
 
 			// §3.4 — a '#Type' value exists only at compile time and is not a
-			// runtime value. The current walker visits every '#'-expression in
-			// the module, including helpers that only ever execute inside an
-			// outer comptime evaluation (e.g. a fn that returns a #Type and is
-			// always reached via `#fn()`). Reliably distinguishing those from
-			// genuine runtime-position uses needs reachability analysis the
-			// front-end doesn't yet do, so leave the node unsubstituted; an
-			// actual misuse will surface as a downstream type error.
+			// runtime value. If this '#'-expression sits in a runtime-reachable
+			// function (reachable from `main` via non-'#' calls), a '#Type'
+			// result is a genuine escape into a runtime position — diagnose it.
+			// In a comptime-only helper (reached solely via `#fn()`) the '#Type'
+			// is consumed by the outer comptime evaluation, so leave it be.
 			if (v.tag == ComptimeValue::Tag::Type)
+			{
+				if (m_currentFnReachable)
+					fail(node.hash, "A '#Type' value cannot escape to a runtime position; "
+						"types exist only at compile time.");
 				return;
+			}
 
 			AST::Expression* synth = synthExpr(v, node.hash);
 			if (!synth)
@@ -533,10 +690,17 @@ namespace
 			ComptimeValue elem = eval(e.value.value());
 			if (stop()) return ComptimeValue::error();
 
-			const int64_t n = parseInteger(text(e.size));
+			ComptimeValue sizeVal = eval(e.size.value());
+			if (stop()) return ComptimeValue::error();
+			if (sizeVal.tag != ComptimeValue::Tag::Integer)
+			{
+				fail(*m_currentHash, "A compile-time array-fill size must be an integer constant.");
+				return ComptimeValue::error();
+			}
+			const int64_t n = sizeVal.intVal;
 			if (n < 0 || n > MAX_ARRAY_SIZE)
 			{
-				fail(e.size, "Compile-time array-fill size is out of range.");
+				fail(*m_currentHash, "Compile-time array-fill size is out of range.");
 				return ComptimeValue::error();
 			}
 
@@ -1763,6 +1927,10 @@ namespace
 		std::vector<std::unordered_map<const void*, ComptimeValue>> m_frames;
 		std::unordered_set<const void*> m_evaluatingConsts;
 		SynthTypeMap& m_synthOut;
+
+		// §3.4 runtime-reachability for the '#Type' barrier.
+		std::unordered_set<const AST::FunctionDefinition*> m_runtimeReachable;
+		bool m_currentFnReachable = false;
 	};
 }
 

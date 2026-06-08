@@ -392,20 +392,29 @@ Accessing or interacting with a `&Type` or a `*Type` target uses **identical syn
 * **Slices (`&[T]`)**: Represent an unmanaged view into a sequence of elements whose bounds are unknown at compile time. Slices are structured internally as a runtime fat pointer pairing an address pointer with a explicit `u64` size boundary.
 * **Dynamically Sized Heap Arrays (`*[T]`)**: Represent a completely managed heap instance block instantiated via a `new` allocation expression:
 ```alloy
-var arr: *[u32] = new [0; 120]; // Allocates 120 elements of u32 initialized to 0
-
+var arr: *[u32] = new [0; 120];     // 120 elements of u32, initialised to 0
+var n: u64 = 120;
+var dyn: *var [u32] = new [0; n];   // count may be a runtime expression
 ```
+The fill count in `new [value; count]` may be a compile-time integer literal (which also permits a fixed stack array `[T; N]`) **or a runtime expression** — a runtime count always allocates a dynamically sized heap array (`*[T]`) of `count` elements, each initialised to `value`.
 
 
 * **Memory Layout & C-FFI Compatibility:** To retain total binary drop-in compatibility with legacy C ecosystems, a pointer to an Alloy dynamically sized array points directly to the memory address of the first active data element (`element[0]`).
 * **Length Metadata Tracking:** The allocation's length value (returned via `arr.length()`) is stored automatically by the runtime in a dedicated metadata prefix block located **immediately before the array data pointer** (i.e., at a negative memory offset from the user-facing pointer address).
 
-#### Ownership & `move`
+#### Ownership, `move`, and Structural Reclaim
 
-* A `*T` (or `*[T]`, or `*var T`) binding **owns** the heap allocation it points to. When the owning binding goes out of scope, the runtime emits a `free` for the allocation (the dyn-array form releases the malloc base at `user_ptr - 8`). Plain references (`&T`, `&var T`) are non-owning views and never trigger a free.
-* The `move` operator transfers ownership: `var q = move p` copies the pointer into `q` and clears the source slot. After `move p`, the binding `p` no longer owns anything — it is a null pointer.
+Ownership is **structural and automatic**. A value *owns heap* if it is a `*T` / `*var T` / `*[T]` pointer, a closure (which owns its captured environment), or a struct / array / enum that transitively contains an owning member, element, or active-variant payload. Plain references (`&T`, `&var T`) and slices (`&[T]`) are non-owning views and never own heap.
+
+* **Scope-end drop.** When an owning local goes out of scope (at every `return` path and at the implicit fall-through), the runtime *drops* it: it recursively frees the heap it owns. Dropping a pointer frees its allocation (the `*[T]` form releases the malloc base at `user_ptr - 8`); dropping a `*[T]` first drops every one of its elements (all elements of an array are initialised, so each is reclaimable); dropping a struct/array/enum drops each owning field/element/active payload; dropping a closure frees its environment. Recursive owning types (e.g. a node holding `*Self`) terminate at the first null pointer.
+* **`move` transfers ownership.** `var q = move p` copies the pointer into `q` and clears (zeroes) the source binding, so the source is no longer an owner. After `move p`, `p` is a null pointer and its scope-end drop is a no-op. `move` always yields a `*T` value — whole-struct transfer is therefore expressed by moving a `*Struct` pointer (or by borrowing through `&var`), not by copying the struct.
+* **Implicit move on return.** `return v`, where `v` is exactly an owning local, transfers ownership to the caller (the local is zeroed and not dropped). A value built in the `return` expression itself (a constructor, `new`, …) is likewise owned by the caller.
+* **Free-on-reassign.** Assigning to an owning binding (`buf = new […]`, `obj.field = move p`) first drops whatever that binding currently owns, then stores the new value — so the previous allocation is reclaimed rather than leaked.
 * **Debug builds** insert a null check on every dereference of a `*T` binding. A use-after-move accesses the null slot and traps (`@llvm.trap`). **Release builds** skip both the null check and the null-store on `move`, so a use-after-move dereferences null and the OS faults.
-* Closure environments and other long-lived allocations are owned by the slot that holds the closure value (or its delegate); the same scope-end free rules apply when ownership tracking is implemented for those forms (today only `*T` / `*[T]` are tracked).
+
+**Growth is manual.** A `*[T]` array has a fixed length once allocated (its length lives in the `user_ptr - 8` prefix); there is no in-place resize or `realloc` primitive. A growable collection (`Vec`/`String`) is built by hand: allocate a larger `*var [T]` buffer with a runtime-sized `new [value; count]`, copy the elements across, and reassign the owning field — free-on-reassign reclaims the old buffer automatically. A generic `Vec<T>` and an owning `String` written this way are demonstrated in `samples/vec.alloy` and `samples/string.alloy`; their mutating operations (`push`, `push_str`, …) take a `&var self` receiver and are invoked as methods (`vec.push(x)`).
+
+> **Manual-safety caveats.** Alloy does not run a borrow/move checker. Copying an owning struct by value (`var b2 = b;` without `move`) *aliases* its owned pointer and will double-free at scope end — transfer ownership through a `*Struct` + `move`, or borrow through `&`/`&var`, instead. A by-value parameter of an owning type is *borrowed*, not consumed (the caller retains ownership and drops it). Heap allocated only in a temporary position (e.g. a closure literal or `new` passed directly as a call argument, never bound to a local) is not yet reclaimed — bind it to a local to make it an owned slot.
 
 
 
@@ -431,6 +440,16 @@ break if (cond) break a; else break b;
 #### Loop Semantics (`for` and `while`)
 
 * Loops are completely interface-driven. Any structural data collection or type implementing the built-in `Iterable` interface (such as a fixed array, a slice `&[T]`, or a dynamically sized heap array `*[T]`) can be utilized inside a `for` loop statement.
+* **Custom iterables (cursor protocol).** A user type becomes iterable by providing two extension functions; the cursor is a separate value, not part of the container:
+
+  ```alloy
+  // The container yields a fresh cursor by value.
+  fn iterator(self c: &Container) -> SomeIter { ... }
+  // The cursor advances and reports the next element, or None when exhausted.
+  fn next(self it: &var SomeIter) -> Option<T> { ... }
+  ```
+
+  `for (c) |x| { ... }` lowers to: `it = c.iterator();` then repeatedly `match (it.next()) { Some |x| <body>; None { break the loop; } }`. The loop variable `x` is bound to the `Option`'s payload type `T`. Built-in arrays/slices/`*[T]` use the faster index-based lowering instead.
 * **Expression-Only `else` Clause:** The trailing `else` block on a `for` or `while` loop is **only permitted when the entire loop construct is evaluated as an expression** (e.g., when assigning its value to a variable). When an `else` block is supplied, a value expression is explicitly required along all execution paths: the loop body **must** yield a value via an explicit `break value;` statement, and the `else` block must evaluate to a value matching that same type. Using an `else` arm on a loop that is executed purely as a statement is a compile-time error.
 
 #### Match Expressions
@@ -490,6 +509,27 @@ fn add(self v: &Vec3, other: &Vec3) -> Vec3 { ... }
 | `reinterpret<T>` | `self s: &S` → `&T` | Reinterprets the bytes of `s` as type `T`. Returns a reference. |
 | `convert<T: Number>` | `self s: &S` → `T` | Converts the numeric value of `s` to type `T`. |
 | `.length()` | `self s: &Iterable` → `u64` | Built-in collection query method bundled into the core `Iterable` interface definition. Available natively on fixed arrays, dynamic heap arrays `*[T]`, slices `&[T]`, and custom iterator structures. |
+
+### 5.1a Built-in (Prelude) Types
+
+Some generic types are provided by the compiler with no source declaration —
+they are always in scope, unqualified, in every module. The compiler synthesises
+their structure directly and monomorphises them on use exactly like a user
+`type<T> = …` definition.
+
+| Type | Definition (equivalent) |
+| --- | --- |
+| `Option<T>` | `enum { Some: T; None; }` — a value that is either present (`Some(x)`) or absent (`None`). |
+
+```alloy
+var maybe: Option<u32> = Option::Some(42);
+match (maybe) {
+    Option::Some |v| { /* v : u32 */ }
+    Option::None    { /* empty */ }
+}
+```
+
+A program may not redeclare a built-in type name.
 
 ### 5.2 Built-in & User-Defined Interfaces
 

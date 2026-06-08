@@ -1,0 +1,10 @@
+// Positive: Option<T> is a built-in (prelude) type — usable without declaring it.
+fn main() -> u32 {
+	var a: Option<u32> = Option::Some(7);
+	var b: Option<u32> = Option::None;
+	match (a) {
+		Option::Some |v| { return v; }
+		Option::None { return 0; }
+	}
+	return 0;
+}

@@ -722,6 +722,85 @@ To verify a change:
     nested instantiation referring to outer type-params is only validated at the
     eventual concrete leaf.
 
+36. ~~**Built-in type registry + `Option<T>` (prelude type)**~~ **DONE.**
+    §5.1a. Built-in generic types are provided by the compiler with no source
+    declaration — a C++ registry (`builtins.hpp`: `enum class BuiltinType`,
+    `builtinTypes()`, `findBuiltinType(name)`) parallel to `s_BuiltinFunctions` /
+    `s_BuiltinInterfaces`. NO text prelude is injected — the type system
+    synthesises the `TypeInfo` directly. Each entry lists name, arity, enum/struct
+    flag, and members with a type-parameter index (`Option`: enum `Some`→param 0,
+    `None`→none). Wiring:
+    - **Resolver** (`resolver.cpp`): a built-in type name resolves without error
+      in both single-segment (`Option`) and qualified (`Option::Some`) positions;
+      the qualified form records an empty names entry (no `TypeDefinition`).
+    - **Interner** (`type_interner.cpp`): `internBuiltinMono` builds a real `Named`
+      whose underlying is a synthesised `Enum`/`Struct`, substituting the concrete
+      args into member/variant payloads. Cached per `(BuiltinType, args)`. Records
+      `InternedTypes::builtinMonoType[NamedId] = tag`. The NamedType interner branch
+      detects a built-in name before the user-type lookup and validates arity.
+    - **Type checker** (`type_checker.cpp`): `resolveEnumVariant` has a built-in
+      branch — when the first path segment is a built-in enum name it recovers the
+      mono instance from the call/annotation `contextType` via `builtinMonoType`.
+      The identifier handler resolves a payload-less built-in variant (`Option::None`)
+      before the empty-names early-return.
+    - **Codegen** (`codegen.cpp`): `classifyVariant` mirrors the same built-in
+      branch keyed off `fallbackEnumTy`.
+    Sample: `samples/option.alloy`; tests: `tests/builtin_option.alloy`,
+    `tests/builtin_option_arity.alloy`. *Limitation:* like user generic enums,
+    a variant constructor still needs a context type (annotation or call target)
+    to fix `T`; there is no turbofish on the variant call.
+
+37. ~~**Custom iterable structures (`for` cursor protocol)**~~ **DONE.**
+    §4.3 / §5. A user type is iterable when it provides
+    `iterator(self c: &C) -> Iter` (yields a cursor by value) and the cursor
+    provides `next(self it: &var Iter) -> Option<T>`. `for (c) |x| { … }`
+    lowers to `it = c.iterator(); loop { match it.next() { Some |x| body; None
+    break } }`. Wiring:
+    - **Type checker** (`type_checker.cpp`): `customIterableElem` resolves the
+      element type — `extensionReturnType("iterator", containerVal)` →
+      iterator type → `extensionReturnType("next", iterVal)` → `Option<T>` →
+      `enumFirstPayload` extracts `T`. The `for` handler falls back to this when
+      the iterable is not an Array/Slice, so the loop capture binds to `T`.
+    - **Codegen** (`codegen.cpp`): `genForCustom` (tried before the index-based
+      `genFor`) resolves the `iterator`/`next` extensions to their lowered
+      `llvm::Function*` via `resolveExtension` (self-type match over `cg.syms`),
+      calls `iterator` once to seed a stack cursor slot, then loops calling
+      `next(&var cursor)`, switching on the returned `Option`'s tag: Some →
+      bind payload into the capture slot + run body; None → exit. Built-in
+      collections keep the index fast path.
+    Samples: `samples/iter_manual.alloy` (manual protocol), `samples/iter_for.alloy`
+    (the `for` sugar); test: `tests/custom_iterable.alloy`. *Limitations:* single
+    iterable per `for` for the custom path (multi-iterable still array-only); the
+    cursor and Option are stack values (no heap / move interaction).
+
+38. ~~**Parser crash on malformed comma-list**~~ **DONE.** `commaSeparatedList`
+    ended with `ASSERT(consume<EndTokenKind>())`, so any list whose item was
+    followed by neither `,` nor the closing delimiter (e.g. the bogus
+    `for (v in c)` — `in` is an identifier, not a keyword) hit `__debugbreak()`
+    and the process died with no diagnostic. Replaced with
+    `ERROR_IF_FALSE(consume<EndTokenKind>(…))` so the parser reports
+    "Expected ',' or the closing delimiter after a list item" and recovers.
+
+39. ~~**Strict `#Type` runtime-barrier diagnostic**~~ **DONE.** §3.4. A `#Type`
+    reflection value exists only at compile time; letting one reach a runtime
+    value position is now an error — but only inside a *runtime-reachable*
+    function, so comptime-only helpers (reached solely via `#fn()`) may still
+    manipulate `#Type` freely. The comptime pass (`comptime.cpp`) now runs a
+    `computeRuntimeReachable` pre-pass: a call-graph BFS from `main` over
+    **non-`#`** direct-identifier calls (`collectCallsExpr`/`collectCallsStmt`
+    deliberately do not descend into `ComptimeExpression` subtrees, since those
+    run at compile time). `substituteComptime` flags a `#Type` result with
+    "A '#Type' value cannot escape to a runtime position" when the enclosing
+    function is in the reachable set; otherwise it leaves the node unsubstituted
+    as before. With no `main`, nothing is runtime-reachable (lenient — preserves
+    library/test behaviour). Tests: `tests/type_runtime_barrier.alloy` (escape in
+    `main` → error), `tests/type_comptime_helper_ok.alloy` (helper builds a type
+    with `#struct_type()`/`#u32` even with a `main` present → clean). *Limitation:*
+    reachability follows direct-identifier runtime calls only (member/indirect
+    calls don't create edges), so an escape inside a fn reached *only* through a
+    method call is under-approximated — it falls back to the prior "surfaces as a
+    downstream type error" behaviour rather than this dedicated diagnostic.
+
 28. ~~**Debug-build array bounds checks**~~ **DONE.** `emitBoundsCheck` in
     [`codegen.cpp`](src/codegen/codegen.cpp) injects a runtime test
     (`idx <u len → cond br ok / fail`; `fail` block calls `@llvm.trap` and
@@ -733,6 +812,133 @@ To verify a change:
     therefore also trap. The check runs in every build for now — the
     spec's "debug builds" qualifier becomes meaningful once a release
     configuration is added (§7 item 4).
+
+40. ~~**Structural heap reclaim + `move`/drop generalisation**~~ **DONE.** §4.2.
+    Ownership was generalised from "free `*T`/`*[T]` locals at scope end" to
+    full **structural drop** of any owned value. New in
+    [`codegen.cpp`](src/codegen/codegen.cpp):
+    - `needsDrop(TypeId)` — a value owns heap if it is a `*T`/`*var T`/`*[T]`
+      pointer, a closure (owns its env), or a struct/array/enum transitively
+      containing an owning member/element/variant-payload. References and
+      slices are non-owning.
+    - `emitDropValue(addr, T)` — recursive drop glue: a pointer frees its
+      allocation (after dropping the pointee); a `*[T]` drops every element
+      then frees the malloc base at `user_ptr - 8`; closures free their env.
+      All pointer derefs are null-guarded so a moved-from (nulled) slot is a
+      safe no-op.
+    - `getDropFn(T)` — per-type `alloy.drop.<id>(ptr)` glue for struct/array/
+      enum aggregates, so a recursive owning type (a node holding `*Self`)
+      lowers to a runtime call rather than infinitely inlined code.
+    - `OwnedSlot` now carries the slot's `TypeId` (not just an `isDynArr`
+      flag); every local whose storage `needsDrop` is registered.
+    - **Free-on-reassign**: assigning to an owning binding (`buf = new […]`,
+      `obj.field = move p`) drops the old value first (uses `rawTypeOf` to get
+      the un-stripped declared type, which also fixes `new`/`move` lowering
+      context for re-assigned dyn-array bindings).
+    - **Implicit move on return** (`zeroIfReturnedOwned`): `return v` for an
+      owning local zeroes its slot so the value is handed to the caller, not
+      dropped.
+    - `move` now zeroes the source via `zeroSlot` (unchanged for pointers).
+    Per the designer decision, reclaim is *structural/automatic* and there is
+    **no grow/`realloc` primitive** — arrays are fixed-length, so a growable
+    collection allocates a new `*var [T]` buffer, copies, and reassigns (the
+    old buffer is reclaimed by free-on-reassign). Sample:
+    [`samples/reclaim.alloy`](samples/reclaim.alloy) (struct owns a buffer,
+    manual grow, drop at scope end — verified the IR frees each allocation
+    exactly once); test `tests/heap_reclaim.alloy`. *Limitations:* (a) copying
+    an owning struct by value aliases its pointer (double-free — use `move`
+    through a `*Struct`, or borrow via `&`/`&var`); (b) a by-value owning
+    parameter is borrowed, not consumed; (c) heap allocated only in a
+    temporary position (a closure literal or `new` passed straight as a call
+    argument, never bound to a local) is still not reclaimed — bind it to a
+    local. A closure *bound to a local* now has its env freed.
+
+41. ~~**Indexing a `*[T]` held in a struct field**~~ **DONE.** A latent
+    codegen bug (exposed by item 40): the dyn-array `[]` branch used
+    `genAddr(object)` as the data pointer, which is the loaded pointer for a
+    local binding but the *field address* for a `*[T]` struct field — so
+    `buf.data[i]` read/wrote off the wrong address and trapped. Now it uses
+    `genExpr(object)` (the object's value = the heap base), matching the
+    already-correct `.length()` path. Required for any collection that stores
+    its buffer in a struct field.
+
+42. ~~**Built-in (prelude) type names are reserved**~~ **DONE.** §5.1a
+    (designer decision: forbid redeclaration over shadowing). A user `type`
+    whose name matches a built-in (`findBuiltinType`, e.g. `Option`) is now a
+    compile error (`'…' is a built-in type name and cannot be redeclared.`),
+    reported in `declare()` ([`resolver.cpp`](src/resolver/resolver.cpp)).
+    This resolves a collision where the built-in registry (checked by name in
+    the resolver/interner/checker/codegen) silently shadowed a same-named user
+    type — its variants were lost and `match` arms were skipped. With names
+    reserved, the built-in-first ordering in those layers is unambiguous.
+    `samples/generic_enum.alloy` / `tests/generic_enum.alloy` were renamed to
+    use `Maybe<T>`; test `tests/redeclare_builtin_type.alloy`.
+
+43. ~~**Generic structs: construction + generic methods + monomorphisation**~~
+    **DONE.** Generic *struct* definitions (`type Vec<T> = struct {…}`) can now
+    be constructed (`Vec<u32> { … }`) and given generic extension methods
+    (`fn push<T>(self v: &var Vec<T>, …)`), end-to-end (typecheck + codegen +
+    run). This was broken before; the gaps closed:
+    - **Parser** ([`parser.cpp`](src/parser/parser.cpp)): `Foo<Args> { … }` is now
+      recognised as a generic struct initializer via a balanced-angle lookahead
+      (`isGenericStructInitAhead`, mirroring `isGenericCallAhead`), so `Box<u32> {
+      .v = 1 }` no longer mis-parses as a comparison.
+    - **Interner** ([`type_interner.cpp`](src/typechecker/type_interner.cpp)): a
+      struct-initializer's `NamedType` (not an `AST::Type`, so never interned) is
+      now interned in the expression walk and recorded in
+      `InternedTypes::exprNamedTypes`, so the checker/codegen recover the (mono)
+      instance. `NamedData` gained `typeArgs` (the concrete arguments of a mono).
+    - **Type checker** ([`type_checker.cpp`](src/typechecker/type_checker.cpp)):
+      the struct-init handler consults `exprNamedTypes`; `unifyParam` gained
+      Named-vs-Named structural unification (same generic source → unify member/
+      variant types) and Slice/Array element unification, so `&var Vec<u32>`
+      unifies against `&var Vec<T>` and binds `T`; the member-call self-compat
+      pre-filter accepts a self whose value type shares the receiver's generic
+      source (was rejecting `Vec<u32>` vs `Vec<T>`); and `substituteTypeParams`
+      rebuilds a generic Named mono (`Vec<T>` → `Vec<u32>`) by matching interned
+      instances, so a generic factory `fn make<T>() -> Vec<T>` returns the right
+      concrete type.
+    - **Bug fix:** `tryGenericOverload` only published its inferred bindings on
+      the *return-type* path, so a generic **`void` method** (`push`, no `->`)
+      monomorphised with **unbound** type parameters → an LLVM "bad signature"
+      crash. Bindings are now published on every success path.
+    - **Codegen** ([`codegen.cpp`](src/codegen/codegen.cpp)): `substT` resolves a
+      generic Named mono to its concrete instance under the active bindings, and
+      `lowerType` may now reuse its type cache for a **concrete** type even while
+      monomorphising (`typeIsConcrete` gate) — so a mono's declared return type
+      and the value it returns lower to the *same* LLVM struct.
+    Samples: [`samples/generic_struct.alloy`](samples/generic_struct.alloy),
+    [`samples/vec.alloy`](samples/vec.alloy); tests `tests/generic_struct.alloy`,
+    `tests/generic_vec.alloy`.
+
+44. ~~**Runtime-sized heap array fill `new [v; n]`**~~ **DONE.** §4.2. The
+    array-fill size is now a full expression, not just an integer-literal token
+    (`ArrayFillExpression::size` changed `Token` → `Required<Expression>`; wired
+    through parser/resolver/interner/comptime). A compile-time integer-literal
+    count still yields a fixed array `[T; N]`; a **runtime** count yields a
+    dynamically-sized array `[T]` (a Slice), valid only as the operand of `new`,
+    which lowers to the §4.2 length-prefix heap layout with a fill loop
+    (`8 + n*sizeof(T)` bytes). This is the missing primitive growable collections
+    need — `new [x; v.len + 1]`. Test `tests/runtime_array_fill.alloy`.
+
+45. ~~**`String` and `Vec<T>` collections (§5)**~~ **DONE (expressible in Alloy).**
+    With items 43–44 plus structural reclaim (item 40), a growable `Vec<T>` and an
+    owning `String` are now writable in **pure Alloy** — no prelude, no built-in
+    registry magic. Samples [`samples/vec.alloy`](samples/vec.alloy) (generic
+    `Vec<T>`: `makeVec`/`push`/`get`/`len`/`sum`, grow-by-reallocate, auto-freed)
+    and [`samples/string.alloy`](samples/string.alloy) (owning byte `String`:
+    `push`/`push_str`/`print`) both build and run. Growth is the manual
+    allocate-copy-reassign pattern (free-on-reassign reclaims the old buffer);
+    every element stays initialised, matching the reclaim model (no spare
+    capacity). Mutation goes through `&var self` **methods** (the §7 method-style
+    idiom), which sidesteps the absent `&var expr` free-function form. Tests
+    `tests/generic_vec.alloy`, `tests/string_collection.alloy`.
+
+46. ~~**Unbuffered stdout (diagnostics survive teardown)**~~ **DONE.** The driver
+    ([`AlloyCompiler.cpp`](src/AlloyCompiler.cpp)) now sets `stdout` unbuffered at
+    `main` start. Previously a late teardown abort could drop block-buffered
+    progress/`--test` output (and surface as a confusing exit code) when output
+    was piped; diagnostics now flush as they are produced.
 
 ---
 
@@ -750,36 +956,37 @@ remaining gaps are concentrated in three areas:
   exists in the grammar (`as` is only an import alias). Needs an EBNF
   addition (`expr as Type` or `Type(expr)`) and matching checker + codegen
   paths.
-* **Real `move` semantics + drop / free** (§4.2). The parser accepts
-  `move p`, and codegen passes the pointer through, but there is no
-  ownership tracking and no destructor / `Drop` story. Closure heap envs,
-  `*[T]` allocations, and `new` heap blocks are never freed — programs
-  leak by construction. A real solution needs a lifetime / ownership
-  pass on top of the typechecker.
-* **`String` and standard collections** (§5). No stdlib modules exist.
-  String literals are typed `&[u8]`; there is no `String` value type,
-  no `Vec`, etc. The generic-enum prerequisite for an `Option<T>` value
-  is now in place (item 35).
+* **A *packaged* standard library** (§5). `Vec<T>` and `String` are now
+  *expressible* in pure Alloy and demonstrated as samples (items 43–45),
+  but they are not yet shipped as importable `std` modules — `--build`
+  compiles a single file with no import resolution, so a stdlib module
+  cannot be imported under it. Turning the demonstrated `Vec`/`String`
+  into an importable `std::vec` / `std::string` needs `--build` (or a
+  package driver) to resolve imports, plus a richer API surface
+  (`pop`, `insert`, iterators, `Option<T>` returns for fallible ops).
+  The *language* gap is closed; what remains is *packaging*.
 * **Comptime filesystem I/O** (§6.3 example: `readTypeFromJson`). §6.2
-  defines the sandbox but no comptime I/O primitives exist. `Iterable`
-  is structurally satisfied for arrays/slices but custom iterator
-  structures are not yet supported.
+  defines the sandbox but no comptime I/O primitives exist. Custom
+  iterator structures are now supported (item 37) via the
+  `iterator()`/`next() -> Option<T>` cursor protocol.
 
 ### Codegen partial implementations (architectural, not quick fixes)
 
-* **Strict `#Type` runtime-barrier diagnostic** (§3.4). A `#Type` that
-  reaches a genuine runtime value position is left silently
-  unsubstituted rather than always reported, because a reachability
-  pass would be required to distinguish legitimate comptime helper
-  bodies (which contain `#u32` etc.) from real runtime escapes.
-* **String-subject `match`** (§4.3). A `match` on a string subject
-  falls through the enum path leniently; there's no real
-  string-pattern matching. Needs a dedicated lowering path.
-* **Closure / dyn-array / `new` heap reclaim** (§4.2). See `move`
-  above — until the ownership story is settled, every heap allocation
-  leaks. Pragmatically the right fix is per-frame arena release for
-  short-lived closures plus `move`-driven free for long-lived heap
-  values.
+* **Statement-temporary heap reclaim** (§4.2). Structural drop (item 40)
+  reclaims every heap value reachable from an owned *local* — pointers,
+  dyn-array elements, struct/array/enum fields, and a closure env bound
+  to a local. What is **not** yet reclaimed is heap materialised only in
+  a *temporary* position: a closure literal or `new` expression passed
+  straight as a call argument and never bound to a local has no slot to
+  own it. The fix is statement-scoped temporary tracking (free temporaries
+  at the end of the full expression), orthogonal to the per-binding
+  ownership now in place.
+* **No move/borrow checker** (§4.2). Reclaim is structural and automatic
+  but unchecked: copying an owning struct by value aliases its pointer and
+  double-frees at scope end (the documented contract is to transfer via a
+  `*Struct` + `move`, or borrow through `&`/`&var`). A static use-after-
+  move / alias analysis would turn these into compile errors instead of
+  runtime traps (debug) / faults (release).
 
 ### Diagnostics & ergonomics
 
@@ -794,7 +1001,20 @@ remaining gaps are concentrated in three areas:
 
 ### Open spec ambiguities (see §7)
 
-None remaining as of this revision — the two prior open items (`if`
-branch grammar and extern return type) are both resolved. New
-ambiguities, if any, should be added back to §7 rather than buried
-in code comments.
+* **No `&var` address-of expression.** The grammar's address-of operator
+  is `&` only (`unary_op = "~" | "!" | "&" | "new" | "move"`), so there
+  is no way to *spell* taking a mutable reference to pass to a free
+  function expecting `&var T` — `&var x` is a parse error. Mutation
+  through a borrow works via **member calls** (a method whose `self` is
+  `&var T` mutates a mutable receiver, per A9), which is sufficient for
+  collection methods (`vec.push(x)`), but a free `fn grow(b: &var Buf)`
+  cannot be called as `grow(&var b)`. The working `Vec`/`String` samples
+  (items 43–45) confirm the **method-style idiom is sufficient** for
+  real collections — `vec.push(x)` / `s.push_str(t)` all mutate through
+  `&var self`. So this is a non-issue in practice unless a free
+  `&var`-taking function is wanted; if so, `&var expr` would be a small
+  grammar addition — a designer call.
+
+The two original open items (`if` branch grammar and extern return
+type) are resolved. New ambiguities should be added here rather than
+buried in code comments.

@@ -1,0 +1,5 @@
+// Negative: built-in Option takes exactly one type argument.
+fn main() -> u32 {
+	var a: Option<u32, i32> = Option::None;  //@expect-error Built-in type 'Option' expects 1 type argument
+	return 0;
+}

@@ -607,6 +607,69 @@ static bool unifyParam(TypeId paramId, TypeId argId, std::unordered_map<TypeId, 
 		return unifyParam(paramInner, argInner, bindings, interned);
 	}
 
+	// Generic Named monos from the same source (user generic def or built-in
+	// prelude type): unify their structural bodies so e.g. Box<T> unifies with
+	// Box<u32> and binds T = u32, or Option<T> with Option<u32>. Gated on a
+	// shared source so two unrelated same-shaped types do not spuriously unify.
+	if (paramInfo.kind == TypeInfo::Kind::Named
+		&& argId < static_cast<TypeId>(interned.table.size())
+		&& interned.get(argId).kind == TypeInfo::Kind::Named)
+	{
+		const TypeInfo& argInfo = interned.get(argId);
+		bool sameSource = false;
+		auto pUser = interned.monoSourceDef.find(paramId);
+		auto aUser = interned.monoSourceDef.find(argId);
+		if (pUser != interned.monoSourceDef.end() && aUser != interned.monoSourceDef.end())
+			sameSource = (pUser->second == aUser->second);
+		if (!sameSource)
+		{
+			auto pBi = interned.builtinMonoType.find(paramId);
+			auto aBi = interned.builtinMonoType.find(argId);
+			if (pBi != interned.builtinMonoType.end() && aBi != interned.builtinMonoType.end())
+				sameSource = (pBi->second == aBi->second);
+		}
+		if (sameSource)
+		{
+			const TypeInfo& pUnder = interned.get(paramInfo.asNamed().underlying);
+			const TypeInfo& aUnder = interned.get(argInfo.asNamed().underlying);
+			if (pUnder.kind == TypeInfo::Kind::Struct && aUnder.kind == TypeInfo::Kind::Struct)
+			{
+				const auto& pm = pUnder.asStruct().members;
+				const auto& am = aUnder.asStruct().members;
+				if (pm.size() != am.size()) return false;
+				for (size_t i = 0; i < pm.size(); ++i)
+					if (!unifyParam(pm[i].type, am[i].type, bindings, interned)) return false;
+				return true;
+			}
+			if (pUnder.kind == TypeInfo::Kind::Enum && aUnder.kind == TypeInfo::Kind::Enum)
+			{
+				const auto& pv = pUnder.asEnum().variants;
+				const auto& av = aUnder.asEnum().variants;
+				if (pv.size() != av.size()) return false;
+				for (size_t i = 0; i < pv.size(); ++i)
+				{
+					if (pv[i].payloadType.has_value() != av[i].payloadType.has_value()) return false;
+					if (pv[i].payloadType.has_value()
+						&& !unifyParam(*pv[i].payloadType, *av[i].payloadType, bindings, interned))
+						return false;
+				}
+				return true;
+			}
+		}
+	}
+
+	// Slice / fixed-array: unify element types so `[T]` unifies with `[u32]`
+	// (and `[T; N]` with `[u32; N]`) — needed for a generic struct field like
+	// `data: *var [T]` to bind T from a concrete `*var [u32]`.
+	if (argId < static_cast<TypeId>(interned.table.size()))
+	{
+		const TypeInfo& argInfo = interned.get(argId);
+		if (paramInfo.kind == TypeInfo::Kind::Slice && argInfo.kind == TypeInfo::Kind::Slice)
+			return unifyParam(paramInfo.asSlice().elem, argInfo.asSlice().elem, bindings, interned);
+		if (paramInfo.kind == TypeInfo::Kind::Array && argInfo.kind == TypeInfo::Kind::Array)
+			return unifyParam(paramInfo.asArray().elem, argInfo.asArray().elem, bindings, interned);
+	}
+
 	return isAssignable(argId, paramId, interned);
 }
 
@@ -628,6 +691,46 @@ static TypeId substituteTypeParams(TypeId id, const std::unordered_map<TypeId, T
 	{
 		TypeId innerSub = substituteTypeParams(info.asIndirection().inner, bindings, interned);
 		return (innerSub == info.asIndirection().inner) ? id : innerSub;
+	}
+
+	// Generic Named mono (e.g. `Vec<T>`): substitute its type arguments and
+	// resolve to the matching concrete instance (`Vec<u32>`) if one has already
+	// been interned — so a generic factory `fn make<T>() -> Vec<T>` yields the
+	// right concrete return type. If no instance exists, leave it unchanged.
+	if (info.kind == TypeInfo::Kind::Named && !info.asNamed().typeArgs.empty())
+	{
+		const auto& nd = info.asNamed();
+		std::vector<TypeId> subArgs;
+		bool changed = false;
+		for (TypeId a : nd.typeArgs)
+		{
+			TypeId s = substituteTypeParams(a, bindings, interned);
+			if (s != a) changed = true;
+			subArgs.push_back(s);
+		}
+		if (!changed) return id;
+
+		auto srcIt = interned.monoSourceDef.find(id);
+		auto biIt = interned.builtinMonoType.find(id);
+		for (TypeId cand = 0; cand < static_cast<TypeId>(interned.table.size()); ++cand)
+		{
+			const TypeInfo& ci = interned.get(cand);
+			if (ci.kind != TypeInfo::Kind::Named || ci.asNamed().typeArgs != subArgs)
+				continue;
+			if (srcIt != interned.monoSourceDef.end())
+			{
+				auto cs = interned.monoSourceDef.find(cand);
+				if (cs != interned.monoSourceDef.end() && cs->second == srcIt->second)
+					return cand;
+			}
+			else if (biIt != interned.builtinMonoType.end())
+			{
+				auto cb = interned.builtinMonoType.find(cand);
+				if (cb != interned.builtinMonoType.end() && cb->second == biIt->second)
+					return cand;
+			}
+		}
+		return id;
 	}
 	return id;
 }
@@ -656,6 +759,51 @@ static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::Identifi
 	const AST::ListNode<const Token*>* first = ident.path.ptr();
 	if (!first || !first->next.hasValue())
 		return result;   // not a qualified path
+
+	// Built-in (prelude) enum, e.g. `Option::Some` — the first segment names a
+	// built-in type and there is no resolved TypeDefinition. Recover the mono
+	// instance from the call/annotation context type. (Built-in names are
+	// reserved per §5.1a, so this never collides with a user type.)
+	std::string_view firstName = state.getStringView(*first->item.value());
+	if (const BuiltinTypeInfo* bt = findBuiltinType(firstName); bt && bt->isEnum)
+	{
+		TypeId ctx = contextType;
+		while (ctx != INVALID_TYPE_ID && ctx < static_cast<TypeId>(state.interned.table.size())
+			&& state.interned.get(ctx).isIndirection())
+			ctx = state.interned.get(ctx).asIndirection().inner;
+		if (ctx == INVALID_TYPE_ID)
+			return result;
+		auto bmIt = state.interned.builtinMonoType.find(ctx);
+		if (bmIt == state.interned.builtinMonoType.end() || bmIt->second != bt->tag)
+			return result;
+
+		TypeId cur = ctx;
+		while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size())
+			&& state.interned.get(cur).kind == TypeInfo::Kind::Named)
+			cur = state.interned.get(cur).asNamed().underlying;
+		if (cur == INVALID_TYPE_ID || cur >= static_cast<TypeId>(state.interned.table.size())
+			|| state.interned.get(cur).kind != TypeInfo::Kind::Enum)
+			return result;
+
+		result.enumTypeId = ctx;
+		const AST::ListNode<const Token*>* node = first;
+		while (node->next.hasValue())
+			node = node->next.ptr();
+		result.variantToken = node->item.value();
+		std::string_view variantName = state.getStringView(*result.variantToken);
+		for (const auto& v : state.interned.get(cur).asEnum().variants)
+		{
+			if (v.name == variantName)
+			{
+				result.variantFound = true;
+				result.hasPayload = v.payloadType.has_value();
+				if (result.hasPayload)
+					result.payloadType = *v.payloadType;
+				break;
+			}
+		}
+		return result;
+	}
 
 	auto declIt = state.resolved.names.find(&ident);
 	if (declIt == state.resolved.names.end() || declIt->second.empty())
@@ -724,6 +872,67 @@ static EnumVariantInfo resolveEnumVariant(CheckState& state, const AST::Identifi
 		}
 	}
 	return result;
+}
+
+// §5 custom iterable: return type of an extension fn `name` whose `self`
+// value-type matches selfValueType, or INVALID if none found.
+static TypeId extensionReturnType(CheckState& state, std::string_view name, TypeId selfValueType)
+{
+	if (selfValueType == INVALID_TYPE_ID)
+		return INVALID_TYPE_ID;
+	for (const auto* decl : state.moduleSymbols.get(name))
+	{
+		const AST::Function* fn = getDeclFunction(*decl);
+		if (!fn) continue;
+		const auto* pl = fn->parameters.ptr();
+		if (!pl) continue;
+		const auto& first = pl->item.value();
+		if (!first.isSelf) continue;
+		auto it = state.interned.astTypes.find(&first.type.value());
+		if (it == state.interned.astTypes.end()) continue;
+		TypeId fpVal = stripIndirection(it->second, state.interned);
+		if (fpVal != selfValueType && !isAssignable(selfValueType, fpVal, state.interned))
+			continue;
+		if (!fn->returnType.hasValue())
+			return INVALID_TYPE_ID;
+		auto rit = state.interned.astTypes.find(&fn->returnType.value());
+		return rit != state.interned.astTypes.end() ? rit->second : INVALID_TYPE_ID;
+	}
+	return INVALID_TYPE_ID;
+}
+
+// If `t` resolves to an enum with a payload-carrying variant (e.g. Option<T>'s
+// `Some: T`), return that payload type; else INVALID.
+static TypeId enumFirstPayload(const InternedTypes& interned, TypeId t)
+{
+	TypeId cur = t;
+	while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(interned.table.size())
+		&& interned.get(cur).kind == TypeInfo::Kind::Named)
+		cur = interned.get(cur).asNamed().underlying;
+	if (cur == INVALID_TYPE_ID || cur >= static_cast<TypeId>(interned.table.size())
+		|| interned.get(cur).kind != TypeInfo::Kind::Enum)
+		return INVALID_TYPE_ID;
+	for (const auto& v : interned.get(cur).asEnum().variants)
+		if (v.payloadType.has_value())
+			return *v.payloadType;
+	return INVALID_TYPE_ID;
+}
+
+// §5 custom iterable element type for a `for` over containerType:
+//   container.iterator() -> Iter ;  Iter.next(&var self) -> Option<Elem>
+// Returns the element type (Elem) or INVALID if `containerType` is not a
+// custom iterable.
+static TypeId customIterableElem(CheckState& state, TypeId containerType)
+{
+	TypeId contVal = stripIndirection(containerType, state.interned);
+	TypeId iterType = extensionReturnType(state, "iterator", contVal);
+	if (iterType == INVALID_TYPE_ID)
+		return INVALID_TYPE_ID;
+	TypeId iterVal = stripIndirection(iterType, state.interned);
+	TypeId nextRet = extensionReturnType(state, "next", iterVal);
+	if (nextRet == INVALID_TYPE_ID)
+		return INVALID_TYPE_ID;
+	return enumFirstPayload(state.interned, nextRet);
 }
 
 // check whether a TypeId satisfies a BuiltinInterface constraint
@@ -857,6 +1066,11 @@ static TypeId tryGenericOverload(const ResolvedDeclaration& decl, const std::vec
 		return INVALID_TYPE_ID;
 	}
 
+	// Publish the inferred bindings on EVERY success path — including a method
+	// with no return type (a generic `void` method such as `push`), whose mono
+	// would otherwise be built with unbound type parameters.
+	outBindings = std::move(bindings);
+
 	// compute substituted return type
 	if (!fn->returnType.hasValue())
 	{
@@ -869,7 +1083,6 @@ static TypeId tryGenericOverload(const ResolvedDeclaration& decl, const std::vec
 		return INVALID_TYPE_ID;
 	}
 
-	outBindings = std::move(bindings);
 	return substituteTypeParams(retIt->second, outBindings, interned);
 }
 
@@ -882,6 +1095,21 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			// identifier
 			[&](const Required<AST::IdentifierExpression>& ident)
 			{
+				// Built-in payload-less variant value (e.g. `Option::None`). The
+				// resolver leaves built-in paths with an empty names entry, so this
+				// must run before the empty-names early return below.
+				{
+					const AST::ListNode<const Token*>* p0 = ident.value().path.ptr();
+					if (p0 && p0->next.hasValue()
+						&& findBuiltinType(state.getStringView(*p0->item.value())))
+					{
+						EnumVariantInfo ev = resolveEnumVariant(state, ident.value(), contextType);
+						if (ev.enumTypeId != INVALID_TYPE_ID && ev.variantFound && !ev.hasPayload)
+							resultType = ev.enumTypeId;
+						return;
+					}
+				}
+
 				auto resolvedIt = state.resolved.names.find(&ident.value());
 				if (resolvedIt == state.resolved.names.end() || resolvedIt->second.empty())
 				{
@@ -1359,9 +1587,33 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					TypeId fpStorageId = it->second;
 					TypeId fpValueId = stripIndirection(fpStorageId, state.interned);
 
+					// A generic method's self value type may be a generic Named mono
+					// (e.g. Vec<T>); accept it when it shares the receiver's generic
+					// source so the generic-overload pass can unify the type params.
+					bool sameGenericSource = false;
+					{
+						TypeId selfVal = stripIndirection(selfType, state.interned);
+						auto sUser = state.interned.monoSourceDef.find(selfVal);
+						auto fUser = state.interned.monoSourceDef.find(fpValueId);
+						if (sUser != state.interned.monoSourceDef.end()
+							&& fUser != state.interned.monoSourceDef.end()
+							&& sUser->second == fUser->second)
+							sameGenericSource = true;
+						if (!sameGenericSource)
+						{
+							auto sBi = state.interned.builtinMonoType.find(selfVal);
+							auto fBi = state.interned.builtinMonoType.find(fpValueId);
+							if (sBi != state.interned.builtinMonoType.end()
+								&& fBi != state.interned.builtinMonoType.end()
+								&& sBi->second == fBi->second)
+								sameGenericSource = true;
+						}
+					}
+
 					bool selfOk =
-						state.interned.get(fpValueId).kind == TypeInfo::Kind::TypeParam ||
 						fpValueId == INVALID_TYPE_ID ||
+						state.interned.get(fpValueId).kind == TypeInfo::Kind::TypeParam ||
+						sameGenericSource ||
 						isAssignable(selfType, fpValueId, state.interned);
 
 					if (selfOk) candidates.push_back(decl);
@@ -1706,19 +1958,41 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					elemType = (elemType == TYPE_UNTYPED_INT) ? TYPE_I32 : TYPE_F32;
 			}
 
-			// Parse size from the integer literal token.
-			const Token& sizeTok = fill.value().size;
-			std::string_view sizeText = state.getStringView(sizeTok);
+						// The size expression must be an integer. A compile-time integer literal
+			// yields a fixed array [T; N]; any other (runtime) size yields a
+			// dynamically-sized array [T] (a Slice), valid only as the operand of
+			// new (heap length-prefix layout, sec 4.2).
+			checkExpression(state, fill.value().size.value(), scope, TYPE_U64);
+
+			bool constSize = false;
 			size_t arraySize = 0;
-			for (char ch : sizeText)
-				arraySize = arraySize * 10 + static_cast<size_t>(ch - '0');
+			if (auto* lit = std::get_if<Required<AST::LiteralExpression>>(&fill.value().size.value()))
+			{
+				const Token& tok = lit->value().value;
+				if (tok.kind == TokenKind::IntegerLiteral)
+				{
+					std::string_view sizeText = state.getStringView(tok);
+					for (char ch : sizeText)
+						if (ch >= '0' && ch <= '9')
+							arraySize = arraySize * 10 + static_cast<size_t>(ch - '0');
+					constSize = true;
+				}
+			}
 
 			if (elemType != INVALID_TYPE_ID)
 			{
-				TypeInfo arrayInfo;
-				arrayInfo.kind = TypeInfo::Kind::Array;
-				arrayInfo.data = TypeInfo::ArrayData{ elemType, arraySize };
-				resultType = state.internType(std::move(arrayInfo));
+				TypeInfo info;
+				if (constSize)
+				{
+					info.kind = TypeInfo::Kind::Array;
+					info.data = TypeInfo::ArrayData{ elemType, arraySize };
+				}
+				else
+				{
+					info.kind = TypeInfo::Kind::Slice;
+					info.data = TypeInfo::SliceData{ elemType };
+				}
+				resultType = state.internType(std::move(info));
 			}
 		},
 
@@ -1730,9 +2004,15 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			const TypeInfo::StructData* structData = nullptr;
 			if (init.value().type.hasValue())
 			{
+				// Prefer the interner-recorded instance for this exact NamedType node
+				// (handles generic monos like Box<u32> { ... }, absent from namedTypeIds).
+				auto exprIt = state.interned.exprNamedTypes.find(init.value().type.ptr());
+				if (exprIt != state.interned.exprNamedTypes.end())
+					namedTypeId = exprIt->second;
+
 				const auto& nameIdent = init.value().type.value().name.value();
 				auto resolvedIt = state.resolved.names.find(&nameIdent);
-				if (resolvedIt != state.resolved.names.end() && !resolvedIt->second.empty())
+				if (namedTypeId == INVALID_TYPE_ID && resolvedIt != state.resolved.names.end() && !resolvedIt->second.empty())
 				{
 					if (auto* td = std::get_if<Required<AST::TypeDefinition>>(&resolvedIt->second[0]->definition))
 					{
@@ -1751,6 +2031,20 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 							}
 						}
 					}
+				}
+			}
+
+			// Recover member layout from the resolved Named id when the by-name
+			// block above did not (the exprNamedTypes / generic-mono path).
+			if (namedTypeId != INVALID_TYPE_ID && !structData)
+			{
+				TypeId cur = namedTypeId;
+				while (cur != INVALID_TYPE_ID && cur < static_cast<TypeId>(state.interned.table.size()))
+				{
+					const TypeInfo& info = state.interned.get(cur);
+					if (info.kind == TypeInfo::Kind::Named) { cur = info.asNamed().underlying; continue; }
+					if (info.kind == TypeInfo::Kind::Struct) structData = &info.asStruct();
+					break;
 				}
 			}
 
@@ -1968,6 +2262,9 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					if (info.kind == TypeInfo::Kind::Array)      elemT = info.asArray().elem;
 					else if (info.kind == TypeInfo::Kind::Slice) elemT = info.asSlice().elem;
 				}
+				// §5: custom iterable — container.iterator().next() -> Option<Elem>.
+				if (elemT == INVALID_TYPE_ID)
+					elemT = customIterableElem(state, iterType);
 				elemTypes.push_back(elemT);
 			});
 

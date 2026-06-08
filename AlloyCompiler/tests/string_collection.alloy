@@ -1,0 +1,40 @@
+// Positive: a growable owning String (heap `*var [u8]` buffer). Exercises a
+// `&var self` method calling another method, appending a string-literal slice,
+// and structural reclaim. Compiles clean.
+extern printf(...) -> i32;
+
+type String = struct {
+	data: *var [u8];
+	len: u64;
+};
+
+fn emptyString() -> String {
+	return String { .data = new [0; 1], .len = 0 };
+}
+
+fn push(self s: &var String, c: u8) {
+	var bigger: *var [u8] = new [c; s.len + 1];
+	var i: u64 = 0;
+	while (i < s.len) {
+		bigger[i] = s.data[i];
+		i += 1;
+	}
+	bigger[s.len] = c;
+	s.data = move bigger;
+	s.len += 1;
+}
+
+fn push_str(self s: &var String, text: &[u8]) {
+	var i: u64 = 0;
+	while (i < text.length()) {
+		s.push(text[i]);
+		i += 1;
+	}
+}
+
+fn main() -> u32 {
+	var s: String = emptyString();
+	s.push_str("hi");
+	s.push('!');
+	return 0;
+}

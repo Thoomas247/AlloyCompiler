@@ -1,0 +1,43 @@
+// §4.2 structural heap reclaim (positive — must compile clean).
+// A struct owns a `*var [u32]` buffer; the compiler reclaims it via structural
+// drop at scope end. "Growing" is manual (arrays are fixed-length): allocate a
+// new buffer, copy, reassign (free-on-reassign reclaims the old one). Returning
+// an owned value transfers ownership (implicit move).
+type Buffer = struct {
+	data: *var [u32];
+	len: u64;
+};
+
+fn makeBuffer() -> Buffer {
+	var d: *var [u32] = new [0; 4];
+	var b: Buffer = Buffer { .data = move d, .len = 4 };
+	return b;            // implicit move — caller now owns b.data
+}
+
+fn total(self b: &Buffer) -> u32 {
+	var sum: u32 = 0;
+	var i: u64 = 0;
+	while (i < b.len) {
+		sum += b.data[i];
+		i += 1;
+	}
+	return sum;
+}
+
+fn main() -> u32 {
+	var b: Buffer = makeBuffer();
+	b.data[0] = 1;
+
+	// Grow manually: allocate a larger buffer, copy, reassign.
+	var bigger: *var [u32] = new [0; 8];
+	var i: u64 = 0;
+	while (i < b.len) {
+		bigger[i] = b.data[i];
+		i += 1;
+	}
+	b.data = move bigger;   // old buffer reclaimed by free-on-reassign
+	b.len = 8;
+
+	return total(&b);
+	// scope end: `b` dropped — its buffer freed.
+}

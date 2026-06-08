@@ -1,0 +1,15 @@
+// Positive: generic struct construction + generic extension method resolution.
+// `Box<u32> { ... }` instantiates the mono and the call `get(&b)` unifies
+// `&Box<u32>` against the generic method's `&Box<T>` self parameter.
+type Box<T> = struct {
+	value: T;
+};
+
+fn get<T>(self b: &Box<T>) -> T {
+	return b.value;
+}
+
+fn main() -> u32 {
+	const b: Box<u32> = Box<u32> { .value = 42 };
+	return get(&b);
+}

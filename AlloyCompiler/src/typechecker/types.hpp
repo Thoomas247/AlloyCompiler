@@ -110,6 +110,10 @@ struct TypeInfo
 	{
 		std::string_view name;
 		TypeId underlying = INVALID_TYPE_ID;
+		// For a monomorphised generic instance (`Foo<i32, u8>`), the concrete
+		// type arguments in declaration order. Empty for non-generic named types.
+		// Lets substituteTypeParams rebuild `Foo<T>` into `Foo<u32>`.
+		std::vector<TypeId> typeArgs;
 	};
 
 	struct TypeParamData
@@ -189,6 +193,16 @@ struct InternedTypes
 	// Monomorphised generic Named TypeId → source generic TypeDefinition.
 	// Set by the interner when it instantiates `Foo<T1, T2>` from a generic def.
 	std::unordered_map<TypeId, const AST::TypeDefinition*> monoSourceDef;
+
+	// Monomorphised built-in generic Named TypeId → its BuiltinType tag.
+	// Set by the interner when it instantiates a prelude type like `Option<u32>`.
+	std::unordered_map<TypeId, BuiltinType> builtinMonoType;
+
+	// Expression-position NamedType (e.g. a struct initializer's `Foo<i32> { … }`
+	// type) → its interned Named TypeId. These NamedTypes are not `AST::Type`
+	// nodes, so they are not in `astTypes`; the interner records the (possibly
+	// monomorphised) instance here so the checker/codegen can recover it.
+	std::unordered_map<const AST::NamedType*, TypeId> exprNamedTypes;
 
 	const TypeInfo& get(TypeId id) const { return table[id]; }
 

@@ -106,17 +106,25 @@ namespace
 		// `if (… is T) |c|` forms). Inhabitants behave like a ref binding.
 		std::unordered_set<const void*> ifaceCaptureDeref;
 
-		// §4.2 ownership — owning heap-pointer slots for the function being
-		// emitted. At every return path (explicit or fall-through) the back-
-		// end emits `free(p)` for each entry. `move <p>` stores null into
-		// the source slot, so a moved pointer doesn't double-free.
+		// §4.2 ownership — owning local slots for the function being emitted.
+		// At every return path (explicit or fall-through) the back-end emits
+		// structural drop glue (`emitFreeAll`) for each entry, recursively
+		// freeing owned heap reachable from the slot's value: `*T`/`*[T]`
+		// pointers, dyn-array elements, struct/array/enum fields, and closure
+		// environments. `move <p>` (or an implicit move on return) zeroes the
+		// source slot, so a transferred allocation is not dropped twice.
 		struct OwnedSlot
 		{
-			llvm::Value* slot;     // alloca holding the user-facing pointer
-			bool isDynArr;         // true for *[T] (header at user_ptr - 8)
+			llvm::Value* slot;     // alloca holding the owned value
+			TypeId       type;     // the slot's storage TypeId (drives drop glue)
 		};
 		std::vector<OwnedSlot> ownedSlots;
 		llvm::Function* freeFn = nullptr;
+		// Per-type drop-glue functions (`alloy.drop.<id>(ptr addr)`), generated
+		// lazily. Used for struct/array/enum aggregates so a recursive owning
+		// type (e.g. a list node holding `*Self`) lowers to a runtime call
+		// rather than infinite inlined code.
+		std::unordered_map<TypeId, llvm::Function*> dropFns;
 
 		llvm::Function* currentFn = nullptr;
 		TypeId currentReturnType = INVALID_TYPE_ID;
@@ -162,10 +170,52 @@ namespace
 		// C4: leaf substitution of a TypeParam id via the active mono bindings.
 		TypeId substT(TypeId id) const
 		{
-			if (currentMonoBindings)
+			if (!currentMonoBindings) return id;
+
+			auto it = currentMonoBindings->find(id);
+			if (it != currentMonoBindings->end()) return it->second;
+
+			// Resolve a generic Named mono (`Vec<T>`) to its concrete instance
+			// (`Vec<u32>`) under the active bindings, so e.g. a generic factory's
+			// declared return type lowers to the same LLVM type as the value it
+			// returns. Falls through unchanged when no instance is interned.
+			if (id != INVALID_TYPE_ID && id < static_cast<TypeId>(interned.table.size()))
 			{
-				auto it = currentMonoBindings->find(id);
-				if (it != currentMonoBindings->end()) return it->second;
+				const TypeInfo& info = interned.get(id);
+				if (info.kind == TypeInfo::Kind::Named && !info.asNamed().typeArgs.empty())
+				{
+					std::vector<TypeId> subArgs;
+					bool changed = false;
+					for (TypeId a : info.asNamed().typeArgs)
+					{
+						TypeId s = substT(a);
+						if (s != a) changed = true;
+						subArgs.push_back(s);
+					}
+					if (changed)
+					{
+						auto srcIt = interned.monoSourceDef.find(id);
+						auto biIt  = interned.builtinMonoType.find(id);
+						for (TypeId cand = 0; cand < static_cast<TypeId>(interned.table.size()); ++cand)
+						{
+							const TypeInfo& ci = interned.get(cand);
+							if (ci.kind != TypeInfo::Kind::Named || ci.asNamed().typeArgs != subArgs)
+								continue;
+							if (srcIt != interned.monoSourceDef.end())
+							{
+								auto cs = interned.monoSourceDef.find(cand);
+								if (cs != interned.monoSourceDef.end() && cs->second == srcIt->second)
+									return cand;
+							}
+							else if (biIt != interned.builtinMonoType.end())
+							{
+								auto cb = interned.builtinMonoType.find(cand);
+								if (cb != interned.builtinMonoType.end() && cb->second == biIt->second)
+									return cand;
+							}
+						}
+					}
+				}
 			}
 			return id;
 		}
@@ -175,6 +225,52 @@ namespace
 			auto it = typed.exprTypes.find(&e);
 			TypeId t = it != typed.exprTypes.end() ? it->second : INVALID_TYPE_ID;
 			return substT(t);
+		}
+
+		// True when `id` reaches no bare TypeParam — so its LLVM lowering is
+		// binding-independent and may be cached even while monomorphizing. A type
+		// containing a TypeParam (e.g. the generic body `Box<T>`'s `{ value: T }`)
+		// lowers differently per binding and must NOT be cached by raw id.
+		bool typeIsConcrete(TypeId id, int depth = 0) const
+		{
+			if (depth > 32 || id == INVALID_TYPE_ID || id >= static_cast<TypeId>(interned.table.size()))
+				return true;
+			const TypeInfo& info = interned.get(id);
+			switch (info.kind)
+			{
+				case TypeInfo::Kind::TypeParam:
+					return false;
+				case TypeInfo::Kind::Pointer:
+				case TypeInfo::Kind::Reference:
+				case TypeInfo::Kind::PtrMut:
+				case TypeInfo::Kind::RefMut:
+					return typeIsConcrete(info.asIndirection().inner, depth + 1);
+				case TypeInfo::Kind::Slice:
+					return typeIsConcrete(info.asSlice().elem, depth + 1);
+				case TypeInfo::Kind::Array:
+					return typeIsConcrete(info.asArray().elem, depth + 1);
+				case TypeInfo::Kind::Named:
+					for (TypeId a : info.asNamed().typeArgs)
+						if (!typeIsConcrete(a, depth + 1)) return false;
+					return typeIsConcrete(info.asNamed().underlying, depth + 1);
+				case TypeInfo::Kind::Struct:
+					for (const auto& m : info.asStruct().members)
+						if (!typeIsConcrete(m.type, depth + 1)) return false;
+					return true;
+				case TypeInfo::Kind::Enum:
+					for (const auto& v : info.asEnum().variants)
+						if (v.payloadType.has_value() && !typeIsConcrete(*v.payloadType, depth + 1)) return false;
+					return true;
+				case TypeInfo::Kind::Function:
+				{
+					const auto& f = info.asFunction();
+					for (TypeId p : f.params) if (!typeIsConcrete(p, depth + 1)) return false;
+					if (f.ret.has_value() && !typeIsConcrete(*f.ret, depth + 1)) return false;
+					return true;
+				}
+				default:
+					return true;
+			}
 		}
 
 		// --- type lowering ------------------------------------------------------
@@ -254,9 +350,11 @@ namespace
 			if (id == INVALID_TYPE_ID || id >= static_cast<TypeId>(interned.table.size()))
 				return builder.getInt32Ty();
 
-			// Skip the cache while monomorphizing — the same TypeId may lower to
-			// different LLVM shapes depending on the active bindings.
-			if (!currentMonoBindings)
+			// A type that reaches no TypeParam lowers identically regardless of the
+			// active mono bindings, so it may share the cache; one that still holds
+			// a TypeParam must be lowered fresh each time (its shape is per-binding).
+			const bool cacheable = !currentMonoBindings || typeIsConcrete(id);
+			if (cacheable)
 			{
 				if (auto it = typeCache.find(id); it != typeCache.end())
 					return it->second;
@@ -308,7 +406,7 @@ namespace
 				case TypeInfo::Kind::Struct:
 				{
 					auto* st = llvm::StructType::create(ctx, "alloy.struct");
-					if (!currentMonoBindings) typeCache[id] = st;   // register before body for self-reference safety
+					if (cacheable) typeCache[id] = st;   // register before body for self-reference safety
 					std::vector<llvm::Type*> fields;
 					for (const auto& m : info.asStruct().members)
 						fields.push_back(lowerType(m.type));
@@ -318,7 +416,7 @@ namespace
 				case TypeInfo::Kind::Enum:
 				{
 					auto* st = llvm::StructType::create(ctx, "alloy.enum");
-					if (!currentMonoBindings) typeCache[id] = st;
+					if (cacheable) typeCache[id] = st;
 					st->setBody({ builder.getInt32Ty(),
 						llvm::ArrayType::get(builder.getInt8Ty(), enumPayloadSize(info)) });
 					return st;
@@ -342,7 +440,7 @@ namespace
 
 			if (!result)
 				result = builder.getInt32Ty();
-			if (!currentMonoBindings) typeCache[id] = result;
+			if (cacheable) typeCache[id] = result;
 			return result;
 		}
 
@@ -513,14 +611,9 @@ namespace
 		return p;
 	}
 
-	// Lazy declare `void free(void* p)` and emit one call per owning slot
-	// recorded in `Codegen::ownedSlots`. Each slot stores the user-facing
-	// pointer; for dyn-array slots (*[T]), the malloc base is at user_ptr - 8
-	// (the length-prefix header). `free(NULL)` is a no-op so `move`-nulled
-	// slots are safe to release unconditionally.
-	void emitFreeAll(Codegen& cg)
+	// Lazy-declare `void free(void* p)`.
+	void ensureFree(Codegen& cg)
 	{
-		if (cg.ownedSlots.empty()) return;
 		if (!cg.freeFn)
 		{
 			auto* fty = llvm::FunctionType::get(cg.builder.getVoidTy(),
@@ -528,17 +621,302 @@ namespace
 			cg.freeFn = llvm::Function::Create(fty,
 				llvm::Function::ExternalLinkage, "free", *cg.mod);
 		}
-		// Free in reverse declaration order (LIFO scope semantics).
-		for (auto it = cg.ownedSlots.rbegin(); it != cg.ownedSlots.rend(); ++it)
+	}
+
+	// =====================================================================
+	//  §4.2 structural ownership / drop glue
+	// =====================================================================
+	// "Drop" = recursively reclaim the heap owned by a value: `*T`/`*[T]`
+	// pointers are freed (after dropping their pointee / every element);
+	// struct/array/enum aggregates drop each owning field/element/active-
+	// variant payload; a closure value frees its (heap) environment. Plain
+	// references (`&T`), slices (`&[T]`), interface objects and primitives
+	// are non-owning views and are never freed.
+
+	bool needsDropRec(Codegen& cg, TypeId t, std::unordered_set<TypeId>& seen)
+	{
+		t = cg.substT(t);
+		if (t == INVALID_TYPE_ID || t >= (TypeId)cg.interned.table.size()) return false;
+		if (!seen.insert(t).second) return false;   // cycle guard (by-pointer recursion)
+		const TypeInfo& info = cg.interned.get(t);
+		using K = TypeInfo::Kind;
+		switch (info.kind)
 		{
-			llvm::Value* p = cg.builder.CreateLoad(cg.builder.getPtrTy(),
-				it->slot, "own.load");
-			llvm::Value* base = p;
-			if (it->isDynArr)
-				base = cg.builder.CreateGEP(cg.builder.getInt8Ty(), p,
-					{ cg.builder.getInt64(-8) }, "own.base");
-			cg.builder.CreateCall(cg.freeFn, { base });
+			case K::Pointer:
+			case K::PtrMut:
+				return true;                              // owns a heap allocation
+			case K::Function:
+				return true;                              // owns a (possibly heap) closure env
+			case K::Array:
+				return needsDropRec(cg, info.asArray().elem, seen);
+			case K::Struct:
+				for (auto& m : info.asStruct().members)
+					if (needsDropRec(cg, m.type, seen)) return true;
+				return false;
+			case K::Enum:
+				for (auto& v : info.asEnum().variants)
+					if (v.payloadType && needsDropRec(cg, *v.payloadType, seen)) return true;
+				return false;
+			case K::Named:
+				return needsDropRec(cg, info.asNamed().underlying, seen);
+			default:
+				return false;   // Reference/RefMut/Slice/Primitive/Interface/TypeParam
 		}
+	}
+
+	bool needsDrop(Codegen& cg, TypeId t)
+	{
+		std::unordered_set<TypeId> seen;
+		return needsDropRec(cg, t, seen);
+	}
+
+	// Mutually-recursive drop helpers (definitions below).
+	llvm::Function* getDropFn(Codegen& cg, TypeId t);
+	void emitDropValue(Codegen& cg, llvm::Value* addr, TypeId t);
+
+	// Drop every element of a runtime-counted array of `elem` rooted at `base`
+	// (the user-facing element[0] pointer). Used for `*[T]` whose elements own
+	// heap. Emits a counted loop `for i in 0..len`.
+	void emitCountedDropLoop(Codegen& cg, llvm::Value* base, llvm::Value* len, TypeId elem)
+	{
+		llvm::Type* ety = cg.lowerType(elem);
+		llvm::Function* fn = cg.builder.GetInsertBlock()->getParent();
+		auto* condBB = llvm::BasicBlock::Create(cg.ctx, "drop.loop.cond", fn);
+		auto* bodyBB = llvm::BasicBlock::Create(cg.ctx, "drop.loop.body", fn);
+		auto* endBB  = llvm::BasicBlock::Create(cg.ctx, "drop.loop.end",  fn);
+		llvm::Value* idxSlot = cg.entryAlloca(cg.builder.getInt64Ty(), "drop.i");
+		cg.builder.CreateStore(cg.builder.getInt64(0), idxSlot);
+		cg.builder.CreateBr(condBB);
+		cg.builder.SetInsertPoint(condBB);
+		llvm::Value* i = cg.builder.CreateLoad(cg.builder.getInt64Ty(), idxSlot, "drop.i.v");
+		cg.builder.CreateCondBr(cg.builder.CreateICmpULT(i, len, "drop.i.lt"), bodyBB, endBB);
+		cg.builder.SetInsertPoint(bodyBB);
+		llvm::Value* eAddr = cg.builder.CreateGEP(ety, base, { i }, "drop.e");
+		emitDropValue(cg, eAddr, elem);
+		cg.builder.CreateStore(cg.builder.CreateAdd(i, cg.builder.getInt64(1), "drop.i.inc"), idxSlot);
+		cg.builder.CreateBr(condBB);
+		cg.builder.SetInsertPoint(endBB);
+	}
+
+	// Emit drop glue for the value of type `t` whose storage is at `addr`.
+	void emitDropValue(Codegen& cg, llvm::Value* addr, TypeId t)
+	{
+		if (!addr) return;
+		t = cg.substT(t);
+		if (t == INVALID_TYPE_ID || t >= (TypeId)cg.interned.table.size()) return;
+		TypeId cur = t;
+		while (cur < (TypeId)cg.interned.table.size()
+			&& cg.interned.get(cur).kind == TypeInfo::Kind::Named)
+			cur = cg.interned.get(cur).asNamed().underlying;
+		const TypeInfo& info = cg.interned.get(cur);
+		using K = TypeInfo::Kind;
+		switch (info.kind)
+		{
+			case K::Pointer:
+			case K::PtrMut:
+			{
+				ensureFree(cg);
+				llvm::Value* p = cg.builder.CreateLoad(cg.builder.getPtrTy(), addr, "drop.p");
+				if (isDynArr(cg.interned, cur))
+				{
+					// *[T] — guard against null (base = p-8 is invalid when p is null).
+					TypeId elem = dynArrElemType(cg.interned, cur);
+					llvm::Function* fn = cg.builder.GetInsertBlock()->getParent();
+					auto* doBB   = llvm::BasicBlock::Create(cg.ctx, "drop.arr",     fn);
+					auto* contBB = llvm::BasicBlock::Create(cg.ctx, "drop.arr.end", fn);
+					llvm::Value* isNull = cg.builder.CreateICmpEQ(p,
+						llvm::ConstantPointerNull::get(cg.builder.getPtrTy()), "drop.arr.null");
+					cg.builder.CreateCondBr(isNull, contBB, doBB);
+					cg.builder.SetInsertPoint(doBB);
+					if (needsDrop(cg, elem))
+					{
+						llvm::Value* hdr = cg.builder.CreateGEP(cg.builder.getInt8Ty(), p,
+							{ cg.builder.getInt64(-8) }, "drop.hdr");
+						llvm::Value* len = cg.builder.CreateLoad(cg.builder.getInt64Ty(), hdr, "drop.len");
+						emitCountedDropLoop(cg, p, len, elem);
+					}
+					llvm::Value* base = cg.builder.CreateGEP(cg.builder.getInt8Ty(), p,
+						{ cg.builder.getInt64(-8) }, "drop.base");
+					cg.builder.CreateCall(cg.freeFn, { base });
+					cg.builder.CreateBr(contBB);
+					cg.builder.SetInsertPoint(contBB);
+				}
+				else
+				{
+					TypeId pointee = info.asIndirection().inner;
+					if (needsDrop(cg, pointee))
+					{
+						llvm::Function* fn = cg.builder.GetInsertBlock()->getParent();
+						auto* doBB   = llvm::BasicBlock::Create(cg.ctx, "drop.ptr",     fn);
+						auto* contBB = llvm::BasicBlock::Create(cg.ctx, "drop.ptr.end", fn);
+						llvm::Value* isNull = cg.builder.CreateICmpEQ(p,
+							llvm::ConstantPointerNull::get(cg.builder.getPtrTy()), "drop.ptr.null");
+						cg.builder.CreateCondBr(isNull, contBB, doBB);
+						cg.builder.SetInsertPoint(doBB);
+						emitDropValue(cg, p, pointee);   // p addresses the pointee storage
+						cg.builder.CreateCall(cg.freeFn, { p });
+						cg.builder.CreateBr(contBB);
+						cg.builder.SetInsertPoint(contBB);
+					}
+					else
+					{
+						cg.builder.CreateCall(cg.freeFn, { p });   // free(NULL) is a no-op
+					}
+				}
+				break;
+			}
+			case K::Struct:
+			case K::Enum:
+			case K::Array:
+			{
+				if (llvm::Function* df = getDropFn(cg, cur))
+					cg.builder.CreateCall(df, { addr });
+				break;
+			}
+			case K::Function:
+			{
+				// Closure value { fn ptr, env ptr } — free the heap env (null for
+				// non-capturing lambdas / named-fn thunks; free(NULL) is a no-op).
+				ensureFree(cg);
+				llvm::Value* envAddr = cg.builder.CreateStructGEP(
+					cg.getClosureTy(), addr, 1, "drop.env.addr");
+				llvm::Value* env = cg.builder.CreateLoad(cg.builder.getPtrTy(), envAddr, "drop.env");
+				cg.builder.CreateCall(cg.freeFn, { env });
+				break;
+			}
+			default:
+				break;   // non-owning
+		}
+	}
+
+	// Build (and cache) a per-type drop function `alloy.drop.<id>(ptr self)` for
+	// a struct/array/enum aggregate. Routing aggregate drops through a function
+	// turns a recursive owning type (e.g. a node holding `*Self`) into a runtime
+	// call rather than infinitely inlined code. The function drops in place; it
+	// does NOT free `self` itself (the caller owns that storage).
+	llvm::Function* getDropFn(Codegen& cg, TypeId t)
+	{
+		TypeId cur = t;
+		while (cur < (TypeId)cg.interned.table.size()
+			&& cg.interned.get(cur).kind == TypeInfo::Kind::Named)
+			cur = cg.interned.get(cur).asNamed().underlying;
+		if (auto it = cg.dropFns.find(cur); it != cg.dropFns.end()) return it->second;
+
+		const TypeInfo& info = cg.interned.get(cur);
+		using K = TypeInfo::Kind;
+		if (info.kind != K::Struct && info.kind != K::Enum && info.kind != K::Array)
+			return nullptr;
+
+		auto* fty = llvm::FunctionType::get(cg.builder.getVoidTy(),
+			{ cg.builder.getPtrTy() }, false);
+		auto* fn = llvm::Function::Create(fty, llvm::Function::PrivateLinkage,
+			"alloy.drop." + std::to_string(cur), *cg.mod);
+		cg.dropFns[cur] = fn;   // register before body (break recursion)
+
+		// Save outer emission state; entryAlloca / block creation target `fn`.
+		llvm::BasicBlock* savedBB = cg.builder.GetInsertBlock();
+		llvm::Function*   savedFn = cg.currentFn;
+		cg.currentFn = fn;
+		auto* entry = llvm::BasicBlock::Create(cg.ctx, "entry", fn);
+		cg.builder.SetInsertPoint(entry);
+		llvm::Argument* self = fn->getArg(0);
+		self->setName("self");
+
+		if (info.kind == K::Struct)
+		{
+			llvm::Type* sty = cg.lowerType(cur);
+			const auto& members = info.asStruct().members;
+			for (size_t i = 0; i < members.size(); ++i)
+			{
+				if (!needsDrop(cg, members[i].type)) continue;
+				llvm::Value* fAddr = cg.builder.CreateStructGEP(sty, self, (unsigned)i, "drop.f");
+				emitDropValue(cg, fAddr, members[i].type);
+			}
+		}
+		else if (info.kind == K::Array)
+		{
+			const auto& ad = info.asArray();
+			if (needsDrop(cg, ad.elem))
+			{
+				llvm::Type* aty = cg.lowerType(cur);
+				for (uint64_t i = 0; i < ad.size; ++i)
+				{
+					llvm::Value* eAddr = cg.builder.CreateGEP(aty, self,
+						{ cg.builder.getInt64(0), cg.builder.getInt64((int64_t)i) }, "drop.e");
+					emitDropValue(cg, eAddr, ad.elem);
+				}
+			}
+		}
+		else   // Enum — switch on the tag, drop the active variant's payload.
+		{
+			const auto& variants = info.asEnum().variants;
+			bool any = false;
+			for (auto& v : variants)
+				if (v.payloadType && needsDrop(cg, *v.payloadType)) { any = true; break; }
+			if (any)
+			{
+				llvm::Type* ety = cg.lowerType(cur);   // { i32 tag, [N x i8] payload }
+				llvm::Value* tagAddr = cg.builder.CreateStructGEP(ety, self, 0, "drop.tag.addr");
+				llvm::Value* tag = cg.builder.CreateLoad(cg.builder.getInt32Ty(), tagAddr, "drop.tag");
+				llvm::Value* payAddr = cg.builder.CreateStructGEP(ety, self, 1, "drop.pay.addr");
+				auto* endBB = llvm::BasicBlock::Create(cg.ctx, "drop.enum.end", fn);
+				auto* sw = cg.builder.CreateSwitch(tag, endBB, (unsigned)variants.size());
+				for (size_t i = 0; i < variants.size(); ++i)
+				{
+					if (!variants[i].payloadType || !needsDrop(cg, *variants[i].payloadType))
+						continue;
+					auto* caseBB = llvm::BasicBlock::Create(cg.ctx, "drop.v", fn);
+					sw->addCase(cg.builder.getInt32((int)i), caseBB);
+					cg.builder.SetInsertPoint(caseBB);
+					emitDropValue(cg, payAddr, *variants[i].payloadType);
+					cg.builder.CreateBr(endBB);
+				}
+				cg.builder.SetInsertPoint(endBB);
+			}
+		}
+
+		cg.builder.CreateRetVoid();
+		cg.currentFn = savedFn;
+		if (savedBB) cg.builder.SetInsertPoint(savedBB);
+		return fn;
+	}
+
+	// Zero a local's slot so a transferred (moved / returned) value is not
+	// dropped again at scope end. For a pointer slot this nulls the pointer;
+	// for an aggregate slot it writes a zeroinitializer (all owning fields null).
+	void zeroSlot(Codegen& cg, llvm::Value* slot, TypeId storage)
+	{
+		llvm::Type* ty = cg.isIndirection(storage)
+			? static_cast<llvm::Type*>(cg.builder.getPtrTy())
+			: cg.lowerType(storage);
+		cg.builder.CreateStore(llvm::Constant::getNullValue(ty), slot);
+	}
+
+	// Run structural drop for every owned local slot in reverse declaration
+	// order (LIFO scope semantics). A `move`d / returned slot was zeroed, so
+	// its drop glue is a no-op.
+	void emitFreeAll(Codegen& cg)
+	{
+		if (cg.ownedSlots.empty()) return;
+		for (auto it = cg.ownedSlots.rbegin(); it != cg.ownedSlots.rend(); ++it)
+			emitDropValue(cg, it->slot, it->type);
+	}
+
+	// If `e` is exactly an owned local identifier, zero its slot so scope-end
+	// drop skips it (the value was handed out by value — `return v` transfers
+	// ownership to the caller, mirroring an explicit `move`).
+	void zeroIfReturnedOwned(Codegen& cg, const AST::Expression& e)
+	{
+		auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&e);
+		if (!idReq) return;
+		const ResolvedDeclaration* decl = cg.resolveIdent(idReq->value());
+		if (!decl) return;
+		const void* key = cg.declKey(*decl);
+		if (!key) return;
+		auto sit = cg.slots.find(key);
+		if (sit == cg.slots.end()) return;
+		for (auto& os : cg.ownedSlots)
+			if (os.slot == sit->second) { zeroSlot(cg, os.slot, os.type); return; }
 	}
 
 	// Emit a runtime bounds check: `idx (i64)` must satisfy 0 <= idx < len.
@@ -815,35 +1193,56 @@ namespace
 		if (!first || !first->next.hasValue())
 			return vi;   // not a qualified path
 
-		const ResolvedDeclaration* decl = cg.resolveIdent(ident);
-		if (!decl)
-			return vi;
-		auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition);
-		if (!td)
-			return vi;
-
 		TypeId namedId = INVALID_TYPE_ID;
-		auto namedIt = cg.interned.namedTypeIds.find(&td->value().name);
-		if (namedIt != cg.interned.namedTypeIds.end())
+
+		// Built-in (prelude) enum, e.g. `Option::Some` — no TypeDefinition; recover
+		// the mono instance from fallbackEnumTy via builtinMonoType. Built-in names
+		// are reserved (§5.1a), so this never collides with a user type.
+		std::string_view firstName = cg.tokenText(*first->item.value());
+		if (const BuiltinTypeInfo* bt = findBuiltinType(firstName); bt && bt->isEnum)
 		{
-			namedId = namedIt->second;
-		}
-		else
-		{
-			// Generic enum: locate the mono instance via fallbackEnumTy (the
-			// call-expression's typed result type, or the var-annotation type).
 			TypeId ctx = fallbackEnumTy;
 			while (ctx != INVALID_TYPE_ID && ctx < static_cast<TypeId>(cg.interned.table.size())
 				&& cg.interned.get(ctx).isIndirection())
 				ctx = cg.interned.get(ctx).asIndirection().inner;
-			if (ctx != INVALID_TYPE_ID)
-			{
-				auto monoIt = cg.interned.monoSourceDef.find(ctx);
-				if (monoIt != cg.interned.monoSourceDef.end() && monoIt->second == &td->value())
-					namedId = ctx;
-			}
-			if (namedId == INVALID_TYPE_ID)
+			if (ctx == INVALID_TYPE_ID)
 				return vi;
+			auto bmIt = cg.interned.builtinMonoType.find(ctx);
+			if (bmIt == cg.interned.builtinMonoType.end() || bmIt->second != bt->tag)
+				return vi;
+			namedId = ctx;
+		}
+		else
+		{
+			const ResolvedDeclaration* decl = cg.resolveIdent(ident);
+			if (!decl)
+				return vi;
+			auto* td = std::get_if<Required<AST::TypeDefinition>>(&decl->definition);
+			if (!td)
+				return vi;
+
+			auto namedIt = cg.interned.namedTypeIds.find(&td->value().name);
+			if (namedIt != cg.interned.namedTypeIds.end())
+			{
+				namedId = namedIt->second;
+			}
+			else
+			{
+				// Generic enum: locate the mono instance via fallbackEnumTy (the
+				// call-expression's typed result type, or the var-annotation type).
+				TypeId ctx = fallbackEnumTy;
+				while (ctx != INVALID_TYPE_ID && ctx < static_cast<TypeId>(cg.interned.table.size())
+					&& cg.interned.get(ctx).isIndirection())
+					ctx = cg.interned.get(ctx).asIndirection().inner;
+				if (ctx != INVALID_TYPE_ID)
+				{
+					auto monoIt = cg.interned.monoSourceDef.find(ctx);
+					if (monoIt != cg.interned.monoSourceDef.end() && monoIt->second == &td->value())
+						namedId = ctx;
+				}
+				if (namedId == INVALID_TYPE_ID)
+					return vi;
+			}
 		}
 
 		TypeId underlying = cg.canonical(namedId);
@@ -1245,7 +1644,12 @@ namespace
 			TypeId rawObj = rawTypeOf(cg, a.object.value());
 			if (isDynArr(cg.interned, rawObj))
 			{
-				llvm::Value* dataPtr = genAddr(cg, a.object.value());
+				// The *[T] data pointer is the object's *value* (the heap base).
+				// genExpr yields it uniformly whether the object is a local
+				// binding or a `*[T]` held in a struct field / array element —
+				// genAddr would return a field's storage address, not the pointer.
+				llvm::Value* dataPtr = genExpr(cg, a.object.value(), rawObj);
+				if (!dataPtr) return nullptr;
 				// Debug bounds check.
 				llvm::Value* lenPtr = cg.builder.CreateGEP(cg.builder.getInt8Ty(),
 					dataPtr, { cg.builder.getInt64(-8) }, "dyn.len.ptr");
@@ -1879,6 +2283,57 @@ namespace
 			{
 				TypeId inner = cg.exprType(un.expression.value());
 
+				// Runtime-sized fill `new [v; n]` → dynamically-sized array `*[T]`.
+				// The checker types a runtime-sized fill as a Slice (not a fixed
+				// Array); allocate 8 + n*sizeof(T), stash n at the base, and fill
+				// every element with v in a loop (§4.2 length-prefix layout).
+				{
+					const AST::ArrayFillExpression* fillOp = nullptr;
+					if (auto* f = std::get_if<Required<AST::ArrayFillExpression>>(&un.expression.value()))
+						fillOp = &f->value();
+					TypeId innerC = cg.canonical(inner);
+					bool innerIsSlice = innerC != INVALID_TYPE_ID
+						&& innerC < (TypeId)cg.interned.table.size()
+						&& cg.interned.get(innerC).kind == TypeInfo::Kind::Slice;
+					if (fillOp && isDynArr(cg.interned, ctxType) && innerIsSlice)
+					{
+						TypeId elemT = cg.interned.get(innerC).asSlice().elem;
+						llvm::Type* llElem = cg.lowerType(elemT);
+						uint64_t elemBytes = cg.mod->getDataLayout().getTypeAllocSize(llElem);
+
+						llvm::Value* n = genExpr(cg, fillOp->size.value(), TYPE_U64);
+						n = coerce(cg, n, cg.exprType(fillOp->size.value()), TYPE_U64);
+
+						llvm::Value* bytes = cg.builder.CreateMul(n, cg.builder.getInt64(elemBytes), "dynarr.bytes");
+						llvm::Value* total = cg.builder.CreateAdd(bytes, cg.builder.getInt64(8), "dynarr.total");
+						llvm::Value* base = cg.builder.CreateCall(cg.mallocFn, { total }, "dynarr.mem");
+						cg.builder.CreateStore(n, base);
+						llvm::Value* userPtr = cg.builder.CreateGEP(cg.builder.getInt8Ty(), base,
+							{ cg.builder.getInt64(8) }, "dynarr.data");
+
+						llvm::Value* fillVal = genExpr(cg, fillOp->value.value(), elemT);
+						fillVal = coerce(cg, fillVal, cg.exprType(fillOp->value.value()), elemT);
+
+						llvm::Function* fn = cg.currentFn;
+						llvm::Value* iSlot = cg.entryAlloca(cg.builder.getInt64Ty(), "fill.i");
+						cg.builder.CreateStore(cg.builder.getInt64(0), iSlot);
+						llvm::BasicBlock* condBB = llvm::BasicBlock::Create(cg.ctx, "fill.cond", fn);
+						llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(cg.ctx, "fill.body", fn);
+						llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(cg.ctx, "fill.end", fn);
+						cg.builder.CreateBr(condBB);
+						cg.builder.SetInsertPoint(condBB);
+						llvm::Value* iv = cg.builder.CreateLoad(cg.builder.getInt64Ty(), iSlot, "fill.iv");
+						cg.builder.CreateCondBr(cg.builder.CreateICmpULT(iv, n, "fill.lt"), bodyBB, endBB);
+						cg.builder.SetInsertPoint(bodyBB);
+						llvm::Value* ep = cg.builder.CreateGEP(llElem, userPtr, { iv }, "fill.ep");
+						cg.builder.CreateStore(fillVal, ep);
+						cg.builder.CreateStore(cg.builder.CreateAdd(iv, cg.builder.getInt64(1), "fill.inc"), iSlot);
+						cg.builder.CreateBr(condBB);
+						cg.builder.SetInsertPoint(endBB);
+						return userPtr;
+					}
+				}
+
 				// C2: *[T] dynamic array — length-prefix layout (§4.2). User-facing
 				// pointer points at element[0]; a u64 length sits 8 bytes BEFORE it.
 				if (isDynArr(cg.interned, ctxType))
@@ -2281,8 +2736,172 @@ namespace
 			genStatement(cg, wx.elseBody.value());
 	}
 
+	// Strip one indirection level from a TypeId (codegen-side), preserving Named.
+	TypeId stripIndir(Codegen& cg, TypeId id)
+	{
+		if (id != INVALID_TYPE_ID && id < (TypeId)cg.interned.table.size()
+			&& cg.interned.get(id).isIndirection())
+			return cg.interned.get(id).asIndirection().inner;
+		return id;
+	}
+
+	// §5: resolve an extension function `name` whose `self` value-type matches
+	// selfValueType. Returns the lowered llvm::Function* + storage types.
+	struct ResolvedExt
+	{
+		llvm::Function* fn = nullptr;
+		std::vector<TypeId> paramTypes;   // self included, storage types
+		TypeId retType = INVALID_TYPE_ID;
+	};
+	ResolvedExt resolveExtension(Codegen& cg, std::string_view name, TypeId selfValueType)
+	{
+		ResolvedExt out;
+		if (selfValueType == INVALID_TYPE_ID) return out;
+		for (const auto* decl : cg.syms.get(name))
+		{
+			auto* fdReq = std::get_if<Required<AST::FunctionDefinition>>(&decl->definition);
+			if (!fdReq) continue;
+			const AST::Function* fn = fdReq->value().function.ptr();
+			const auto* pl = fn->parameters.ptr();
+			if (!pl) continue;
+			const auto& first = pl->item.value();
+			if (!first.isSelf) continue;
+			auto it = cg.interned.astTypes.find(&first.type.value());
+			if (it == cg.interned.astTypes.end()) continue;
+			TypeId fpVal = stripIndir(cg, it->second);
+			if (fpVal != selfValueType && cg.canonical(fpVal) != cg.canonical(selfValueType))
+				continue;
+			auto fit = cg.fnMap.find(fdReq->ptr());
+			if (fit == cg.fnMap.end()) continue;
+			out.fn = fit->second;
+			fn->parameters.forEach([&](const Required<AST::FunctionParameter>& p)
+				{
+					auto ti = cg.interned.astTypes.find(&p.value().type.value());
+					out.paramTypes.push_back(ti != cg.interned.astTypes.end() ? ti->second : INVALID_TYPE_ID);
+				});
+			if (fn->returnType.hasValue())
+			{
+				auto rit = cg.interned.astTypes.find(&fn->returnType.value());
+				out.retType = rit != cg.interned.astTypes.end() ? rit->second : INVALID_TYPE_ID;
+			}
+			return out;
+		}
+		return out;
+	}
+
+	// §5 custom iterable: `for (x in c)` where c provides
+	//   iterator(self &C) -> Iter ;  next(self &var Iter) -> Option<T>
+	// Returns true if it handled the loop (custom iterable detected).
+	bool genForCustom(Codegen& cg, const AST::ForExpression& fx, llvm::Value* resultSlot, TypeId resultType)
+	{
+		// Single-iterable only.
+		const AST::Expression* iterableExpr = nullptr;
+		int count = 0;
+		fx.iterables.value().forEach([&](const Required<AST::Expression>& it)
+			{ if (count == 0) iterableExpr = &it.value(); ++count; });
+		if (count != 1 || !iterableExpr) return false;
+
+		TypeId rawContTy = cg.exprType(*iterableExpr);
+		TypeId contVal = stripIndir(cg, rawContTy);
+		TypeId canonCont = cg.canonical(contVal);
+		// Skip the built-in collection kinds — those use the index fast path.
+		if (canonCont != INVALID_TYPE_ID && canonCont < (TypeId)cg.interned.table.size())
+		{
+			TypeInfo::Kind k = cg.interned.get(canonCont).kind;
+			if (k == TypeInfo::Kind::Array || k == TypeInfo::Kind::Slice)
+				return false;
+		}
+
+		ResolvedExt iterFn = resolveExtension(cg, "iterator", contVal);
+		if (!iterFn.fn) return false;
+		TypeId iterTy = iterFn.retType;                 // Named iterator type (by value)
+		TypeId iterVal = stripIndir(cg, iterTy);
+		ResolvedExt nextFn = resolveExtension(cg, "next", iterVal);
+		if (!nextFn.fn) return false;
+		TypeId optTy = nextFn.retType;                  // Option<T> mono Named
+		if (optTy == INVALID_TYPE_ID) return false;
+
+		// Find the Some tag + payload type within Option's enum.
+		TypeId optEnum = cg.canonical(optTy);
+		if (optEnum == INVALID_TYPE_ID || optEnum >= (TypeId)cg.interned.table.size()
+			|| cg.interned.get(optEnum).kind != TypeInfo::Kind::Enum)
+			return false;
+		int someTag = -1;
+		TypeId elemTy = INVALID_TYPE_ID;
+		{
+			const auto& variants = cg.interned.get(optEnum).asEnum().variants;
+			for (size_t i = 0; i < variants.size(); ++i)
+				if (variants[i].payloadType.has_value())
+				{ someTag = static_cast<int>(i); elemTy = *variants[i].payloadType; break; }
+		}
+		if (someTag < 0) return false;
+
+		// it = c.iterator();
+		llvm::Value* contAddr = genAddr(cg, *iterableExpr);
+		if (!contAddr) return false;
+		llvm::Value* iterVal0 = cg.builder.CreateCall(iterFn.fn, { contAddr }, "iter.init");
+		llvm::Type* iterLL = cg.lowerType(iterTy);
+		llvm::Value* iterSlot = cg.entryAlloca(iterLL, "iter");
+		cg.builder.CreateStore(iterVal0, iterSlot);
+
+		// Capture slot (the loop variable).
+		llvm::Value* capSlot = nullptr;
+		{
+			const AST::Capture* cap = nullptr;
+			if (fx.iterators.hasValue())
+				fx.iterators.value().forEach([&](const Required<AST::Capture>& c)
+					{ if (!cap) cap = c.ptr(); });
+			if (cap)
+			{
+				capSlot = cg.entryAlloca(cg.lowerType(elemTy), "for.cap");
+				cg.slots[cap] = capSlot;
+				cg.slotStorage[cap] = elemTy;
+			}
+		}
+
+		llvm::Type* optLL = cg.lowerType(optTy);
+		llvm::Value* optSlot = cg.entryAlloca(optLL, "for.opt");
+
+		llvm::BasicBlock* condBB = llvm::BasicBlock::Create(cg.ctx, "for.cond", cg.currentFn);
+		llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(cg.ctx, "for.body", cg.currentFn);
+		llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(cg.ctx, "for.exit", cg.currentFn);
+
+		cg.builder.CreateBr(condBB);
+		cg.builder.SetInsertPoint(condBB);
+		llvm::Value* opt = cg.builder.CreateCall(nextFn.fn, { iterSlot }, "for.next");
+		cg.builder.CreateStore(opt, optSlot);
+		llvm::Value* tag = cg.builder.CreateLoad(cg.builder.getInt32Ty(),
+			cg.builder.CreateStructGEP(optLL, optSlot, 0, "opt.tag"), "tag");
+		llvm::Value* isSome = cg.builder.CreateICmpEQ(tag,
+			cg.builder.getInt32(static_cast<uint32_t>(someTag)), "is.some");
+		cg.builder.CreateCondBr(isSome, bodyBB, exitBB);
+
+		cg.builder.SetInsertPoint(bodyBB);
+		if (capSlot)
+		{
+			llvm::Value* payPtr = cg.builder.CreateStructGEP(optLL, optSlot, 1, "opt.pay");
+			llvm::Value* v = cg.builder.CreateLoad(cg.lowerType(elemTy), payPtr, "elem");
+			cg.builder.CreateStore(v, capSlot);
+		}
+		cg.breakStack.push_back({ exitBB, resultSlot, resultType });
+		genStatement(cg, fx.body.value());
+		cg.breakStack.pop_back();
+		if (cg.blockOpen())
+			cg.builder.CreateBr(condBB);
+
+		cg.builder.SetInsertPoint(exitBB);
+		if (fx.elseBody.hasValue())
+			genStatement(cg, fx.elseBody.value());
+		return true;
+	}
+
 	void genFor(Codegen& cg, const AST::ForExpression& fx, llvm::Value* resultSlot, TypeId resultType)
 	{
+		// §5: custom iterable protocol (iterator()/next()) takes priority over the
+		// built-in array/slice index lowering.
+		if (genForCustom(cg, fx, resultSlot, resultType))
+			return;
+
 		// Collect iterables and their element types.
 		struct Iter { const AST::Expression* expr; TypeId type; TypeId elem; };
 		std::vector<Iter> iters;
@@ -2763,18 +3382,12 @@ namespace
 			cg.slots[&vd] = slot;
 			cg.slotStorage[&vd] = storage;
 
-			// §4.2 ownership: a `*T`/`*[T]` binding owns its heap allocation
-			// and is freed at scope end. `*[T]` is the length-prefix layout —
-			// the malloc base sits at user_ptr - 8.
-			if (storage != INVALID_TYPE_ID && storage < (TypeId)cg.interned.table.size())
-			{
-				const auto& info = cg.interned.get(storage);
-				if (info.kind == TypeInfo::Kind::Pointer
-				 || info.kind == TypeInfo::Kind::PtrMut)
-				{
-					cg.ownedSlots.push_back({ slot, isDynArr(cg.interned, storage) });
-				}
-			}
+			// §4.2 ownership: a local that owns heap (a `*T`/`*[T]` pointer, a
+			// closure, or a struct/array/enum transitively containing one) is
+			// dropped at scope end via structural drop glue. References / slices
+			// are non-owning and excluded by `needsDrop`.
+			if (needsDrop(cg, storage))
+				cg.ownedSlots.push_back({ slot, storage });
 			return;
 		}
 
@@ -2787,7 +3400,12 @@ namespace
 				cg.warn("assignment target is not addressable — skipped");
 				return;
 			}
-			TypeId tt = cg.exprType(as.target.value());
+			// The target's *declared* storage type (un-stripped). `exprType` strips
+			// one indirection for value use (§4.2 transparent deref), but here we
+			// need the binding's true type so `new`/`move` lower with the right
+			// context (e.g. *[T] length-prefix) and so free-on-reassign can drop
+			// the previous owned value.
+			TypeId tt = rawTypeOf(cg, as.target.value());
 			llvm::Value* rhs = nullptr;
 			if (isIfaceIndirection(cg.interned, tt))
 			{
@@ -2823,6 +3441,13 @@ namespace
 					default: break;
 				}
 			}
+			// §4.2 free-on-reassign: overwriting an owning binding (`buf = new […]`,
+			// `v.field = move p`) first drops whatever it currently owns, so the
+			// previous allocation is reclaimed rather than leaked. The RHS was
+			// already evaluated above; a `move` source was zeroed, so dropping the
+			// (now possibly null) old value is safe.
+			if (as.op == TokenKind::Assign && needsDrop(cg, tt))
+				emitDropValue(cg, addr, tt);
 			cg.builder.CreateStore(rhs, addr);
 			return;
 		}
@@ -2891,6 +3516,10 @@ namespace
 			{
 				llvm::Value* v = genExpr(cg, p->value().value.value(), cg.currentReturnType);
 				v = coerce(cg, v, cg.exprType(p->value().value.value()), cg.currentReturnType);
+				// Implicit move on return: when the returned value is exactly an owned
+				// local, the caller now owns it - zero the source slot so scope-end
+				// drop does not free what we just handed out.
+				zeroIfReturnedOwned(cg, p->value().value.value());
 				emitFreeAll(cg);
 				cg.builder.CreateRet(v);
 			}

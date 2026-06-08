@@ -1,0 +1,7 @@
+// §3.4 — a '#Type' value cannot reach a runtime position. `#u32` reflects to a
+// primitive #Type; assigning it to a runtime variable inside `main` (which is
+// runtime-reachable) is a compile-time error.
+fn main() -> u32 {
+	var t = #u32;  //@expect-error '#Type' value cannot escape
+	return 0;
+}

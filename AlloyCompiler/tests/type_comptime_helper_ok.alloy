@@ -1,0 +1,15 @@
+// §3.4 — a comptime-only helper function (reached solely via `#fn()`) may
+// manipulate '#Type' values freely. Even with a runtime `main` present, the
+// reachability analysis must NOT flag the #Type uses inside `buildT`, because
+// `buildT` is never called at runtime. Positive test (compiles clean).
+fn buildT() -> u32 {
+	var t = #struct_type();
+	t.add_member("a", #u32);
+	t.add_member("b", #u32);
+	return t.member_names().length();
+}
+
+fn main() -> u32 {
+	const n = #buildT();
+	return n;
+}

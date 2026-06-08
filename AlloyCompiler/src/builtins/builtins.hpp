@@ -28,6 +28,53 @@ const std::unordered_map<BuiltinInterface, std::unordered_set<std::string_view>>
 	{BuiltinInterface::Number, {"u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64"}},
 };
 
+// ---------------------------------------------------------------------------
+// Built-in (prelude) types (§5). These behave like user `type` definitions but
+// are provided by the compiler with no source declaration — the type system
+// synthesises their `TypeInfo` directly. Generic built-ins (e.g. `Option<T>`)
+// are monomorphised on use exactly like user generic types.
+// ---------------------------------------------------------------------------
+
+enum class BuiltinType
+{
+	Option,   // Option<T> = enum { Some: T; None; }
+};
+
+struct BuiltinTypeInfo
+{
+	std::string_view name;
+	size_t arity;       // number of type parameters
+	bool isEnum;        // true → enum (variants), false → struct (members)
+
+	// For an enum: each variant's name and the index of the type-parameter that
+	// is its payload (-1 = no payload). For a struct: member name + param index.
+	struct Member
+	{
+		std::string_view name;
+		int paramIndex;   // -1 = no payload / unit
+	};
+	std::vector<Member> members;
+
+	BuiltinType tag;
+};
+
+// Registry of built-in types. Order is not significant.
+inline const std::vector<BuiltinTypeInfo>& builtinTypes()
+{
+	static const std::vector<BuiltinTypeInfo> types = {
+		{ "Option", 1, true, { { "Some", 0 }, { "None", -1 } }, BuiltinType::Option },
+	};
+	return types;
+}
+
+inline const BuiltinTypeInfo* findBuiltinType(std::string_view name)
+{
+	for (const auto& bt : builtinTypes())
+		if (bt.name == name)
+			return &bt;
+	return nullptr;
+}
+
 struct BuiltinFunction
 {
 	std::string_view name;

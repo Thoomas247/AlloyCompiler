@@ -1,0 +1,41 @@
+// Validate the iterator protocol pieces WITHOUT the `for` sugar:
+//   Counter.iterator() -> CounterIter   (cursor by value)
+//   CounterIter.next(&var self) -> Option<u32>
+extern printf(...) -> i32;
+
+type CounterIter = struct {
+	current: u32;
+	limit: u32;
+};
+
+type Counter = struct {
+	limit: u32;
+};
+
+fn iterator(self c: &Counter) -> CounterIter {
+	return CounterIter { .current = 0, .limit = c.limit };
+}
+
+fn next(self it: &var CounterIter) -> Option<u32> {
+	if (it.current < it.limit) {
+		var v: u32 = it.current;
+		it.current = it.current + 1;
+		return Option::Some(v);
+	}
+	return Option::None;
+}
+
+fn main() -> u32 {
+	const c: Counter = Counter { .limit = 3 };
+	var it: CounterIter = c.iterator();
+
+	var done: bool = false;
+	while (!done) {
+		var m: Option<u32> = it.next();
+		match (m) {
+			Option::Some |v| { printf("got %u\n", v); }
+			Option::None { done = true; }
+		}
+	}
+	return 0;
+}

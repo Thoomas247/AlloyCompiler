@@ -33,6 +33,13 @@ Result<SymbolTable> declare(const Source& moduleSource, const AST::Module& modul
 					[&](const Required<AST::TypeDefinition>& typeDef) -> Status
 					{
 						auto name = state.getStringView(typeDef.value().name);
+						// §5.1a — built-in (prelude) type names are reserved.
+						if (findBuiltinType(name))
+						{
+							state.logger.logErrorInRange(typeDef.value().name, typeDef.value().name,
+								"'{}' is a built-in type name and cannot be redeclared.", name);
+							return Error;
+						}
 						if (symbolTable.add(name, visibility, typeDef) == Error)
 						{
 							state.logger.logErrorInRange(typeDef.value().name, typeDef.value().name,
@@ -234,8 +241,9 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 	{
 		auto name = state.getStringView(*firstToken);
 
-		// check if built-in type
-		if (s_BuiltinTypeNames.contains(name))
+		// check if built-in type (primitives or prelude types like Option<T>).
+		// Built-in names are reserved (§5.1a) — a user type cannot shadow them.
+		if (s_BuiltinTypeNames.contains(name) || findBuiltinType(name))
 		{
 			return;
 		}
@@ -289,6 +297,15 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 				candidates = std::move(visible);
 			}
 			state.result.names[&ident] = std::move(candidates);
+		}
+		else if (findBuiltinType(firstName))
+		{
+			// Track B (built-in): first segment is a prelude type, e.g.
+			// `Option::Some`. No TypeDefinition exists — the type-checker and
+			// codegen classify the variant via the built-in registry using the
+			// path tokens and the call/annotation context type. (Built-in names
+			// are reserved, so this can never be a shadowing user type.)
+			state.result.names[&ident] = {};
 		}
 		else
 		{
@@ -437,6 +454,7 @@ static void resolveExpression(ResolveState& state, const AST::Expression& expr, 
 			[&](const Required<AST::ArrayFillExpression>& fill)
 			{
 				resolveExpression(state, fill.value().value.value(), scope);
+				resolveExpression(state, fill.value().size.value(), scope);
 			},
 			[&](const Required<AST::StructInitializerExpression>& structInit)
 			{

@@ -1,0 +1,58 @@
+// A growable, owning `String` — a heap byte buffer built in pure Alloy.
+//
+// Like `Vec<u8>`: an owning `*var [u8]` buffer plus a length. `push` appends one
+// byte (grow-by-one: allocate, copy, append, reassign — free-on-reassign drops
+// the old buffer); `push_str` appends every byte of a string literal (`&[u8]`).
+// The buffer is reclaimed automatically at scope end by §4.2 structural drop.
+extern printf(...) -> i32;
+
+type String = struct {
+	data: *var [u8];
+	len: u64;
+};
+
+fn emptyString() -> String {
+	return String { .data = new [0; 1], .len = 0 };
+}
+
+fn push(self s: &var String, c: u8) {
+	var bigger: *var [u8] = new [c; s.len + 1];
+	var i: u64 = 0;
+	while (i < s.len) {
+		bigger[i] = s.data[i];
+		i += 1;
+	}
+	bigger[s.len] = c;
+	s.data = move bigger;     // free-on-reassign drops the old buffer
+	s.len += 1;
+}
+
+// Append every byte of a string literal (typed `&[u8]`).
+fn push_str(self s: &var String, text: &[u8]) {
+	var i: u64 = 0;
+	while (i < text.length()) {
+		s.push(text[i]);
+		i += 1;
+	}
+}
+
+fn print(self s: &String) {
+	var i: u64 = 0;
+	while (i < s.len) {
+		printf("%c", s.data[i]);
+		i += 1;
+	}
+}
+
+fn main() -> u32 {
+	var s: String = emptyString();
+	s.push_str("Hello");
+	s.push(',');
+	s.push(' ');
+	s.push_str("Alloy!");
+
+	s.print();
+	printf("\nlength = %llu\n", s.len);
+	return 0;
+	// scope end: s's buffer is freed by structural drop.
+}

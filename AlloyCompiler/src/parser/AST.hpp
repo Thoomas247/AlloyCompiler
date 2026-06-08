@@ -291,7 +291,10 @@ namespace AST
 	struct ArrayFillExpression
 	{
 		Required<Expression> value;
-		const Token& size;
+		// The element count. A compile-time integer literal yields a fixed array
+		// `[T; N]`; a runtime expression yields a dynamically-sized array `[T]`,
+		// valid only as the operand of `new` (heap length-prefix layout, §4.2).
+		Required<Expression> size;
 	};
 
 	struct StructInitializerExpression

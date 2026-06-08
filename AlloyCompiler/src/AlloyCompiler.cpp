@@ -335,6 +335,10 @@ static int buildFile(const std::string& path, bool debug)
 
 int main(int argc, char** argv)
 {
+	// Make stdout unbuffered so progress/diagnostics survive even if a late
+	// teardown (e.g. LLVM global shutdown) aborts before the buffer is flushed.
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
+
 	if (argc > 1 && std::string_view(argv[1]) == "--test")
 		return runTests();
 

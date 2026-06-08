@@ -1,0 +1,70 @@
+// A growable generic vector `Vec<T>`, written entirely in Alloy.
+//
+// Demonstrates that §5 collections are expressible on top of the language's
+// own features — generic structs, generic `&var self` methods, runtime-sized
+// heap allocation (`new [v; n]` with a runtime count), and §4.2 structural
+// reclaim (the buffer is freed automatically; growth reclaims the old buffer).
+//
+// The buffer is a `*var [T]` dynamically-sized array. `push` grows by exactly
+// one element each call (allocate len+1, copy, append, reassign — free-on-
+// reassign drops the previous buffer). No spare capacity is kept, so every
+// element is always initialised, matching the reclaim model.
+extern printf(...) -> i32;
+
+type Vec<T> = struct {
+	data: *var [T];
+	len: u64;
+};
+
+// An empty vector starts with a single-slot buffer (length 0).
+fn makeVec<T>(seed: T) -> Vec<T> {
+	return Vec<T> { .data = new [seed; 1], .len = 0 };
+}
+
+fn push<T>(self v: &var Vec<T>, x: T) {
+	var bigger: *var [T] = new [x; v.len + 1];
+	var i: u64 = 0;
+	while (i < v.len) {
+		bigger[i] = v.data[i];
+		i += 1;
+	}
+	bigger[v.len] = x;
+	v.data = move bigger;     // free-on-reassign drops the old buffer
+	v.len += 1;
+}
+
+fn get<T>(self v: &Vec<T>, i: u64) -> T {
+	return v.data[i];
+}
+
+fn len<T>(self v: &Vec<T>) -> u64 {
+	return v.len;
+}
+
+fn sum(self v: &Vec<u32>) -> u32 {
+	var total: u32 = 0;
+	var i: u64 = 0;
+	while (i < v.len) {
+		total += v.data[i];
+		i += 1;
+	}
+	return total;
+}
+
+fn main() -> u32 {
+	var v: Vec<u32> = makeVec<u32>(0);
+	v.push(10);
+	v.push(20);
+	v.push(30);
+	v.push(40);
+
+	printf("len = %llu\n", v.len());
+	var i: u64 = 0;
+	while (i < v.len()) {
+		printf("  v[%llu] = %u\n", i, v.get(i));
+		i += 1;
+	}
+	printf("sum = %u\n", sum(&v));
+	return 0;
+	// scope end: v's buffer is freed by structural drop.
+}
