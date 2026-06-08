@@ -1,0 +1,29 @@
+// std::io — minimal file input built on C stdio (FFI).
+//
+// `import std::io;` then `readFile(path)` to slurp a whole file into a String.
+// Paths are C strings (`*u8`) — a string literal works directly:
+//   var src: String = readFile("input.alloy");
+
+import std::string;
+
+extern fopen(path: *u8, mode: *u8) -> u64;   // FILE* returned as an opaque u64
+extern fgetc(stream: u64) -> i32;            // next byte, or -1 (EOF)
+extern fclose(stream: u64) -> i32;
+
+// Read an entire file into a String. On failure (file missing) the String is
+// empty — check `length()`. `path` is a byte string (a string literal works);
+// it must be NUL-terminated for the C `fopen` (string literals are).
+exp fn readFile(path: &[u8]) -> String {
+	var s: String = stringNew();
+	var f: u64 = fopen(path, "r");
+	if (f == 0) {
+		return s;
+	}
+	var c: i32 = fgetc(f);
+	while (c != 0 - 1) {
+		s.pushByte(c.convert<u8>());
+		c = fgetc(f);
+	}
+	fclose(f);
+	return s;
+}

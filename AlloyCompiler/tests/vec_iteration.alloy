@@ -1,0 +1,50 @@
+// Positive: `for` over a generic Vec<T> via a reference-holding cursor
+// (iterator()/next() -> Option<T>). Exercises reference-in-struct fields,
+// generic extension monomorphisation, and on-demand Option<T> instantiation.
+type Vec<T> = struct {
+	data: *var [T];
+	len: u64;
+};
+
+type VecIter<T> = struct {
+	src: &Vec<T>;
+	pos: u64;
+};
+
+fn vecNew<T>(seed: T) -> Vec<T> {
+	return Vec<T> { .data = new [seed; 1], .len = 0 };
+}
+
+fn push<T>(self v: &var Vec<T>, x: T) {
+	var bigger: *var [T] = new [x; v.len + 1];
+	var i: u64 = 0;
+	while (i < v.len) { bigger[i] = v.data[i]; i += 1; }
+	bigger[v.len] = x;
+	v.data = move bigger;
+	v.len += 1;
+}
+
+fn iterator<T>(self v: &Vec<T>) -> VecIter<T> {
+	return VecIter<T> { .src = v, .pos = 0 };
+}
+
+fn next<T>(self it: &var VecIter<T>) -> Option<T> {
+	if (it.pos < it.src.len) {
+		var x: T = it.src.data[it.pos];
+		it.pos += 1;
+		return Option::Some(x);
+	}
+	return Option::None;
+}
+
+fn main() -> u32 {
+	var v: Vec<u32> = vecNew<u32>(0);
+	v.push(7);
+	v.push(11);
+	v.push(14);
+	var sum: u32 = 0;
+	for (v) |x| {
+		sum += x;
+	}
+	return sum;
+}

@@ -1,0 +1,97 @@
+// std::vec — a growable generic vector.
+//
+// Import it with `import std::vec;` and use `Vec<T>` plus its methods. The
+// element buffer is an owning `*var [T]` dynamically-sized array; it is freed
+// automatically at scope end by §4.2 structural reclaim. Growth is by exact
+// reallocation (allocate len+1, copy, append, reassign — free-on-reassign drops
+// the old buffer), so every element is always initialised.
+
+exp type Vec<T> = struct {
+	data: *var [T];
+	len: u64;
+};
+
+// A forward cursor over a Vec, borrowing the vector (a non-owning `&Vec<T>`
+// field) so iteration never copies or frees the buffer. Drives `for (v) |x|`.
+exp type VecIter<T> = struct {
+	src: &Vec<T>;
+	pos: u64;
+};
+
+// Create an empty vector. `seed` is any value of the element type; it is used to
+// initialise the (unused) initial slot and is never read back.
+exp fn vecNew<T>(seed: T) -> Vec<T> {
+	return Vec<T> { .data = new [seed; 1], .len = 0 };
+}
+
+// Append one element, growing the buffer by one.
+exp fn push<T>(self v: &var Vec<T>, x: T) {
+	var bigger: *var [T] = new [x; v.len + 1];
+	var i: u64 = 0;
+	while (i < v.len) {
+		bigger[i] = v.data[i];
+		i += 1;
+	}
+	bigger[v.len] = x;
+	v.data = move bigger;     // free-on-reassign drops the old buffer
+	v.len += 1;
+}
+
+// Read the element at index `i` (debug builds bounds-check the access).
+exp fn get<T>(self v: &Vec<T>, i: u64) -> T {
+	return v.data[i];
+}
+
+// Overwrite the element at index `i`.
+exp fn set<T>(self v: &var Vec<T>, i: u64, x: T) {
+	v.data[i] = x;
+}
+
+// Number of elements currently stored.
+exp fn len<T>(self v: &Vec<T>) -> u64 {
+	return v.len;
+}
+
+// True when the vector holds no elements.
+exp fn isEmpty<T>(self v: &Vec<T>) -> bool {
+	return v.len == 0;
+}
+
+// Remove and return the last element, or `Option::None` if the vector is empty.
+// The buffer is kept at its current capacity; the next `push` reallocates it.
+exp fn pop<T>(self v: &var Vec<T>) -> Option<T> {
+	if (v.len == 0) {
+		return Option::None;
+	}
+	v.len -= 1;
+	return Option::Some(v.data[v.len]);
+}
+
+// Return (without removing) the last element, or `Option::None` if empty.
+exp fn last<T>(self v: &Vec<T>) -> Option<T> {
+	if (v.len == 0) {
+		return Option::None;
+	}
+	return Option::Some(v.data[v.len - 1]);
+}
+
+// Logically empty the vector (length 0); the buffer is reclaimed at scope end.
+exp fn clear<T>(self v: &var Vec<T>) {
+	v.len = 0;
+}
+
+// §5 iterator protocol: `iterator()` yields a cursor by value and `next()`
+// advances it, yielding `Option::Some(element)` until exhausted (`None`). This
+// makes `for (v) |x| { … }` iterate a Vec<T>.
+exp fn iterator<T>(self v: &Vec<T>) -> VecIter<T> {
+	return VecIter<T> { .src = v, .pos = 0 };
+}
+
+exp fn next<T>(self it: &var VecIter<T>) -> Option<T> {
+	if (it.pos < it.src.len) {
+		var x: T = it.src.data[it.pos];
+		it.pos += 1;
+		return Option::Some(x);
+	}
+	return Option::None;
+}

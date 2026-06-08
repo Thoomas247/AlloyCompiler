@@ -1,0 +1,73 @@
+// std::string — a growable, owning UTF-8 byte string.
+//
+// Import it with `import std::string;` and use `String`. Backed by an owning
+// `*var [u8]` buffer freed automatically at scope end (§4.2). Like std::vec,
+// growth is by exact reallocation. Output is left to the caller — read bytes
+// with `byteAt`/`length` (this module declares no `extern`s of its own).
+
+exp type String = struct {
+	data: *var [u8];
+	len: u64;
+};
+
+// Create an empty string.
+exp fn stringNew() -> String {
+	return String { .data = new [0; 1], .len = 0 };
+}
+
+// Append one byte.
+exp fn pushByte(self s: &var String, c: u8) {
+	var bigger: *var [u8] = new [c; s.len + 1];
+	var i: u64 = 0;
+	while (i < s.len) {
+		bigger[i] = s.data[i];
+		i += 1;
+	}
+	bigger[s.len] = c;
+	s.data = move bigger;     // free-on-reassign drops the old buffer
+	s.len += 1;
+}
+
+// Append every byte of a string literal (typed `&[u8]`).
+exp fn pushStr(self s: &var String, text: &[u8]) {
+	var i: u64 = 0;
+	while (i < text.length()) {
+		s.pushByte(text[i]);
+		i += 1;
+	}
+}
+
+// Byte at index `i` (debug builds bounds-check the access).
+exp fn byteAt(self s: &String, i: u64) -> u8 {
+	return s.data[i];
+}
+
+// Number of bytes currently stored.
+exp fn length(self s: &String) -> u64 {
+	return s.len;
+}
+
+// True when the string holds no bytes.
+exp fn isEmpty(self s: &String) -> bool {
+	return s.len == 0;
+}
+
+// Logically empty the string (length 0); the buffer is reclaimed at scope end.
+exp fn clear(self s: &var String) {
+	s.len = 0;
+}
+
+// Byte-for-byte equality of two strings.
+exp fn equals(self a: &String, b: &String) -> bool {
+	if (a.len != b.len) {
+		return false;
+	}
+	var i: u64 = 0;
+	while (i < a.len) {
+		if (a.data[i] != b.data[i]) {
+			return false;
+		}
+		i += 1;
+	}
+	return true;
+}

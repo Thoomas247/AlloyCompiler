@@ -1,6 +1,8 @@
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -247,6 +249,120 @@ static int runTests()
 	return failed == 0 ? 0 : 1;
 }
 
+// argv[0], captured in main — used to locate the stdlib shipped beside the exe.
+static std::string g_programPath;
+
+// ---------------------------------------------------------------------------
+// Module merging for `--build` (§5.4). Alloy compiles a single file to a native
+// executable. To make a real, importable standard library possible without full
+// separate compilation, `--build` resolves each `import a::b::c` to a shipped
+// source file (`a/b/c.alloy`) found under a search path, strips the import
+// statements, and concatenates every reachable module into ONE compilation unit
+// — a single TypeId space, so generics and concrete cross-module calls all work
+// through the normal in-module machinery. Use imported names UNQUALIFIED.
+// ---------------------------------------------------------------------------
+
+static bool readFileToString(const fs::path& path, std::string& out)
+{
+	std::ifstream stream(path);
+	if (!stream.is_open())
+		return false;
+	std::stringstream buffer;
+	buffer << stream.rdbuf();
+	out = buffer.str();
+	return true;
+}
+
+// One loaded module: its source with the leading `import …;` statements removed
+// (so it can be concatenated) plus the import paths it declared.
+struct LoadedModule
+{
+	std::string body;
+	std::vector<std::string> imports;
+};
+
+static LoadedModule loadModule(const Source& src)
+{
+	LoadedModule out;
+	auto [tokenStatus, tokens] = tokenize(src);
+	(void)tokenStatus;
+
+	// Skip the leading run of comments / `import …;` statements; the first real
+	// definition token marks where the import-free body begins.
+	size_t i = 0;
+	size_t bodyStart = src.data.size();
+	while (i < tokens.size())
+	{
+		TokenKind k = tokens[i].kind;
+		if (k == TokenKind::Comment) { ++i; continue; }
+		if (k == TokenKind::Import)
+		{
+			while (i < tokens.size() && tokens[i].kind != TokenKind::Semicolon) ++i;
+			if (i < tokens.size()) ++i;   // step past the ';'
+			continue;
+		}
+		break;
+	}
+	if (i < tokens.size() && tokens[i].kind != TokenKind::EndOfFile)
+		bodyStart = tokens[i].start.index;
+	out.body = src.data.substr(bodyStart);
+
+	auto [parseStatus, parseResult] = parse(src, tokens);
+	(void)parseStatus;
+	auto& [moduleNode, allocator] = parseResult;
+	moduleNode.value().imports.forEach([&](const Required<AST::Import>& imp)
+		{
+			out.imports.push_back(std::string(imp.value().path));
+		});
+	return out;
+}
+
+// Map an import path ("a::b::c") to a file ("a/b/c.alloy") under the first
+// search root that contains it. Roots: the current directory, the directory of
+// the compiler executable, and $ALLOY_STDLIB — so the stdlib can ship beside
+// the binary or be pointed at explicitly.
+static bool resolveImportFile(const std::string& importPath, fs::path& found)
+{
+	std::string rel;
+	for (size_t i = 0; i < importPath.size(); )
+	{
+		if (i + 1 < importPath.size() && importPath[i] == ':' && importPath[i + 1] == ':')
+		{
+			rel += '/';
+			i += 2;
+		}
+		else
+		{
+			rel += importPath[i];
+			++i;
+		}
+	}
+	rel += ".alloy";
+
+	std::vector<fs::path> roots;
+	roots.push_back(fs::current_path());
+	if (!g_programPath.empty())
+	{
+		std::error_code ec;
+		fs::path exeDir = fs::path(g_programPath).parent_path();
+		if (!exeDir.empty()) roots.push_back(exeDir);
+	}
+	if (const char* env = std::getenv("ALLOY_STDLIB"); env && *env)
+		roots.push_back(fs::path(env));
+
+	for (const auto& root : roots)
+	{
+		fs::path cand = root / rel;
+		std::error_code ec;
+		if (fs::exists(cand, ec))
+		{
+			found = cand;
+			return true;
+		}
+	}
+	return false;
+}
+
 // ---------------------------------------------------------------------------
 // Back-end driver (§6.C) — compiles a single .alloy file end to end: front-end
 // pipeline, LLVM code generation, then links the emitted object into a native
@@ -262,19 +378,72 @@ static int buildFile(const std::string& path, bool debug)
 		return 1;
 	}
 
-	std::ifstream stream(file);
-	std::stringstream buffer;
-	buffer << stream.rdbuf();
+	std::string userSrc;
+	if (!readFileToString(file, userSrc))
+	{
+		std::fprintf(stderr, "ERROR: could not read source file '%s'.\n", path.c_str());
+		return 1;
+	}
 
-	Source source{ file.stem().string(), buffer.str() };
+	// Resolve + merge imports (§5.4) into one compilation unit. The user module
+	// comes first; every reachable import is loaded once, import-stripped, and
+	// appended. All bodies are import-free, so concatenation order is irrelevant.
+	Source userSource{ file.stem().string(), userSrc };
+	LoadedModule userMod = loadModule(userSource);
+
+	// Keep the user file's own `import` statements at the top of the combined
+	// unit (only the dependencies are import-stripped). They let the resolver
+	// accept qualified access to imported names (`std::vec::Vec`) — see the
+	// importedSymbols wiring below — while every definition still lives in one
+	// merged module so codegen needs no cross-module support.
+	std::string combined = userSrc + "\n\n";
+	std::deque<std::string> pending(userMod.imports.begin(), userMod.imports.end());
+	std::set<std::string> seen;
+	while (!pending.empty())
+	{
+		std::string importPath = pending.front();
+		pending.pop_front();
+		if (!seen.insert(importPath).second)
+			continue;
+
+		fs::path depFile;
+		if (!resolveImportFile(importPath, depFile))
+		{
+			std::fprintf(stderr,
+				"ERROR: imported module '%s' was not found in the library search path "
+				"(looked for '%s' under the current directory, the compiler directory, and $ALLOY_STDLIB).\n",
+				importPath.c_str(), importPath.c_str());
+			return 1;
+		}
+		std::string depSrc;
+		if (!readFileToString(depFile, depSrc))
+		{
+			std::fprintf(stderr, "ERROR: could not read imported module '%s' at '%s'.\n",
+				importPath.c_str(), depFile.generic_string().c_str());
+			return 1;
+		}
+		Source depSource{ importPath, depSrc };
+		LoadedModule depMod = loadModule(depSource);
+		combined += depMod.body;
+		combined += "\n\n";
+		for (const auto& di : depMod.imports)
+			pending.push_back(di);
+	}
+
+	Source source{ file.stem().string(), combined };
 
 	auto [tokenStatus, tokens] = tokenize(source);
 	auto [parseStatus, parseResult] = parse(source, tokens);
 	auto& [moduleNode, allocator] = parseResult;
 	auto [declareStatus, symbols] = declare(source, moduleNode.value());
 
-	std::vector<const SymbolTable*> noImports;
-	auto [resolveStatus, resolved] = resolve(source, moduleNode.value(), symbols, noImports);
+	// Every import aliases back to the merged module's own symbol table, so a
+	// qualified name (`std::vec::Vec`) resolves to the merged definition and is
+	// subject to the normal cross-boundary visibility check (only pub/exp).
+	std::vector<const SymbolTable*> importedSymbols;
+	moduleNode.value().imports.forEach([&](const Required<AST::Import>&)
+		{ importedSymbols.push_back(&symbols); });
+	auto [resolveStatus, resolved] = resolve(source, moduleNode.value(), symbols, importedSymbols);
 
 	auto failOut = [&]() -> int
 	{
@@ -338,6 +507,9 @@ int main(int argc, char** argv)
 	// Make stdout unbuffered so progress/diagnostics survive even if a late
 	// teardown (e.g. LLVM global shutdown) aborts before the buffer is flushed.
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+	if (argc > 0 && argv[0])
+		g_programPath = argv[0];
 
 	if (argc > 1 && std::string_view(argv[1]) == "--test")
 		return runTests();

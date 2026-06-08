@@ -1,0 +1,52 @@
+// Uses the shipped standard library via `import`. The compiler resolves each
+// import to its `.alloy` file under the library search path and merges it into
+// this compilation unit, so `Vec<T>` and `String` are usable directly.
+import std::vec;
+import std::string;
+
+extern printf(...) -> i32;
+
+fn main() -> u32 {
+	// std::vec — a growable generic vector.
+	var v: Vec<u32> = vecNew<u32>(0);
+	v.push(10);
+	v.push(20);
+	v.push(30);
+	printf("vec len = %llu\n", v.len());
+	// `for` over a Vec uses std::vec's iterator()/next() cursor protocol.
+	var sum: u32 = 0;
+	for (v) |e| {
+		printf("  v = %u\n", e);
+		sum += e;
+	}
+	printf("sum = %u\n", sum);
+	var i: u64 = 0;
+
+	// Drain the vector with the fallible `pop` (returns `Option<T>`).
+	printf("draining:");
+	var draining: bool = true;
+	while (draining) {
+		match (v.pop()) {
+			Option::Some |x| { printf(" %u", x); }
+			Option::None { draining = false; }
+		}
+	}
+	printf("  (empty now? %d)\n", v.isEmpty());
+
+	// std::string — a growable owning byte string.
+	var s: String = stringNew();
+	s.pushStr("Hello, ");
+	s.pushStr("stdlib!");
+	i = 0;
+	while (i < s.length()) {
+		printf("%c", s.byteAt(i));
+		i += 1;
+	}
+	printf("\n");
+
+	// String equality (std::string::equals).
+	var t: String = stringNew();
+	t.pushStr("Hello, stdlib!");
+	printf("strings equal? %d\n", s.equals(&t));
+	return 0;
+}

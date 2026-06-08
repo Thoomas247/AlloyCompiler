@@ -264,18 +264,44 @@ static void resolveIdentifier(ResolveState& state, const AST::IdentifierExpressi
 	else
 	{
 		// qualified path: A::B[::C...]
-		// track A — module-qualified: first segment is an import alias
+		// track A — module-qualified: a PREFIX of the path is an import alias
+		//   (e.g. `std::vec::Vec` — the import alias is `std::vec`, the name `Vec`)
 		// track B — type-scoped: first segment is a TypeDefinition; remaining segments resolved by type-checker
 		auto firstName = state.getStringView(*firstToken);
 
-		if (auto* importTable = state.findImport(firstName))
+		// Find the longest path prefix that matches an import alias. A module path
+		// may itself be qualified (`std::vec`), so try `std`, then `std::vec`, ….
+		const SymbolTable* importTable = nullptr;
+		std::string matchedAlias;
+		const AST::ListNode<const Token*>* afterPrefix = nullptr;
 		{
-			// Track A: walk to last segment and resolve in the imported module's symbol table.
+			std::string prefix;
 			const AST::ListNode<const Token*>* node = &firstNode;
-			while (node->next.hasValue())
-				node = node->next.ptr();
+			while (node)
+			{
+				if (!prefix.empty()) prefix += "::";
+				prefix += std::string(state.getStringView(*node->item.value()));
+				const AST::ListNode<const Token*>* rest = node->next.hasValue() ? node->next.ptr() : nullptr;
+				if (rest)
+				{
+					if (auto* t = state.findImport(prefix))
+					{
+						importTable = t;
+						matchedAlias = prefix;
+						afterPrefix = rest;
+					}
+				}
+				node = rest;
+			}
+		}
 
-			const Token* lastToken = node->item.value();
+		if (importTable)
+		{
+			// Track A: resolve the segment immediately after the module prefix in the
+			// imported module's symbol table (any further `::member` segments — e.g.
+			// `mod::Enum::Variant` — are resolved by the type-checker).
+			firstName = matchedAlias;
+			const Token* lastToken = afterPrefix->item.value();
 			auto lastName = state.getStringView(*lastToken);
 			auto candidates = importTable->get(lastName);
 			if (candidates.empty())

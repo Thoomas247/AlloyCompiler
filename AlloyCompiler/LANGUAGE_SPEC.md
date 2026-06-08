@@ -611,7 +611,10 @@ extern variadicFunc(...) -> *var u8;
 
 ### 5.4 Module System
 
-* **Strict File System Mirroring:** Qualified module pathways match physical disk positioning precisely. An instruction like `import a::b::c;` commands the compiler to look explicitly for a source file located at `a/b/c.alloy` relative to the workspace project root directory.
+* **Strict File System Mirroring:** Qualified module pathways match physical disk positioning precisely. An instruction like `import a::b::c;` commands the compiler to look explicitly for a source file located at `a/b/c.alloy`.
+* **Standard library:** The standard library ships as ordinary Alloy source files alongside the compiler (`std/vec.alloy`, `std/string.alloy`, …). It is **not** a prelude — nothing is in scope until imported. `import std::vec;` makes `Vec<T>` available.
+* **`--build` import resolution (current implementation):** When compiling a single file to a native executable, each `import a::b::c;` is resolved to `a/b/c.alloy` searched under, in order: the current directory, the compiler-executable's directory, and `$ALLOY_STDLIB`. Every reachable module is **merged into one compilation unit**.
+* **Qualified vs. unqualified access:** an imported name may be written either unqualified (`Vec`) or module-qualified (`std::vec::Vec`). Qualified access goes through the cross-module visibility check, so only `pub`/`exp` definitions are reachable that way; unqualified access sees the whole merged unit. A name that collides with an existing definition is a redeclaration error. (The merge is an implementation shortcut — true separate compilation with per-module object files and namespaces is a future step; the per-module TypeId model is the obstacle.)
 
 ---
 

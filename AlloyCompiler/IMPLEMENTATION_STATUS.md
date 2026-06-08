@@ -940,6 +940,163 @@ To verify a change:
     progress/`--test` output (and surface as a confusing exit code) when output
     was piped; diagnostics now flush as they are produced.
 
+47. ~~**Importable standard library shipped as `.alloy` files**~~ **DONE.** §5.4.
+    The standard library is a set of real Alloy source files
+    ([`std/vec.alloy`](std/vec.alloy), [`std/string.alloy`](std/string.alloy))
+    that ship with the compiler — no prelude, no built-in registry. A user
+    program imports them (`import std::vec;`) and uses the names directly.
+    Mechanism (`buildFile` in [`AlloyCompiler.cpp`](src/AlloyCompiler.cpp)):
+    `--build` resolves each `import a::b::c` to a file `a/b/c.alloy` found under
+    a search path (the current directory, the compiler-executable directory, and
+    `$ALLOY_STDLIB`), strips the `import` statements from every reachable module,
+    and **concatenates them all into one compilation unit**. This sidesteps full
+    separate compilation: a single TypeId space means cross-module generics
+    (`Vec<T>`) monomorphise and concrete cross-module calls (`String` methods)
+    resolve through the existing in-module machinery. Transitive imports are
+    followed; each module is merged once. *Limitations:* (a) imported names are
+    used **unqualified** (the merge has no per-module namespace, so `std::vec::Vec`
+    is not addressable — write `Vec`); (b) no cross-module visibility enforcement
+    (everything in the merged unit is mutually visible); (c) a name clash between
+    a user definition and a stdlib one is a redeclaration error. The companion
+    fix: codegen's built-in `.length()` no longer hijacks a **user-defined**
+    `length` method on a non-array/slice receiver (it returned a constant `0`);
+    it now defers to overload resolution, so a type may define its own `length`.
+    Demo [`samples/use_stdlib.alloy`](samples/use_stdlib.alloy) (`import std::vec;
+    import std::string;`) builds + runs; test `tests/user_length_method.alloy`.
+
+48. ~~**Stdlib breadth (`Option`-returning ops) + two latent codegen fixes**~~
+    **DONE.** [`std/vec.alloy`](std/vec.alloy) gained `isEmpty`, `pop`/`last`
+    (returning the built-in `Option<T>`), and `clear`;
+    [`std/string.alloy`](std/string.alloy) gained `isEmpty`, `clear`, and
+    `equals`. Two real back-end bugs surfaced and were fixed:
+    - **Enum LLVM-type identity.** Every enum lowers to `{ i32, [N x i8] }` with a
+      type-erased payload, but each lowering created a *fresh* identified struct.
+      A generic method returning a generic enum (`pop<T> -> Option<T>`) lowered
+      its return type and its returned value to two distinct `%alloy.enum` structs
+      → `ret` failed LLVM verification. Enums are now interned by payload size
+      (`enumTyCache`), so same-shape enums share one LLVM type.
+    - **Non-32-bit dynamic-array field indexing.** Indexing a `*var [T]` held in a
+      **struct field** (`s.data[i]`) typed the element via the *unstripped* field
+      type (a pointer), so it fell back to `i32`. Invisible for 32-bit elements
+      (`Vec<u32>` — `u32` *is* `i32`), but for `*var [u8]` it emitted 4-byte loads,
+      reading past the buffer (e.g. `String::equals` mismatched on the tail). The
+      index type-check now strips one indirection before reading the element type.
+    The demo exercises `pop`/`Option` draining and `String::equals`.
+
+49. ~~**`for`-iteration over a generic `Vec<T>` (borrow-in-struct + on-demand
+    mono instantiation)**~~ **DONE.** `for (v) |x| { … }` now iterates a generic
+    `Vec<T>` through the §5 cursor protocol (`iterator()`/`next() -> Option<T>`,
+    item 37) — `VecIter<T>` and `iterator`/`next` are now part of
+    [`std/vec.alloy`](std/vec.alloy). Four pieces landed:
+    - **References in struct fields (borrow-in-struct).** A struct may now hold a
+      non-owning `&T` field. `genStructInit` stores a *pointer* into an
+      indirection-typed field (via `genArg`) instead of §4.2-dereferencing the RHS
+      and clobbering the field; and `genAddr` for a member access whose object is
+      itself a reference *field*/element loads it to follow the reference (an
+      identifier binding was already deref'd, a field was not). This was the core
+      blocker — an iterator can hold `src: &Vec<T>` without owning/freeing the
+      buffer.
+    - **On-demand mono instantiation** (`deepSubstitute`, type checker). A generic
+      method returning a generic type (`next<T>() -> Option<T>`) now *instantiates*
+      the concrete `Option<u32>` (rebuilding its underlying enum) rather than
+      leaving the result as the generic `Option<T>` when no other code referenced
+      it — previously a `match` capture bound to `T` and arithmetic on it failed.
+    - **Generic custom-iterable resolution.** Both the type checker
+      (`extensionReturnType`) and codegen (`resolveExtension`) now match a *generic*
+      `iterator`/`next` whose `self` shares the container's generic source, bind the
+      type parameters positionally, and monomorphise — so `for` over `Vec<u32>`
+      resolves `iterator<u32>`/`next<u32>` and the concrete `VecIter<u32>`/
+      `Option<u32>`.
+    Demo: [`samples/use_stdlib.alloy`](samples/use_stdlib.alloy) now iterates the
+    imported Vec with `for`; test `tests/vec_iteration.alloy`. The reference-field
+    and on-demand-instantiation fixes are general wins (linked structures, views,
+    any generic-method-returning-generic-type).
+
+50. ~~**Qualified module names + visibility on imported modules**~~ **DONE.** §5.4.
+    Imported names may now be written **module-qualified** — `std::vec::Vec`,
+    `std::vec::vecNew` — in addition to unqualified. Two changes:
+    - **Resolver:** Track A (module-qualified path) now matches the *longest path
+      prefix* that is an import alias, since a module path is itself qualified
+      (`std::vec`). The remaining segment resolves in the imported module's symbol
+      table, through the existing **visibility** filter — so only `pub`/`exp`
+      definitions are reachable by qualified access (the stdlib types are now
+      `exp`). Unqualified access is unchanged.
+    - **`--build` merge:** the user file's own `import`s are kept at the top of the
+      merged unit and each aliases back to the merged symbol table, so the resolver
+      can satisfy a qualified name while every definition still lives in one module
+      (codegen needs no cross-module support). Demo
+      [`samples/qualified_import.alloy`](samples/qualified_import.alloy).
+
+    *Scope note:* this delivers qualified names and per-module visibility on top of
+    the merge model. **True separate compilation** — per-module object files,
+    cross-module mangled symbol references, `linkonce_odr` monomorphisations, and a
+    real per-module namespace/TypeId reconciliation — remains a large follow-on
+    (the per-module TypeId spaces are the core obstacle); the merge is the
+    deliberate shortcut that makes the current importer work.
+
+51. ~~**Recursive AST (self-hosting keystone): owning-pointer trees**~~ **DONE.**
+    A recursive `enum`/`struct` graph built from owning `*T` pointers — the core
+    data structure a compiler-in-Alloy needs — now works end-to-end: factory
+    functions returning `*Expr`, recursive `match`-based traversal, and recursive
+    structural drop (the whole tree freed exactly once, no corruption). Two
+    general fixes:
+    - **A5 relaxation:** an owning `*T` binding may be initialised from a *function
+      call* returning `*T` (a factory like `fn num() -> *Expr`), not only a literal
+      `new`/`move`. The call is an rvalue, so this transfers ownership without
+      aliasing — essential for building trees.
+    - **Pointer-argument forwarding:** passing a `*T`/`&T` *value* (a call result
+      or a `*T`-typed struct field, for a struct/enum `T`) to a `&T`/`*T` parameter
+      now forwards the pointer directly instead of taking its address or
+      §4.2-dereferencing it. The fix uses the *unstripped* return/field type
+      (`rawTypeOf`, extended to function calls) and is gated to bare pointers
+      (not slices/interfaces) and non-identifier args (identifiers already load
+      their held pointer via `genAddr`). Without it, `eval(child)` passed a garbage
+      value and the match read a garbage tag.
+    Sample [`samples/ast_eval.alloy`](samples/ast_eval.alloy); test
+    `tests/recursive_ast.alloy`. This unblocks ASTs, linked lists, and any tree of
+    owning nodes — the representation layer for a self-hosted compiler.
+
+52. ~~**File input via FFI + `std::io` (read a source file into a String)**~~
+    **DONE.** A compiler must read source. [`std/io.alloy`](std/io.alloy) provides
+    `readFile(path: &[u8]) -> String`, built on C `fopen`/`fgetc`/`fclose` via
+    `extern`. Sample [`samples/read_file.alloy`](samples/read_file.alloy) reads
+    its own source into a `std::string::String` and prints the first line. Two
+    FFI fixes made this work:
+    - **Typed extern arguments.** `calleeParamTypes` now returns an *extern*'s
+      declared fixed parameter types (not just `FunctionDefinition`s), so a typed
+      extern call (`fopen(path: *u8, …)`) lowers each argument against its C type
+      instead of treating everything as variadic. Trailing `…` args are still
+      C-promoted.
+    - **Slice → pointer decay.** A byte string `&[u8]` (or `[u8]`) passed to a bare
+      C pointer parameter (`*u8` = `char*`) now forwards the slice's *data pointer*
+      (field 0 of the fat pointer) rather than the `{ptr,len}` header — for both
+      string literals and `&[u8]` variables. (String literals are NUL-terminated,
+      so they work directly as C strings.)
+    *Limitation:* command-line arguments (`argc`/`argv`, a C `char**`) are not yet
+    exposed — `main` takes no parameters and there is no `**T` / argv accessor, so
+    a compiler-in-Alloy currently reads a fixed/known path rather than one passed
+    on the command line. That (plus file *writing*) is the remaining I/O follow-on.
+
+53. ~~**Self-hosting proof: a full arithmetic compiler written in Alloy**~~
+    **DONE.** [`samples/calc.alloy`](samples/calc.alloy) is a complete mini-compiler
+    *written in Alloy* — the same lexer → parser → AST → evaluator shape as a real
+    compiler. It tokenizes an expression string into a `Vec<Token>` (enum tokens),
+    parses it by recursive descent with operator precedence and parentheses
+    (`&var Parser` cursor, `match` on tokens), builds a recursive `*Expr` AST, and
+    evaluates it: `2 + 3 * 4 - 1 = 13`, `(2 + 3) * 4 = 20`, `10 + 20 * 3 = 70` — all
+    correct, memory reclaimed by structural drop. This exercises String/slice
+    iteration, char/digit handling, `Vec` of enums, recursive owning-pointer ASTs,
+    generic methods, and method-style state mutation, all at once.
+    Building it surfaced a **fundamental codegen bug**, now fixed: assigning to a
+    bare-identifier **pointer variable** (`acc = cons(i, move acc)` — the iterative
+    tree-/list-building pattern) used `genAddr` on the target, which §4.2-*derefs*
+    an indirection identifier and yields the *pointee* address — so the store and
+    free-on-reassign went through the **old** pointer, corrupting the heap. It now
+    uses the binding's *slot* for an identifier target (member/array targets still
+    use the field/element address). Never hit before because prior reassignments
+    always targeted struct *fields* (`b.data = …`), not pointer variables. Test
+    `tests/pointer_reassign.alloy` (a linked list built by repeated prepend).
+
 ---
 
 ## What's Left vs. the Spec
@@ -956,15 +1113,17 @@ remaining gaps are concentrated in three areas:
   exists in the grammar (`as` is only an import alias). Needs an EBNF
   addition (`expr as Type` or `Type(expr)`) and matching checker + codegen
   paths.
-* **A *packaged* standard library** (§5). `Vec<T>` and `String` are now
-  *expressible* in pure Alloy and demonstrated as samples (items 43–45),
-  but they are not yet shipped as importable `std` modules — `--build`
-  compiles a single file with no import resolution, so a stdlib module
-  cannot be imported under it. Turning the demonstrated `Vec`/`String`
-  into an importable `std::vec` / `std::string` needs `--build` (or a
-  package driver) to resolve imports, plus a richer API surface
-  (`pop`, `insert`, iterators, `Option<T>` returns for fallible ops).
-  The *language* gap is closed; what remains is *packaging*.
+* **A richer standard library + true separate compilation** (§5). `std::vec`
+  and `std::string` ship as importable `.alloy` files (item 47), support
+  iterators and `Option`-returning ops (items 48–49), and are reachable both
+  unqualified and module-qualified with visibility enforced (item 50). What
+  remains is *breadth* (more types/ops — `insert`, hash maps, slices over a
+  Vec, formatted output) and a *real* module system: the importer still
+  **merges** every module into one compilation unit, so there are no separate
+  per-module object files, no cross-module symbol linkage, and one shared
+  TypeId space. True separate compilation (per-module objects, mangled
+  cross-module references, `linkonce_odr` monos) is the larger follow-on; the
+  per-module TypeId model is the core obstacle.
 * **Comptime filesystem I/O** (§6.3 example: `readTypeFromJson`). §6.2
   defines the sandbox but no comptime I/O primitives exist. Custom
   iterator structures are now supported (item 37) via the

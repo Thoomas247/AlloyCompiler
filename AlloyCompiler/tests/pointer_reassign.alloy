@@ -1,0 +1,31 @@
+// Positive: reassigning an owning pointer variable where the RHS consumes the
+// same variable (`acc = node(move acc, …)`) — the iterative tree-building
+// pattern a parser uses. The assignment must rebind the variable's slot, not
+// store through the old pointer.
+type Cons = struct { head: i64; tail: *List; };
+type List = enum { Nil; Cell: Cons; };
+
+fn nil() -> *List { return new List::Nil; }
+fn cons(h: i64, t: *List) -> *List { return new List::Cell(Cons { .head = h, .tail = move t }); }
+
+fn sum(l: &List) -> i64 {
+	match (l) {
+		List::Nil { return 0; }
+		List::Cell |c| { return c.head + sum(c.tail); }
+	}
+	return 0;
+}
+
+fn main() -> u32 {
+	// Build [1,2,3] by repeatedly prepending — reassigning `acc` each time.
+	var acc: *List = nil();
+	var i: i64 = 1;
+	while (i <= 3) {
+		acc = cons(i, move acc);
+		i += 1;
+	}
+	if (sum(acc) == 6) {
+		return 0;
+	}
+	return 1;
+}

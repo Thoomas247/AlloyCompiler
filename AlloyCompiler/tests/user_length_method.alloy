@@ -1,0 +1,17 @@
+// Positive: a user type may define a method named `length` — it must not be
+// hijacked by the built-in `.length()` (which applies only to arrays/slices).
+type Bag = struct {
+	count: u64;
+};
+
+fn length(self b: &Bag) -> u64 {
+	return b.count;
+}
+
+fn main() -> u32 {
+	const b: Bag = Bag { .count = 5 };
+	if (b.length() == 5) {
+		return 0;
+	}
+	return 1;
+}

@@ -62,6 +62,12 @@ namespace
 		llvm::TargetMachine* targetMachine = nullptr;
 
 		std::unordered_map<TypeId, llvm::Type*> typeCache;
+		// All enums lower to `{ i32 tag, [N x i8] payload }`; the payload is type-
+		// erased, so enums sharing a payload size share one LLVM type (keyed by N).
+		// Without this, two monomorphisations of the same enum (e.g. `Option<u32>`
+		// lowered for a return type and for the returned value) become distinct
+		// identified structs and a `ret` instruction fails verification.
+		std::unordered_map<uint64_t, llvm::StructType*> enumTyCache;
 		llvm::StructType* sliceTy = nullptr;       // { ptr, i64 } fat pointer
 		llvm::StructType* ifaceTy = nullptr;       // { data ptr, vtable ptr } fat pointer
 		llvm::StructType* closureTy = nullptr;     // { fn ptr, env ptr } function value
@@ -415,10 +421,18 @@ namespace
 				}
 				case TypeInfo::Kind::Enum:
 				{
+					uint64_t payload = enumPayloadSize(info);
+					auto eit = enumTyCache.find(payload);
+					if (eit != enumTyCache.end())
+					{
+						if (cacheable) typeCache[id] = eit->second;
+						return eit->second;
+					}
 					auto* st = llvm::StructType::create(ctx, "alloy.enum");
-					if (cacheable) typeCache[id] = st;
 					st->setBody({ builder.getInt32Ty(),
-						llvm::ArrayType::get(builder.getInt8Ty(), enumPayloadSize(info)) });
+						llvm::ArrayType::get(builder.getInt8Ty(), payload) });
+					enumTyCache[payload] = st;
+					if (cacheable) typeCache[id] = st;
 					return st;
 				}
 				case TypeInfo::Kind::Named:
@@ -563,6 +577,33 @@ namespace
 				std::string_view fname = cg.tokenText(mReq->value().memberName);
 				for (const auto& m : cg.interned.get(cur).asStruct().members)
 					if (m.name == fname) return m.type;
+			}
+		}
+		// A call's *unstripped* return type — the type checker strips one
+		// indirection in exprType (so a `*T`-returning call used as a value derefs),
+		// but for argument passing we need to know the result is itself a pointer.
+		if (auto* cReq = std::get_if<Required<AST::FunctionCallExpression>>(&e))
+		{
+			auto it = cg.typed.selectedOverloads.find(&cReq->value());
+			if (it != cg.typed.selectedOverloads.end() && it->second)
+			{
+				if (auto* fd = std::get_if<Required<AST::FunctionDefinition>>(&it->second->definition))
+				{
+					const AST::Function& f = fd->value().function.value();
+					if (f.returnType.hasValue())
+					{
+						auto ti = cg.interned.astTypes.find(&f.returnType.value());
+						if (ti != cg.interned.astTypes.end()) return ti->second;
+					}
+				}
+				else if (auto* ext = std::get_if<Required<AST::ExternDefinition>>(&it->second->definition))
+				{
+					if (ext->value().returnType.hasValue())
+					{
+						auto ti = cg.interned.astTypes.find(&ext->value().returnType.value());
+						if (ti != cg.interned.astTypes.end()) return ti->second;
+					}
+				}
 			}
 		}
 		return cg.exprType(e);
@@ -1616,7 +1657,17 @@ namespace
 			// e.g. `c.r` where `c: &Circle` finds the Circle struct.
 			if (objTy < (TypeId)cg.interned.table.size()
 				&& cg.interned.get(objTy).isIndirection())
+			{
+				// `base` holds the indirection. For an identifier binding genAddr
+				// already returns the held pointer; for a member-/array-access lvalue
+				// (e.g. a reference stored in a struct field, `it.src.len`) it returns
+				// the field/element ADDRESS — load it to follow the reference.
+				const AST::Expression& obj = m.object.value();
+				if (std::get_if<Required<AST::MemberAccessExpression>>(&obj)
+					|| std::get_if<Required<AST::ArrayAccessExpression>>(&obj))
+					base = cg.builder.CreateLoad(cg.builder.getPtrTy(), base, "ref.field.deref");
 				objTy = cg.interned.get(objTy).asIndirection().inner;
+			}
 			while (objTy < (TypeId)cg.interned.table.size()
 				&& cg.interned.get(objTy).kind == TypeInfo::Kind::Named)
 				objTy = cg.interned.get(objTy).asNamed().underlying;
@@ -1740,8 +1791,22 @@ namespace
 		const AST::Function* fn = nullptr;
 		if (auto* f = std::get_if<Required<AST::FunctionDefinition>>(&decl.definition))
 			fn = f->value().function.ptr();
+		// An extern's declared (fixed) parameter types — so a typed extern call
+		// (e.g. `fopen(path: *u8, …)`) lowers each argument against its C type
+		// instead of treating every argument as variadic. Trailing variadic args
+		// (`…`) are still promoted by the INVALID_TYPE_ID fall-through at the call.
 		if (!fn)
+		{
+			if (auto* ext = std::get_if<Required<AST::ExternDefinition>>(&decl.definition))
+			{
+				ext->value().parameters.forEach([&](const Required<AST::FunctionParameter>& p)
+					{
+						auto ti = cg.interned.astTypes.find(&p.value().type.value());
+						out.push_back(ti != cg.interned.astTypes.end() ? ti->second : INVALID_TYPE_ID);
+					});
+			}
 			return out;
+		}
 		fn->parameters.forEach([&](const Required<AST::FunctionParameter>& p)
 			{
 				auto ti = cg.interned.astTypes.find(&p.value().type.value());
@@ -1769,8 +1834,55 @@ namespace
 
 		if (cg.isIndirection(paramType))
 		{
+			// C-FFI slice→pointer decay: a slice/array argument bound to a bare
+			// (non-slice, non-interface) pointer parameter — e.g. a byte string
+			// `&[u8]` passed to a C `char*` (`*u8`) — forwards the slice's data
+			// pointer, not the fat-pointer header.
+			{
+				TypeId pInner = cg.canonical(cg.interned.get(paramType).asIndirection().inner);
+				bool paramBare = pInner != INVALID_TYPE_ID && pInner < static_cast<TypeId>(cg.interned.table.size())
+					&& cg.interned.get(pInner).kind != TypeInfo::Kind::Slice
+					&& cg.interned.get(pInner).kind != TypeInfo::Kind::Interface;
+				TypeId argVal = cg.canonical(cg.exprType(arg));
+					for (int g = 0; g < 4 && argVal != INVALID_TYPE_ID
+						&& argVal < static_cast<TypeId>(cg.interned.table.size())
+						&& cg.interned.get(argVal).isIndirection(); ++g)
+						argVal = cg.canonical(cg.interned.get(argVal).asIndirection().inner);
+				bool argSlice = argVal != INVALID_TYPE_ID && argVal < static_cast<TypeId>(cg.interned.table.size())
+					&& cg.interned.get(argVal).kind == TypeInfo::Kind::Slice;
+				if (paramBare && argSlice)
+				{
+					// Get the slice value (works for a literal, which is not an
+					// lvalue) and extract its data pointer (field 0).
+					llvm::Value* sv = genExpr(cg, arg, cg.exprType(arg));
+					if (sv && sv->getType() == cg.getSliceTy())
+						return cg.builder.CreateExtractValue(sv, { 0 }, "ffi.data");
+					if (sv && sv->getType() == cg.builder.getPtrTy())
+						return cg.builder.CreateLoad(cg.builder.getPtrTy(),
+							cg.builder.CreateStructGEP(cg.getSliceTy(), sv, 0, "slice.datap"),
+							"ffi.data");
+				}
+			}
 			if (exprIsAddressForm(arg))
 				return genExpr(cg, arg, paramType);
+			// The argument is already a pointer/reference VALUE (e.g. a call
+			// returning `*T`, passed to a `&T`/`*T` parameter) — forward that
+			// pointer directly rather than taking its address. rawTypeOf gives the
+			// UNstripped type (exprType strips one indirection for §4.2 value use).
+			{
+				TypeId at = rawTypeOf(cg, arg);
+				if (at != INVALID_TYPE_ID && at < static_cast<TypeId>(cg.interned.table.size())
+					&& cg.interned.get(at).isIndirection()
+					&& !std::get_if<Required<AST::IdentifierExpression>>(&arg))
+				{
+					TypeId inner = cg.canonical(cg.interned.get(at).asIndirection().inner);
+					bool fat = inner != INVALID_TYPE_ID && inner < static_cast<TypeId>(cg.interned.table.size())
+						&& (cg.interned.get(inner).kind == TypeInfo::Kind::Slice
+							|| cg.interned.get(inner).kind == TypeInfo::Kind::Interface);
+					if (!fat)
+						return genExpr(cg, arg, at);
+				}
+			}
 			llvm::Value* addr = genAddr(cg, arg);
 			if (addr)
 				return addr;
@@ -1821,7 +1933,10 @@ namespace
 							cg.builder.CreateStructGEP(cg.getSliceTy(), addr, 1, "slice.len"));
 				}
 			}
-			return cg.builder.getInt64(0);
+			// Not an array/slice/dynamic-array receiver: `.length()` here is a
+			// user-defined method (e.g. on a struct), not the built-in (§5.1).
+			// Return null so normal overload resolution dispatches to it.
+			return nullptr;
 		}
 
 		if (name == "convert" || name == "reinterpret")
@@ -2165,8 +2280,20 @@ namespace
 				{
 					if (members[i].name != fname)
 						continue;
-					llvm::Value* v = genExpr(cg, mi.value().value.value(), members[i].type);
-					v = coerce(cg, v, cg.exprType(mi.value().value.value()), members[i].type);
+					// An indirection-typed field (`*T` / `&T` / `*[T]`) stores a
+					// POINTER: `new`/`move` yield one directly, a `&x` is an address,
+					// and a reference value forwards its held pointer. genArg performs
+					// exactly this (mirroring call-argument lowering) — using plain
+					// genExpr would §4.2-dereference a reference RHS and store the
+					// whole pointee, clobbering the field (and its neighbours).
+					llvm::Value* v;
+					if (cg.isIndirection(members[i].type))
+						v = genArg(cg, mi.value().value.value(), members[i].type);
+					else
+					{
+						v = genExpr(cg, mi.value().value.value(), members[i].type);
+						v = coerce(cg, v, cg.exprType(mi.value().value.value()), members[i].type);
+					}
 					llvm::Value* fp = cg.builder.CreateStructGEP(llStruct, slot,
 						static_cast<unsigned>(i), "init.f");
 					cg.builder.CreateStore(v, fp);
@@ -2757,11 +2884,13 @@ namespace
 	{
 		ResolvedExt out;
 		if (selfValueType == INVALID_TYPE_ID) return out;
+		TypeId canonSelf = cg.canonical(selfValueType);
 		for (const auto* decl : cg.syms.get(name))
 		{
 			auto* fdReq = std::get_if<Required<AST::FunctionDefinition>>(&decl->definition);
 			if (!fdReq) continue;
-			const AST::Function* fn = fdReq->value().function.ptr();
+			const AST::FunctionDefinition& fdef = fdReq->value();
+			const AST::Function* fn = fdef.function.ptr();
 			const auto* pl = fn->parameters.ptr();
 			if (!pl) continue;
 			const auto& first = pl->item.value();
@@ -2769,21 +2898,81 @@ namespace
 			auto it = cg.interned.astTypes.find(&first.type.value());
 			if (it == cg.interned.astTypes.end()) continue;
 			TypeId fpVal = stripIndir(cg, it->second);
-			if (fpVal != selfValueType && cg.canonical(fpVal) != cg.canonical(selfValueType))
+
+			if (!fdef.typeParameters.hasValue())
+			{
+				// Non-generic extension: exact self-type match, already-emitted fn.
+				if (fpVal != selfValueType && cg.canonical(fpVal) != canonSelf)
+					continue;
+				auto fit = cg.fnMap.find(fdReq->ptr());
+				if (fit == cg.fnMap.end()) continue;
+				out.fn = fit->second;
+				fn->parameters.forEach([&](const Required<AST::FunctionParameter>& p)
+					{
+						auto ti = cg.interned.astTypes.find(&p.value().type.value());
+						out.paramTypes.push_back(ti != cg.interned.astTypes.end() ? ti->second : INVALID_TYPE_ID);
+					});
+				if (fn->returnType.hasValue())
+				{
+					auto rit = cg.interned.astTypes.find(&fn->returnType.value());
+					out.retType = rit != cg.interned.astTypes.end() ? rit->second : INVALID_TYPE_ID;
+				}
+				return out;
+			}
+
+			// Generic extension (e.g. `iterator<T>(self &Vec<T>)`): the self value
+			// type must be a generic Named mono sharing the container's source, so
+			// the type parameters can be bound positionally and monomorphised.
+			if (fpVal >= (TypeId)cg.interned.table.size()
+				|| selfValueType >= (TypeId)cg.interned.table.size())
 				continue;
-			auto fit = cg.fnMap.find(fdReq->ptr());
-			if (fit == cg.fnMap.end()) continue;
-			out.fn = fit->second;
+			const TypeInfo& fpInfo = cg.interned.get(fpVal);
+			const TypeInfo& selfInfo = cg.interned.get(selfValueType);
+			if (fpInfo.kind != TypeInfo::Kind::Named || selfInfo.kind != TypeInfo::Kind::Named)
+				continue;
+			const auto& fpArgs = fpInfo.asNamed().typeArgs;
+			const auto& selfArgs = selfInfo.asNamed().typeArgs;
+			if (fpArgs.empty() || fpArgs.size() != selfArgs.size())
+				continue;
+			bool sameSource = false;
+			{
+				auto fu = cg.interned.monoSourceDef.find(fpVal);
+				auto su = cg.interned.monoSourceDef.find(selfValueType);
+				if (fu != cg.interned.monoSourceDef.end() && su != cg.interned.monoSourceDef.end())
+					sameSource = (fu->second == su->second);
+				if (!sameSource)
+				{
+					auto fb = cg.interned.builtinMonoType.find(fpVal);
+					auto sb = cg.interned.builtinMonoType.find(selfValueType);
+					if (fb != cg.interned.builtinMonoType.end() && sb != cg.interned.builtinMonoType.end())
+						sameSource = (fb->second == sb->second);
+				}
+			}
+			if (!sameSource) continue;
+
+			std::unordered_map<TypeId, TypeId> bindings;
+			for (size_t i = 0; i < fpArgs.size(); ++i)
+				bindings[fpArgs[i]] = selfArgs[i];
+
+			MonoEntry e = getOrCreateMono(cg, fdef, std::unordered_map<TypeId, TypeId>(bindings));
+			out.fn = e.fn;
+
+			// Param/return storage types resolved to the concrete instance.
+			const auto* prev = cg.currentMonoBindings;
+			cg.currentMonoBindings = &bindings;
 			fn->parameters.forEach([&](const Required<AST::FunctionParameter>& p)
 				{
 					auto ti = cg.interned.astTypes.find(&p.value().type.value());
-					out.paramTypes.push_back(ti != cg.interned.astTypes.end() ? ti->second : INVALID_TYPE_ID);
+					out.paramTypes.push_back(ti != cg.interned.astTypes.end()
+						? cg.substT(ti->second) : INVALID_TYPE_ID);
 				});
 			if (fn->returnType.hasValue())
 			{
 				auto rit = cg.interned.astTypes.find(&fn->returnType.value());
-				out.retType = rit != cg.interned.astTypes.end() ? rit->second : INVALID_TYPE_ID;
+				out.retType = rit != cg.interned.astTypes.end()
+					? cg.substT(rit->second) : INVALID_TYPE_ID;
 			}
+			cg.currentMonoBindings = prev;
 			return out;
 		}
 		return out;
@@ -3394,7 +3583,27 @@ namespace
 		if (auto* p = std::get_if<Required<AST::AssignmentStatement>>(&s))
 		{
 			const AST::AssignmentStatement& as = p->value();
-			llvm::Value* addr = genAddr(cg, as.target.value());
+			// For a bare-identifier target whose binding is a pointer/reference
+			// (`lhs = …`), we are rebinding the pointer itself, so the lvalue is its
+			// SLOT. genAddr would §4.2-dereference an indirection identifier and yield
+			// the POINTEE address — wrong for the store and for free-on-reassign
+			// (it would free/overwrite through the old pointer). Member/array targets
+			// correctly keep using genAddr (the field/element address).
+			llvm::Value* addr = nullptr;
+			if (auto* idReq = std::get_if<Required<AST::IdentifierExpression>>(&as.target.value()))
+			{
+				const ResolvedDeclaration* d = cg.resolveIdent(idReq->value());
+				if (d)
+				{
+					const void* k = cg.declKey(*d);
+					TypeId storage = (k && cg.slotStorage.count(k)) ? cg.slotStorage[k] : INVALID_TYPE_ID;
+					if (k && cg.slots.count(k) && cg.isIndirection(storage)
+						&& !isIfaceIndirection(cg.interned, storage))
+						addr = cg.slots[k];
+				}
+			}
+			if (!addr)
+				addr = genAddr(cg, as.target.value());
 			if (!addr)
 			{
 				cg.warn("assignment target is not addressable — skipped");

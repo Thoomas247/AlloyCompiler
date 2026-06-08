@@ -1,0 +1,29 @@
+// Qualified access to imported standard-library names (§5.4).
+//
+// After `import std::vec;`, names may be written either unqualified (`Vec`,
+// `vecNew`) or module-qualified (`std::vec::Vec`, `std::vec::vecNew`). Qualified
+// access goes through the cross-module visibility check, so only `pub`/`exp`
+// definitions are reachable that way. Methods are always called via `.` (the
+// receiver type selects the overload), so they need no qualification.
+import std::vec;
+
+extern printf(...) -> i32;
+
+fn main() -> u32 {
+	// Fully-qualified type annotation and factory call.
+	var v: std::vec::Vec<u32> = std::vec::vecNew<u32>(0);
+	v.push(3);
+	v.push(4);
+	v.push(5);
+
+	// Unqualified use of the same imported name still works.
+	var w: Vec<u32> = vecNew<u32>(0);
+	w.push(100);
+
+	var sum: u32 = 0;
+	for (v) |x| {
+		sum += x;
+	}
+	printf("v.len=%llu sum=%u  w0=%u\n", v.len(), sum, w.get(0));
+	return 0;
+}

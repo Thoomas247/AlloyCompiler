@@ -433,6 +433,13 @@ static bool rhsIsAllocation(const AST::Expression& e)
 {
 	if (auto* u = std::get_if<Required<AST::UnaryExpression>>(&e))
 		return u->value().op == TokenKind::New || u->value().op == TokenKind::Move;
+	// A function/method call that returns `*T` hands the callee's ownership to the
+	// caller — a legitimate (and essential) way to initialise an owning pointer,
+	// e.g. a factory `fn makeNode() -> *Node`. The call is an rvalue, so this does
+	// not alias an existing owned location the way `var q = p;` would. A type
+	// mismatch (call returns a non-pointer) is still caught by the assignability check.
+	if (std::get_if<Required<AST::FunctionCallExpression>>(&e))
+		return true;
 	return false;
 }
 
@@ -735,6 +742,131 @@ static TypeId substituteTypeParams(TypeId id, const std::unordered_map<TypeId, T
 	return id;
 }
 
+// Like substituteTypeParams, but INSTANTIATES a concrete generic mono on demand
+// (rebuilding its underlying struct/enum and interning a fresh instance) instead
+// of only finding an already-interned one. Used for a generic call's RESULT type,
+// so e.g. `fn next<T>() -> Option<T>` called with T=u32 yields a real `Option<u32>`
+// even when nothing else in the program referenced that instance — without it the
+// result stayed the generic `Option<T>` and a `match` capture bound to `T`.
+static TypeId deepSubstitute(CheckState& state, TypeId id,
+	const std::unordered_map<TypeId, TypeId>& bindings)
+{
+	if (id == INVALID_TYPE_ID || id >= static_cast<TypeId>(state.interned.table.size()))
+		return id;
+	if (auto it = bindings.find(id); it != bindings.end())
+		return it->second;
+
+	using K = TypeInfo::Kind;
+	// Copy out everything we need BEFORE any recursive internType (which may grow
+	// the table and could invalidate a held reference).
+	const TypeInfo& info = state.interned.get(id);
+	K kind = info.kind;
+
+	if (kind == K::Pointer || kind == K::Reference || kind == K::PtrMut || kind == K::RefMut)
+	{
+		TypeId inner = info.asIndirection().inner;
+		TypeId ni = deepSubstitute(state, inner, bindings);
+		if (ni == inner) return id;
+		TypeInfo t; t.kind = kind; t.data = TypeInfo::IndirectionData{ ni };
+		return state.internType(std::move(t));
+	}
+	if (kind == K::Slice)
+	{
+		TypeId elem = info.asSlice().elem;
+		TypeId ne = deepSubstitute(state, elem, bindings);
+		if (ne == elem) return id;
+		TypeInfo t; t.kind = K::Slice; t.data = TypeInfo::SliceData{ ne };
+		return state.internType(std::move(t));
+	}
+	if (kind == K::Array)
+	{
+		TypeId elem = info.asArray().elem; size_t sz = info.asArray().size;
+		TypeId ne = deepSubstitute(state, elem, bindings);
+		if (ne == elem) return id;
+		TypeInfo t; t.kind = K::Array; t.data = TypeInfo::ArrayData{ ne, sz };
+		return state.internType(std::move(t));
+	}
+	if (kind == K::Named)
+	{
+		std::vector<TypeId> typeArgs = info.asNamed().typeArgs;   // copy
+		if (typeArgs.empty()) return id;                          // non-generic named
+		std::string_view name = info.asNamed().name;
+		TypeId underlying = info.asNamed().underlying;
+		auto srcU = state.interned.monoSourceDef.find(id);
+		const AST::TypeDefinition* srcDef = srcU != state.interned.monoSourceDef.end() ? srcU->second : nullptr;
+		auto srcB = state.interned.builtinMonoType.find(id);
+		bool hasBuiltin = srcB != state.interned.builtinMonoType.end();
+		BuiltinType builtinTag = hasBuiltin ? srcB->second : BuiltinType{};
+
+		std::vector<TypeId> subArgs; bool changed = false;
+		for (TypeId a : typeArgs)
+		{
+			TypeId s = deepSubstitute(state, a, bindings);
+			if (s != a) changed = true;
+			subArgs.push_back(s);
+		}
+		if (!changed) return id;
+
+		// Reuse an already-interned instance if one matches.
+		for (TypeId c = 0; c < static_cast<TypeId>(state.interned.table.size()); ++c)
+		{
+			const TypeInfo& ci = state.interned.get(c);
+			if (ci.kind != K::Named || ci.asNamed().typeArgs != subArgs) continue;
+			if (srcDef)
+			{
+				auto cu = state.interned.monoSourceDef.find(c);
+				if (cu != state.interned.monoSourceDef.end() && cu->second == srcDef) return c;
+			}
+			else if (hasBuiltin)
+			{
+				auto cb = state.interned.builtinMonoType.find(c);
+				if (cb != state.interned.builtinMonoType.end() && cb->second == builtinTag) return c;
+			}
+		}
+
+		TypeId newUnder = deepSubstitute(state, underlying, bindings);
+		TypeInfo t; t.kind = K::Named; t.data = TypeInfo::NamedData{ name, newUnder, subArgs };
+		TypeId nid = state.internType(std::move(t));
+		if (srcDef) state.interned.monoSourceDef[nid] = srcDef;
+		if (hasBuiltin) state.interned.builtinMonoType[nid] = builtinTag;
+		return nid;
+	}
+	if (kind == K::Struct)
+	{
+		std::vector<TypeInfo::StructMember> members = info.asStruct().members;  // copy
+		std::vector<TypeInfo::StructMember> nm; bool changed = false;
+		for (auto& m : members)
+		{
+			TypeId s = deepSubstitute(state, m.type, bindings);
+			if (s != m.type) changed = true;
+			nm.push_back({ m.name, s });
+		}
+		if (!changed) return id;
+		TypeInfo t; t.kind = K::Struct; t.data = TypeInfo::StructData{ std::move(nm) };
+		return state.internType(std::move(t));
+	}
+	if (kind == K::Enum)
+	{
+		std::vector<TypeInfo::EnumVariant> variants = info.asEnum().variants;   // copy
+		std::vector<TypeInfo::EnumVariant> nv; bool changed = false;
+		for (auto& v : variants)
+		{
+			std::optional<TypeId> p = v.payloadType;
+			if (p.has_value())
+			{
+				TypeId s = deepSubstitute(state, *p, bindings);
+				if (s != *p) changed = true;
+				p = s;
+			}
+			nv.push_back({ v.name, p });
+		}
+		if (!changed) return id;
+		TypeInfo t; t.kind = K::Enum; t.data = TypeInfo::EnumData{ std::move(nv) };
+		return state.internType(std::move(t));
+	}
+	return id;
+}
+
 // A1: result of resolving a qualified identifier as an enum-variant path
 // (Enum::Variant). enumTypeId is INVALID unless the first path segment names an
 // enum TypeDefinition; variantFound indicates the last segment named a variant.
@@ -891,12 +1023,58 @@ static TypeId extensionReturnType(CheckState& state, std::string_view name, Type
 		auto it = state.interned.astTypes.find(&first.type.value());
 		if (it == state.interned.astTypes.end()) continue;
 		TypeId fpVal = stripIndirection(it->second, state.interned);
-		if (fpVal != selfValueType && !isAssignable(selfValueType, fpVal, state.interned))
+
+		const auto* tpList = getDeclTypeParams(*decl);
+		if (!tpList)
+		{
+			// Non-generic extension: self must be assignable to the receiver type.
+			if (fpVal != selfValueType && !isAssignable(selfValueType, fpVal, state.interned))
+				continue;
+			if (!fn->returnType.hasValue())
+				return INVALID_TYPE_ID;
+			auto rit = state.interned.astTypes.find(&fn->returnType.value());
+			return rit != state.interned.astTypes.end() ? rit->second : INVALID_TYPE_ID;
+		}
+
+		// Generic extension (e.g. `iterator<T>(self &Vec<T>) -> VecIter<T>`): bind
+		// the type parameters positionally from the concrete container and
+		// instantiate the concrete return type (interning `VecIter<u32>` etc. so
+		// codegen can resolve them).
+		if (fpVal >= static_cast<TypeId>(state.interned.table.size())
+			|| selfValueType >= static_cast<TypeId>(state.interned.table.size()))
 			continue;
+		const TypeInfo& fpInfo = state.interned.get(fpVal);
+		const TypeInfo& selfInfo = state.interned.get(selfValueType);
+		if (fpInfo.kind != TypeInfo::Kind::Named || selfInfo.kind != TypeInfo::Kind::Named)
+			continue;
+		const auto& fpArgs = fpInfo.asNamed().typeArgs;
+		const auto& selfArgs = selfInfo.asNamed().typeArgs;
+		if (fpArgs.empty() || fpArgs.size() != selfArgs.size())
+			continue;
+		bool sameSource = false;
+		{
+			auto fu = state.interned.monoSourceDef.find(fpVal);
+			auto su = state.interned.monoSourceDef.find(selfValueType);
+			if (fu != state.interned.monoSourceDef.end() && su != state.interned.monoSourceDef.end())
+				sameSource = (fu->second == su->second);
+			if (!sameSource)
+			{
+				auto fb = state.interned.builtinMonoType.find(fpVal);
+				auto sb = state.interned.builtinMonoType.find(selfValueType);
+				if (fb != state.interned.builtinMonoType.end() && sb != state.interned.builtinMonoType.end())
+					sameSource = (fb->second == sb->second);
+			}
+		}
+		if (!sameSource) continue;
 		if (!fn->returnType.hasValue())
 			return INVALID_TYPE_ID;
 		auto rit = state.interned.astTypes.find(&fn->returnType.value());
-		return rit != state.interned.astTypes.end() ? rit->second : INVALID_TYPE_ID;
+		if (rit == state.interned.astTypes.end())
+			return INVALID_TYPE_ID;
+		std::unordered_map<TypeId, TypeId> bindings;
+		for (size_t i = 0; i < fpArgs.size(); ++i)
+			bindings[fpArgs[i]] = selfArgs[i];
+		return deepSubstitute(state, rit->second, bindings);
 	}
 	return INVALID_TYPE_ID;
 }
@@ -1370,7 +1548,13 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 			TypeId objType = checkExpression(state, access.value().object.value(), scope);
 			checkExpression(state, access.value().index.value(), scope);
 			if (objType == INVALID_TYPE_ID || objType >= static_cast<TypeId>(state.interned.table.size())) return;
-			const TypeInfo& info = state.interned.get(objType);
+			// A dynamically-sized array held in a struct field (`*var [T]`) keeps its
+			// pointer wrapper here (only a *bare* identifier is transparently deref'd),
+			// so strip one indirection before reading the Slice/Array element type.
+			// Without this the element type fell back to i32 — invisible for 32-bit
+			// elements, wrong for e.g. `u8` (`*var [u8]` indexed as 4-byte loads).
+			TypeId stripped = stripIndirection(objType, state.interned);
+			const TypeInfo& info = state.interned.get(stripped);
 			if (info.kind == TypeInfo::Kind::Slice) resultType = info.asSlice().elem;
 			else if (info.kind == TypeInfo::Kind::Array) resultType = info.asArray().elem;
 		},
@@ -1836,7 +2020,7 @@ static TypeId checkExpression(CheckState& state, const AST::Expression& expr, Sc
 					{
 						auto it = state.interned.astTypes.find(&fn->returnType.value());
 						if (it != state.interned.astTypes.end())
-							selectedRetId = substituteTypeParams(it->second, bindings, state.interned);
+							selectedRetId = deepSubstitute(state, it->second, bindings);
 					}
 				}
 			}

@@ -1,0 +1,22 @@
+// Reads a file into a std::string::String via std::io, then prints it.
+import std::io;
+import std::string;
+
+extern printf(...) -> i32;
+
+fn main() -> u32 {
+	var src: String = readFile("samples/read_file.alloy");
+	printf("read %llu bytes; first line:\n", src.length());
+	var i: u64 = 0;
+	while (i < src.length()) {
+		var b: u8 = src.byteAt(i);
+		if (b == 10) {                  // newline
+			i = src.length();           // stop after the first line
+		} else {
+			printf("%c", b);
+			i += 1;
+		}
+	}
+	printf("\n");
+	return 0;
+}

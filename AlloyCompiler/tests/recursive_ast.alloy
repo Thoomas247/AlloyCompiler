@@ -1,0 +1,35 @@
+// Positive: a recursive enum/struct AST built from owning `*Expr` pointers
+// (factory functions returning `*Expr`), traversed recursively, and freed by
+// structural drop. The keystone data structure for a self-hosted compiler.
+type BinOp = struct {
+	left: *Expr;
+	right: *Expr;
+};
+
+type Expr = enum {
+	Num: i64;
+	Add: BinOp;
+	Mul: BinOp;
+};
+
+fn num(n: i64) -> *Expr { return new Expr::Num(n); }
+fn add(l: *Expr, r: *Expr) -> *Expr { return new Expr::Add(BinOp { .left = move l, .right = move r }); }
+fn mul(l: *Expr, r: *Expr) -> *Expr { return new Expr::Mul(BinOp { .left = move l, .right = move r }); }
+
+fn eval(e: &Expr) -> i64 {
+	match (e) {
+		Expr::Num |n| { return n; }
+		Expr::Add |b| { return eval(b.left) + eval(b.right); }
+		Expr::Mul |b| { return eval(b.left) * eval(b.right); }
+	}
+	return 0;
+}
+
+fn main() -> u32 {
+	// (1 + 2) * 3 = 9
+	var t: *Expr = mul(add(num(1), num(2)), num(3));
+	if (eval(t) == 9) {
+		return 0;
+	}
+	return 1;
+}

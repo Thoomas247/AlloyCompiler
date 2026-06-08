@@ -1,0 +1,38 @@
+// A recursive AST (expression tree) built from owning pointers, evaluated
+// recursively, and freed by structural drop — the core data structure a
+// self-hosted compiler needs. (1 + 2) * 3 = 9.
+extern printf(...) -> i32;
+
+type BinOp = struct {
+	left: *Expr;
+	right: *Expr;
+};
+
+type Expr = enum {
+	Num: i64;
+	Add: BinOp;
+	Mul: BinOp;
+};
+
+fn num(n: i64) -> *Expr { return new Expr::Num(n); }
+fn add(l: *Expr, r: *Expr) -> *Expr { return new Expr::Add(BinOp { .left = move l, .right = move r }); }
+fn mul(l: *Expr, r: *Expr) -> *Expr { return new Expr::Mul(BinOp { .left = move l, .right = move r }); }
+
+fn eval(e: &Expr) -> i64 {
+	match (e) {
+		Expr::Num |n| { return n; }
+		Expr::Add |b| { return eval(b.left) + eval(b.right); }
+		Expr::Mul |b| { return eval(b.left) * eval(b.right); }
+	}
+	return 0;
+}
+
+fn main() -> u32 {
+	var a: *Expr = num(5);
+	printf("single = %lld\n", eval(a));
+
+	var t: *Expr = mul(add(num(1), num(2)), num(3));
+	printf("tree   = %lld\n", eval(t));
+	return 0;
+	// scope end: `a` and `t` are dropped — each tree freed recursively, once.
+}
